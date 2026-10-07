@@ -1,0 +1,83 @@
+{
+  "name": "memory_record",
+  "description": "Store one durable fact (decision, invariant, preference, architecture note, or debug finding), optionally attached to a named entity. Returns observation_id. If that entity already has the identical fact, returns the existing one with status=exists. Record clinical 7-bit ASCII technical prose only, with zero stage directions or conversational flourishes.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "content": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 8000,
+        "description": "The fact to remember, as one self-contained sentence or short paragraph."
+      },
+      "entity": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "description": "Entity this fact is about (e.g. a service, repo, or host name). Created if missing, matched case-insensitively."
+      },
+      "entity_type": {
+        "type": "string",
+        "enum": [
+          "service",
+          "repo",
+          "pattern",
+          "concept",
+          "operator",
+          "host"
+        ],
+        "description": "Entity type. Only applied when not 'concept', or omit to keep the existing type. (Requires 'entity' to be specified)."
+      },
+      "summary": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000,
+        "description": "One-line description of the entity (replaces the previous summary). (Requires 'entity' to be specified)."
+      },
+      "category": {
+        "type": "string",
+        "enum": [
+          "architecture",
+          "decision",
+          "invariant",
+          "preference",
+          "debug_finding"
+        ],
+        "default": "architecture",
+        "description": "Kind of fact."
+      },
+      "tags": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "maxItems": 50,
+        "description": "Keyword tags."
+      },
+      "confidence": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 1,
+        "description": "How certain the fact is."
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "default": "default",
+        "description": "Free-form label (e.g. task or project). A filter label only, not an isolation boundary."
+      },
+      "attributes": {
+        "type": "object",
+        "description": "Entity key/values (max 4000 serialized characters), merged with existing ones (JSON Merge Patch: a null value deletes that key). (Requires 'entity' to be specified)."
+      }
+    },
+    "required": [
+      "content"
+    ],
+    "additionalProperties": false
+  }
+}

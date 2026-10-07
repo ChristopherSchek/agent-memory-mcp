@@ -1,0 +1,43 @@
+{
+  "name": "memory_relate",
+  "description": "Create or update a directed edge 'source relation_type target' between two distinct entities (created if missing). Use clinical technical entity names, relation types, and metadata only.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "source": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "description": "Source entity name."
+      },
+      "target": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "description": "Target entity name (must differ from source)."
+      },
+      "relation_type": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "default": "references",
+        "description": "Forward verb in snake_case, e.g. depends_on, hosted_on, deploys_to, provisions, governs, references, synchronizes_with, stores_data_for, authenticates_against."
+      },
+      "weight": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 100,
+        "description": "Edge strength, 1.0 on create, unchanged on update if omitted."
+      },
+      "metadata": {
+        "type": "object",
+        "description": "Edge key/values (max 4000 serialized characters), merged with existing ones (null deletes a key)."
+      }
+    },
+    "required": [
+      "source",
+      "target"
+    ],
+    "additionalProperties": false
+  }
+}
