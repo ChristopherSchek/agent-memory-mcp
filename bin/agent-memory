@@ -1028,7 +1028,14 @@ class _Transaction:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None:
-            self.conn.execute("COMMIT;")
+            try:
+                self.conn.execute("COMMIT;")
+            except Exception:
+                try:
+                    self.conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                raise
         else:
             try:
                 self.conn.execute("ROLLBACK;")
@@ -2561,29 +2568,11 @@ def _scrub_deleted(conn):
 
         # 2. Checkpoint with backoff
         conn.execute("PRAGMA busy_timeout = 2000;")
-        checkpointed = False
         for attempt in range(6):
-            row = conn.execute("PRAGMA wal_checkpoint(RESTART);").fetchone()
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
             if row and row[0] == 0:
-                checkpointed = True
                 break
             time.sleep(0.05 * (attempt + 1))
-
-        # 3. Physical WAL sanitization
-        db_file = _db_file(conn) or DB_PATH
-        wal_path = db_file + "-wal"
-        if checkpointed and os.path.exists(wal_path):
-            sz = os.path.getsize(wal_path)
-            if sz > 0:
-                fd = os.open(wal_path, os.O_RDWR)
-                try:
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    os.write(fd, b"\x00" * sz)
-                    os.fdatasync(fd)
-                    os.ftruncate(fd, 0)
-                    os.fdatasync(fd)
-                finally:
-                    os.close(fd)
     except (sqlite3.Error, OSError):
         pass
     finally:
