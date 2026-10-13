@@ -46,7 +46,7 @@ Measured using `python3 benchmark/benchmark_comparison.py -n 100` across physica
 | **Controller & DRAM** | Intel Optane Media Controller, direct cell write | Samsung 3-core MEX (400 MHz), 256MB LPDDR2 |
 | **Sequential Read / Write** | 1,350 MB/s / 290 MB/s | 540 MB/s / 410 MB/s (TurboWrite pseudo-SLC buffer) |
 | **Random 4KB Read / Write** | 240,000 IOPS / 65,000 IOPS | 94,000 IOPS / 35,000 IOPS |
-| **Manufacturer Latency** | Read: 0.007 ms (7 µs), Write: 0.018 ms (18 µs) (typical) | Not rated for byte-level write (FTL page write) |
+| **Manufacturer Latency** | Read: 0.007 ms (7 us), Write: 0.018 ms (18 us) (typical) | Not rated for byte-level write (FTL page write) |
 | **Endurance Rating** | 182.5 TBW (~100 GB/day for 5 years) | 72 TBW |
 | **Write Mechanism** | In-place byte write (no block-erase overhead) | Flash Translation Layer (FTL) block-erase cycles |
 
