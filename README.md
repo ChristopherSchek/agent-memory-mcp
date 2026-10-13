@@ -7,7 +7,7 @@ A per-user SQLite store (CLI and stdio MCP server) for AI coding agents. It prev
 ### 1. Check prerequisites
 ```bash
 python3 -V                                                   # 3.10+ required
-python3 -c "import sqlite3; conn = sqlite3.connect(':memory:'); conn.execute('CREATE VIRTUAL TABLE t USING fts5(x);'); print('SQLite', sqlite3.sqlite_version, 'with FTS5 and JSON1: OK')"
+python3 -c $'import sqlite3\nconn = sqlite3.connect(":memory:")\nconn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nprint("SQLite", sqlite3.sqlite_version, "with FTS5 and JSON1: OK")'
 ```
 
 ### 2. Install
@@ -46,7 +46,7 @@ Measured using `python3 benchmark/benchmark_comparison.py -n 100` across physica
 | **Controller & DRAM** | Intel Optane Media Controller, direct cell write | Samsung 3-core MEX (400 MHz), 256MB LPDDR2 |
 | **Sequential Read / Write** | 1,350 MB/s / 290 MB/s | 540 MB/s / 410 MB/s (TurboWrite pseudo-SLC buffer) |
 | **Random 4KB Read / Write** | 240,000 IOPS / 65,000 IOPS | 94,000 IOPS / 35,000 IOPS |
-| **Manufacturer Latency** | Read: 0.007 ms (7 µs), Write: 0.018 ms (18 µs) (typical) | Not rated for byte-level write (FTL page write) |
+| **Manufacturer Latency** | Read: 0.007 ms (7 us), Write: 0.018 ms (18 us) (typical) | Not rated for byte-level write (FTL page write) |
 | **Endurance Rating** | 182.5 TBW (~100 GB/day for 5 years) | 72 TBW |
 | **Write Mechanism** | In-place byte write (no block-erase overhead) | Flash Translation Layer (FTL) block-erase cycles |
 
@@ -122,7 +122,9 @@ Config paths:
 
 Define a shell alias:
 ```bash
-am() { ~/.local/bin/agent-memory "$@"; }
+am() {
+    ~/.local/bin/agent-memory "$@"
+}
 ```
 
 ```bash
