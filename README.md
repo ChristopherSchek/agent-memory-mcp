@@ -7,7 +7,7 @@ A per-user SQLite store (CLI and stdio MCP server) for AI coding agents. It prev
 ### 1. Check prerequisites
 ```bash
 python3 -V                                                   # 3.10+ required
-python3 -c "import sqlite3; conn = sqlite3.connect(':memory:'); conn.execute('CREATE VIRTUAL TABLE t USING fts5(x);'); print('SQLite', sqlite3.sqlite_version, 'with FTS5 and JSON1: OK')"
+python3 -c $'import sqlite3\nconn = sqlite3.connect(":memory:")\nconn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nprint("SQLite", sqlite3.sqlite_version, "with FTS5 and JSON1: OK")'
 ```
 
 ### 2. Install
@@ -122,7 +122,9 @@ Config paths:
 
 Define a shell alias:
 ```bash
-am() { ~/.local/bin/agent-memory "$@"; }
+am() {
+    ~/.local/bin/agent-memory "$@"
+}
 ```
 
 ```bash
