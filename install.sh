@@ -22,6 +22,7 @@
 # Nothing is installed or registered until preflight, initialisation and self-test pass.
 # ==============================================================================
 set -euo pipefail
+umask 022
 
 VERSION="1.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

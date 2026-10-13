@@ -109,6 +109,7 @@ Verify the command exits with code `0` and outputs JSON containing:
 ### Safe Merge Script
 
 Set `TARGET_CONFIG_PATH` to your client's configuration file:
+- **Claude Code:** `~/.claude/settings.json` (or `~/.claude/mcp_config.json`)
 - **Gemini CLI:** `~/.gemini/config/mcp_config.json`
 - **Cursor:** `~/.cursor/mcp.json` (or `.cursor/mcp.json` in project root)
 - **Windsurf:** `~/.codeium/windsurf/mcp_config.json`

@@ -636,7 +636,7 @@ def get_connection(read_only: bool = False, check: bool = True, _migrated: bool 
                 _VALIDATED_DIRS.add(db_dir)
         is_new_db = not os.path.exists(real_db_path)
         if not is_new_db:
-            _require_owned(real_db_path, "Database file", check_sidecars=True)
+            _require_owned(real_db_path, "Database file", forbid_group_other_write=True, check_sidecars=True)
             _VALIDATED_DB_FILES.add(real_db_path)
     else:
         is_new_db = False
@@ -726,7 +726,7 @@ def get_connection(read_only: bool = False, check: bool = True, _migrated: bool 
         PRAGMA threads = 4;
     """)
     conn.row_factory = sqlite3.Row
-    if is_new_db:
+    if not read_only:
         secure_db_permissions()
         _VALIDATED_DB_FILES.add(real_db_path)
     return conn
@@ -1207,7 +1207,9 @@ def sanitize_fts_query(raw_query: str) -> str:
 
     classified = []
     for token in tokens:
-        if token == "(":
+        if token == "-":
+            classified.append(_TOK_NOT)
+        elif token == "(":
             classified.append(_TOK_LPAREN)
         elif token == ")":
             classified.append(_TOK_RPAREN)
@@ -1644,6 +1646,14 @@ def split_tags_respecting_brackets(text: str) -> list:
         tokens.append(last_token)
     return tokens
 
+_SECRET_PATTERNS = [
+    (re.compile(r"-----BEGIN\s+(?:RSA|OPENSSH|DSA|EC|PGP)?\s*PRIVATE KEY-----", re.IGNORECASE), "private key"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}\b"), "GitHub personal access token"),
+    (re.compile(r"\bsk-[A-Za-z0-9-_]{20,}\b"), "OpenAI API secret key"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key ID"),
+    (re.compile(r"\b(?:bearer\s+[A-Za-z0-9\-._~+/]+=*)\b", re.IGNORECASE), "bearer authentication token"),
+]
+
 class _Abort(Exception):
     """Raised inside a write transaction to roll it back and report a user-facing error."""
 
@@ -1651,6 +1661,7 @@ def record_observation(content: str, entity_name: str = None, entity_type: str =
                        summary: str = None, category: str = "architecture", tags=None,
                        confidence: float = 1.0, session_id: str = "default",
                        attributes: dict = None, conn: sqlite3.Connection = None) -> dict:
+    """Records an observation into SQLite and the FTS5 full-text index -- unrecorded observations fail to persist architectural knowledge across agent sessions."""
     if not content or not isinstance(content, str):
         return {"error": "Content must be a non-empty string."}
     clean_content = _normalize_nfc(content).replace("\x00", " ").strip()
@@ -1658,6 +1669,11 @@ def record_observation(content: str, entity_name: str = None, entity_type: str =
         return {"error": "Content must be a non-empty string."}
     if len(clean_content) > MAX_CONTENT_CHARS:
         return {"error": f"Content is {len(clean_content)} characters; the limit is {MAX_CONTENT_CHARS}. Store one concise, self-contained fact."}
+
+    # Secret hygiene screening
+    for pat, name in _SECRET_PATTERNS:
+        if pat.search(clean_content):
+            return {"error": f"Secret hygiene check failed: content contains {name}. Never record raw credentials, tokens, or private keys into memory."}
 
     conf_val = 1.0
     if confidence is not None:
@@ -1890,6 +1906,7 @@ def record_observation(content: str, entity_name: str = None, entity_type: str =
 def relate_entities(source_name: str, target_name: str, relation_type: str,
                     weight: float = None, metadata: dict = None,
                     conn: sqlite3.Connection = None) -> dict:
+    """Creates or updates a directed graph edge between two entities in the knowledge graph -- failed relationships leave component dependencies unmapped."""
     s_clean = _normalize_nfkc(source_name).replace("\x00", " ").strip() if isinstance(source_name, str) else ""
     t_clean = _normalize_nfkc(target_name).replace("\x00", " ").strip() if isinstance(target_name, str) else ""
     r_type = (relation_type or "").replace("\x00", " ").strip().lower() if isinstance(relation_type, str) else ""
@@ -2176,6 +2193,7 @@ def _result_row(r, match: str) -> dict:
 
 def search_memory(query: str, category: str = None, session_id: str = None, limit: int = 10,
                   conn: sqlite3.Connection = None):
+    """Executes a full-text or category search across indexed observations using FTS5 and BM25 ranking -- search errors cause agents to miss relevant historical facts."""
     has_category = bool(category and isinstance(category, str) and category.strip())
     has_query = bool(query and isinstance(query, str) and query.strip())
     if not has_query and not has_category:
@@ -2356,7 +2374,8 @@ def search_memory(query: str, category: str = None, session_id: str = None, limi
                 pass
 
 def recall_entity(name: str, session_id: str = None, limit: int = 20, relation_limit: int = 50,
-                  conn: sqlite3.Connection = None) -> dict:
+                  category: str = None, conn: sqlite3.Connection = None) -> dict:
+    """Retrieves the entity profile, attributes, recent observations, and graph relationships for a named entity -- recall failures cause agents to operate without entity context."""
     clean_name = _normalize_nfkc((name or "").replace("\x00", " ").strip()) if isinstance(name, str) else ""
     if not clean_name:
         return {"error": "Entity name cannot be empty."}
@@ -2415,6 +2434,9 @@ def recall_entity(name: str, session_id: str = None, limit: int = 20, relation_l
             if clean_sess:
                 obs_sql += " AND session_id = ? COLLATE NOCASE"
                 obs_params.append(clean_sess)
+            if category:
+                obs_sql += " AND category = ? COLLATE NOCASE"
+                obs_params.append(category.strip())
             obs_sql += " ORDER BY created_at DESC, seq DESC LIMIT ?"
             obs_params.append(bounded_limit + 1)
 
@@ -2553,12 +2575,10 @@ def traverse_graph(root_name: str, max_depth: int = 2, conn: sqlite3.Connection 
 
 def _scrub_deleted(conn):
     """
-    DoD 5220.22-M cryptographic erasure:
+    Purges deleted memory records and compacts storage:
     1. Compact and purge deleted inverted index tokens via FTS5 optimize.
-    2. Checkpoint all WAL frames into main database file with RESTART.
-    3. Overwrite the physical WAL media blocks with cryptographic zeros and fdatasync before truncation.
+    2. Checkpoint and truncate WAL frames with backoff retry.
     """
-    wal_path = None
     try:
         # 1. Compact FTS5 inverted index
         try:
@@ -2569,9 +2589,12 @@ def _scrub_deleted(conn):
         # 2. Checkpoint with backoff
         conn.execute("PRAGMA busy_timeout = 2000;")
         for attempt in range(6):
-            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
-            if row and row[0] == 0:
-                break
+            try:
+                row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+                if row and row[0] == 0:
+                    break
+            except sqlite3.OperationalError:
+                pass
             time.sleep(0.05 * (attempt + 1))
     except (sqlite3.Error, OSError):
         pass
@@ -2615,8 +2638,8 @@ def forget_memory(observation_id: str = None, entity: str = None, source: str = 
             should_close = True
         with _Transaction(conn, "IMMEDIATE"):
             if obs_id:
-                # DoD 5220.22-M in-place multi-pass overwrite before deletion
-                obs_row = conn.execute("SELECT seq, length(content) FROM observations WHERE observation_id = ?", (obs_id,)).fetchone()
+                # In-place multi-pass overwrite before deletion
+                obs_row = conn.execute("SELECT seq, length(content), entity_id FROM observations WHERE observation_id = ?", (obs_id,)).fetchone()
                 if obs_row:
                     seq_num, content_len = obs_row[0], obs_row[1]
                     if content_len and content_len > 0:
@@ -2628,6 +2651,14 @@ def forget_memory(observation_id: str = None, entity: str = None, source: str = 
                 n = conn.execute("DELETE FROM observations WHERE observation_id = ?", (obs_id,)).rowcount
                 if n == 0:
                     raise _Abort(f"Observation '{obs_id}' not found.")
+                parent_eid = obs_row[2] if obs_row and len(obs_row) > 2 else None
+                if parent_eid:
+                    rem_obs = conn.execute("SELECT COUNT(*) FROM observations WHERE entity_id = ?", (parent_eid,)).fetchone()[0]
+                    rem_rel = conn.execute("SELECT COUNT(*) FROM relations WHERE source_entity_id = ? OR target_entity_id = ?", (parent_eid, parent_eid)).fetchone()[0]
+                    if rem_obs == 0 and rem_rel == 0:
+                        ent_row = conn.execute("SELECT summary, type FROM entities WHERE entity_id = ?", (parent_eid,)).fetchone()
+                        if ent_row and not ent_row[0] and ent_row[1] == "concept":
+                            conn.execute("DELETE FROM entities WHERE entity_id = ?", (parent_eid,))
                 result = {"status": "success", "deleted_observations": n}
             elif ent:
                 row = conn.execute("SELECT entity_id, name FROM entities WHERE name = ? COLLATE NOCASE", (ent,)).fetchone()
@@ -2643,6 +2674,7 @@ def forget_memory(observation_id: str = None, entity: str = None, source: str = 
                         conn.execute("UPDATE observations SET content = zeroblob(?), tags = NULL WHERE seq = ?", (content_len, seq_num))
                 n_obs = len(obs_rows)
                 n_rel = conn.execute("SELECT COUNT(*) FROM relations WHERE source_entity_id = ? OR target_entity_id = ?", (eid, eid)).fetchone()[0]
+                conn.execute("PRAGMA foreign_keys = ON;")
                 conn.execute("DELETE FROM entities WHERE entity_id = ?", (eid,))
                 result = {"status": "success", "deleted_entity": canonical,
                           "deleted_observations": n_obs, "deleted_relations": n_rel}
@@ -2683,13 +2715,13 @@ _CATEGORIES_ENUM = ["architecture", "decision", "invariant", "preference", "debu
 TOOLS = [
     {
         "name": "memory_record",
-        "description": "Store one durable fact (decision, invariant, preference, architecture note, or debug finding), optionally attached to a named entity. Returns observation_id; if that entity already has the identical fact, returns the existing one with status=exists.",
+        "description": "Store one durable fact (decision, invariant, preference, architecture note, or debug finding), optionally attached to a named entity. Returns observation_id. If that entity already has the identical fact, returns the existing one with status=exists.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "maxLength": MAX_CONTENT_CHARS, "description": "The fact to remember, as one self-contained sentence or short paragraph."},
-                "entity": {"type": "string", "maxLength": MAX_NAME_CHARS, "description": "Entity this fact is about (e.g. a service, repo, or host name). Created if missing; matched case-insensitively."},
-                "entity_type": {"type": "string", "enum": _ENTITY_TYPES_ENUM, "description": "Entity type. Only applied when not 'concept'; omit to keep the existing type. (Requires 'entity' to be specified)."},
+                "entity": {"type": "string", "maxLength": MAX_NAME_CHARS, "description": "Entity this fact is about (e.g. a service, repo, or host name). Created if missing, matched case-insensitively."},
+                "entity_type": {"type": "string", "enum": _ENTITY_TYPES_ENUM, "description": "Entity type. Only applied when not 'concept', or omit to keep the existing type. (Requires 'entity' to be specified)."},
                 "summary": {"type": "string", "maxLength": MAX_SUMMARY_CHARS, "description": "One-line description of the entity (replaces the previous summary). (Requires 'entity' to be specified)."},
                 "category": {"type": "string", "enum": _CATEGORIES_ENUM, "default": "architecture", "description": "Kind of fact."},
                 "tags": {"type": "array", "items": {"type": "string", "maxLength": MAX_TAG_CHARS}, "maxItems": MAX_TAGS, "description": "Keyword tags (a comma-separated string is also accepted)."},
@@ -2721,9 +2753,10 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "entity": {"type": "string", "description": "Entity name (case-insensitive)."},
+                "category": {"type": "string", "description": "Optional category filter (e.g. invariant, decision, architecture)."},
                 "session_id": {"type": "string", "description": "Only include facts with this session label."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Maximum facts (newest first); has_more_observations signals truncation. If true, re-call with limit=100 or use memory_search."},
-                "relation_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50, "description": "Maximum relations per direction; has_more_outgoing_relations and has_more_incoming_relations signal truncation. If true, re-call with relation_limit=100."}
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Maximum facts (newest first), where has_more_observations signals truncation. If true, re-call with limit=100 or use memory_search."},
+                "relation_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50, "description": "Maximum relations per direction, where has_more_outgoing_relations and has_more_incoming_relations signal truncation. If true, re-call with relation_limit=100."}
             },
             "required": ["entity"]
         }
@@ -2737,7 +2770,7 @@ TOOLS = [
                 "source": {"type": "string", "description": "Source entity name."},
                 "target": {"type": "string", "description": "Target entity name (must differ from source)."},
                 "relation_type": {"type": "string", "default": "references", "description": "Forward verb in snake_case, e.g. depends_on, hosted_on, deploys_to, provisions, governs, references, synchronizes_with, stores_data_for, authenticates_against."},
-                "weight": {"type": "number", "minimum": 0.0, "maximum": 100.0, "description": "Edge strength; 1.0 on create, unchanged on update if omitted."},
+                "weight": {"type": "number", "minimum": 0.0, "maximum": 100.0, "description": "Edge strength, 1.0 on create, unchanged on update if omitted."},
                 "metadata": {"type": "object", "description": "Edge key/values, merged with existing ones (null deletes a key)."}
             },
             "required": ["source", "target"]
@@ -2766,7 +2799,7 @@ MUTATING_TOOLS = frozenset(("memory_record", "memory_relate", "memory_forget"))
 MCP_INSTRUCTIONS = """\
 agent-memory: persistent memory shared by all of this user's agent sessions.
 - At the start of a task, memory_recall the project/service/repo/host name or memory_search a few keywords. If memory_recall returns not found, fall back to memory_search. Search before recording so facts are not duplicated.
-- Truncation awareness: check has_more_observations, has_more_outgoing_relations, and has_more_incoming_relations. If true, older facts or relations were omitted; re-call with limit=100 or use targeted memory_search.
+- Truncation awareness: check has_more_observations, has_more_outgoing_relations, and has_more_incoming_relations. If true, older facts or relations were omitted, so re-call with limit=100 or use targeted memory_search.
 - Record only durable facts (decisions with their reasons, invariants, preferences, root causes and fixes) with memory_record: one self-contained fact, attached to an entity, with a category.
 - Link entities with memory_relate using forward verbs (depends_on, hosted_on, deploys_to, provisions, governs, references, synchronizes_with, stores_data_for, authenticates_against).
 - Correct a stale fact with memory_forget (observation_id), then memory_record the corrected one.
@@ -2813,6 +2846,7 @@ def _format_rpc_error(req_id, code: int, message: str) -> RawJsonStr:
 # ==============================================================================
 def process_single_rpc(msg: dict, mcp_conn: sqlite3.Connection, tools_def: list, is_read_only: bool = False,
                        unavailable: str = None, conn_holder: list = None, err_holder: list = None):
+    """Dispatches a single JSON-RPC 2.0 MCP request to the corresponding tool or protocol handler -- unhandled dispatch failures prevent agents from communicating with the memory server."""
     raw_id = msg.get("id", _NO_ID)
     has_id = (raw_id is not _NO_ID)
     if has_id and not (type(raw_id) in (str, int) and not isinstance(raw_id, bool)):
@@ -2941,13 +2975,14 @@ def process_single_rpc(msg: dict, mcp_conn: sqlite3.Connection, tools_def: list,
                     elif k == "limit": s_lim = v
                 tool_result = search_memory(query=s_q, category=s_cat, session_id=s_sess, limit=s_lim, conn=mcp_conn)
             elif tname == "memory_recall":
-                r_name, r_sess, r_lim, r_rlim = "", None, 20, 50
+                r_name, r_sess, r_lim, r_rlim, r_cat = "", None, 20, 50, None
                 for k, v in args.items():
                     if k in ("entity", "name", "entity_name"): r_name = v or ""
+                    elif k == "category": r_cat = v
                     elif k in ("session_id", "session"): r_sess = v
                     elif k == "limit": r_lim = v
                     elif k == "relation_limit": r_rlim = v
-                tool_result = recall_entity(name=r_name, session_id=r_sess, limit=r_lim, relation_limit=r_rlim, conn=mcp_conn)
+                tool_result = recall_entity(name=r_name, session_id=r_sess, limit=r_lim, relation_limit=r_rlim, category=r_cat, conn=mcp_conn)
             elif tname == "memory_relate":
                 rel_s, rel_t, rel_type, rel_w, rel_meta = "", "", "references", None, None
                 for k, v in args.items():
@@ -3094,10 +3129,11 @@ def serve_mcp():
 
             current_req_id = None
             try:
-                if raw_line[0] in ("{", "["):
-                    line = raw_line
+                clean_raw = raw_line.lstrip("\ufeff")
+                if clean_raw and clean_raw[0] in ("{", "["):
+                    line = clean_raw
                 else:
-                    line = raw_line.strip()
+                    line = clean_raw.strip()
                     if not line:
                         continue
 
@@ -3136,11 +3172,10 @@ def serve_mcp():
             except Exception as e:
                 sys.stderr.write(f"MCP server loop error: {e}\n")
                 sys.stderr.flush()
-                if current_req_id is not None:
-                    try:
-                        _send_rpc(format_rpc_error(current_req_id, -32603, f"Internal error: {e}"))
-                    except Exception:
-                        pass
+                try:
+                    _send_rpc(format_rpc_error(current_req_id, -32603, f"Internal error: {e}"))
+                except Exception:
+                    pass
     except BrokenPipeError:
         try:
             devnull = os.open(os.devnull, os.O_WRONLY)
@@ -3318,6 +3353,7 @@ def _normalize_cli_argv(argv):
     return res
 
 def run_doctor(a=None):
+    """Runs read-only diagnostics across database integrity, permissions, storage gates, and index consistency -- undetected corruption causes silent data loss during agent operations."""
     rep_ = {"version": VERSION, "schema": SCHEMA_VERSION_STR, "storage_format": SCHEMA_VERSION,
             "python": sys.version.split()[0], "sqlite": sqlite3.sqlite_version, "db_path": DB_PATH,
             "allow_non_optane": allow_non_optane()}
@@ -3436,8 +3472,8 @@ def run_doctor(a=None):
                     healthy = False
                 rep_["needs_migration"] = ident["kind"] in ("legacy", "empty")
 
-                # PRAGMA quick_check
-                qc_rows = c.execute("PRAGMA quick_check;").fetchall()
+                # PRAGMA integrity_check
+                qc_rows = c.execute("PRAGMA integrity_check;").fetchall()
                 if qc_rows and qc_rows[0][0] == "ok" and len(qc_rows) == 1:
                     rep_["integrity"] = "ok"
                 else:
@@ -3935,24 +3971,25 @@ def main():
             if isinstance(res, dict) and "error" in res:
                 sys.exit(1)
         except (RuntimeError, OSError, sqlite3.Error) as e:
-            print(json.dumps({"error": str(e)}, indent=2))
+            print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
             sys.exit(1)
     search_p.set_defaults(func=run_search)
 
     # Recall
     recall_p = subparsers.add_parser("recall", help="Recall entity and relations")
     recall_p.add_argument("name", help="Entity name")
+    recall_p.add_argument("--category", "-c", default=None, help="Filter recalled observations by category")
     recall_p.add_argument("--session", "--session-id", "--session_id", "-s", default=None, dest="session", help="Filter observations by session identifier")
     recall_p.add_argument("--limit", "-l", type=int, default=20, help="Maximum observations to return (1-100, default: 20)")
     recall_p.add_argument("--relation-limit", "--rel-limit", type=int, default=50, help="Maximum relations to return per direction (1-100, default: 50)")
     def run_recall(a):
         try:
-            res = recall_entity(a.name, session_id=a.session, limit=a.limit, relation_limit=a.relation_limit)
+            res = recall_entity(a.name, session_id=a.session, limit=a.limit, relation_limit=a.relation_limit, category=a.category)
             print(json.dumps(res, indent=2))
             if isinstance(res, dict) and "error" in res:
                 sys.exit(1)
         except (RuntimeError, OSError, sqlite3.Error) as e:
-            print(json.dumps({"error": str(e)}, indent=2))
+            print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
             sys.exit(1)
     recall_p.set_defaults(func=run_recall)
 
@@ -3981,29 +4018,29 @@ def main():
     def run_backup(a):
         dest = os.path.abspath(os.path.expanduser(a.dest))
         if os.path.lexists(dest):
-            print(json.dumps({"error": f"'{dest}' already exists; refusing to overwrite it."}, indent=2))
+            print(json.dumps({"error": f"'{dest}' already exists; refusing to overwrite it."}, indent=2), file=sys.stderr)
             sys.exit(1)
         real_dest = os.path.realpath(dest)
         if real_dest == DB_PATH or real_dest in (DB_PATH + "-wal", DB_PATH + "-shm", DB_PATH + "-journal"):
-            print(json.dumps({"error": "Destination is the live database or its sidecars."}, indent=2))
+            print(json.dumps({"error": "Destination is the live database or its sidecars."}, indent=2), file=sys.stderr)
             sys.exit(1)
         dest_dir = os.path.dirname(dest)
         if not os.path.exists(dest_dir):
-            print(json.dumps({"error": f"Destination directory '{dest_dir}' does not exist."}, indent=2))
+            print(json.dumps({"error": f"Destination directory '{dest_dir}' does not exist."}, indent=2), file=sys.stderr)
             sys.exit(1)
         try:
             _require_owned(dest_dir, "Destination directory", forbid_group_other_write=True, check_sidecars=False)
         except RuntimeError as e:
-            print(json.dumps({"error": str(e)}, indent=2))
+            print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
             sys.exit(1)
         created = False
         try:
             src = get_connection(read_only=True, check=False)
         except FileNotFoundError:
-            print(json.dumps({"error": f"No memory database at {DB_PATH}."}, indent=2))
+            print(json.dumps({"error": f"No memory database at {DB_PATH}."}, indent=2), file=sys.stderr)
             sys.exit(1)
         except (RuntimeError, OSError, sqlite3.Error) as e:
-            print(json.dumps({"error": str(e)}, indent=2))
+            print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
             sys.exit(1)
         try:
             fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
@@ -4022,7 +4059,7 @@ def main():
                         pass
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
-            print(json.dumps({"error": f"Backup failed: {e}"}, indent=2))
+            print(json.dumps({"error": f"Backup failed: {e}"}, indent=2), file=sys.stderr)
             sys.exit(1)
         finally:
             src.close()
@@ -4034,10 +4071,10 @@ def main():
     def run_restore(a):
         src = os.path.abspath(os.path.expanduser(a.src))
         if not os.path.isfile(src):
-            print(json.dumps({"error": f"Backup file '{src}' does not exist or is not a regular file."}, indent=2))
+            print(json.dumps({"error": f"Backup file '{src}' does not exist or is not a regular file."}, indent=2), file=sys.stderr)
             sys.exit(1)
         if os.path.realpath(src) == os.path.realpath(DB_PATH):
-            print(json.dumps({"error": "Source is the live database file."}, indent=2))
+            print(json.dumps({"error": "Source is the live database file."}, indent=2), file=sys.stderr)
             sys.exit(1)
         try:
             _require_owned(src, "Backup file", forbid_group_other_write=True)
@@ -4045,11 +4082,12 @@ def main():
             if (st.st_mode & 0o077) != 0:
                 raise RuntimeError(f"Backup file '{src}' must have mode 0600 (group/other permissions must be 0, current mode is {oct(st.st_mode & 0o777)}).")
         except RuntimeError as e:
-            print(json.dumps({"error": str(e)}, indent=2))
+            print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
             sys.exit(1)
 
         src_conn = None
-        dst_conn = None
+        tmp_conn = None
+        tmp_restore_path = None
         try:
             src_uri = f"file:{_pathname2url(os.path.realpath(src))}?mode=ro"
             src_conn = sqlite3.connect(src_uri, uri=True)
@@ -4059,12 +4097,51 @@ def main():
                 raise RuntimeError(f"Invalid backup file: {err}")
 
             # Verify integrity of backup file before touching live database!
-            qc = src_conn.execute("PRAGMA quick_check;").fetchall()
+            qc = src_conn.execute("PRAGMA integrity_check;").fetchall()
             if not qc or qc[0][0] != "ok":
                 qc_errs = "; ".join(r[0] for r in qc[:3])
                 raise RuntimeError(f"Backup file '{src}' failed integrity check ({qc_errs}); refusing to restore.")
 
-            # Check if live database is corrupted. If so, quarantine it so restore can succeed.
+            # Stage restore into temporary file to ensure atomic replacement
+            tmp_restore_path = f"{DB_PATH}.restore-{_uuid4_str()[:8]}.tmp"
+            fd = os.open(tmp_restore_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+            os.close(fd)
+
+            tmp_conn = sqlite3.connect(f"file:{_pathname2url(tmp_restore_path)}", uri=True)
+            tmp_conn.isolation_level = None
+            src_conn.backup(tmp_conn)
+            tmp_conn.execute("PRAGMA journal_mode = WAL;")
+            if ident.get("kind") in ("legacy", "empty"):
+                init_db(conn=tmp_conn)
+
+            # Validate restored database integrity and foreign keys
+            t_qc = tmp_conn.execute("PRAGMA integrity_check;").fetchall()
+            if not t_qc or t_qc[0][0] != "ok":
+                t_errs = "; ".join(r[0] for r in t_qc[:3])
+                raise RuntimeError(f"Restored database failed integrity check ({t_errs}).")
+
+            t_fk = tmp_conn.execute("PRAGMA foreign_key_check;").fetchall()
+            if t_fk:
+                fk_violations = [f"{t} rowid={rowid} -> {p}" for t, rowid, p, _ in t_fk[:5]]
+                raise RuntimeError(f"Restored database failed foreign key check: {', '.join(fk_violations)}")
+
+            try:
+                tmp_conn.execute("INSERT INTO observations_fts(observations_fts) VALUES('integrity-check');")
+            except sqlite3.Error as e:
+                raise RuntimeError(f"Restored database FTS5 index corrupt: {e}")
+
+            counts = {}
+            for t in CORE_TABLES:
+                try:
+                    counts[t] = tmp_conn.execute(f"SELECT COUNT(*) FROM {t};").fetchone()[0]
+                except sqlite3.OperationalError:
+                    pass
+
+            tmp_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            tmp_conn.close()
+            tmp_conn = None
+
+            # Handle live database quarantine or backup before atomic swap
             pre_bak = None
             if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
                 is_corrupt = False
@@ -4091,24 +4168,35 @@ def main():
                             except OSError:
                                 pass
                     pre_bak = corrupt_bak
+                else:
+                    live_conn = None
+                    try:
+                        live_conn = sqlite3.connect(f"file:{_pathname2url(DB_PATH)}", uri=True)
+                        pre_bak = _backup_before_restore(live_conn)
+                    finally:
+                        if live_conn is not None:
+                            live_conn.close()
 
-            dst_conn = get_connection(read_only=False)
-            dst_conn.execute("PRAGMA busy_timeout = 5000;")
-            if pre_bak is None:
-                pre_bak = _backup_before_restore(dst_conn)
-            src_conn.backup(dst_conn)
-            dst_conn.execute("PRAGMA journal_mode = WAL;")
-            if ident.get("kind") in ("legacy", "empty"):
-                init_db(conn=dst_conn)
-            dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            # Atomically replace live database and purge stale sidecars
+            for ext in ("-wal", "-shm", "-journal"):
+                side = DB_PATH + ext
+                if os.path.exists(side):
+                    try:
+                        os.unlink(side)
+                    except OSError:
+                        pass
+            for ext in ("-wal", "-shm"):
+                tmp_side = tmp_restore_path + ext
+                if os.path.exists(tmp_side):
+                    try:
+                        os.unlink(tmp_side)
+                    except OSError:
+                        pass
+
+            os.replace(tmp_restore_path, DB_PATH)
+            tmp_restore_path = None
             secure_db_permissions()
 
-            counts = {}
-            for t in CORE_TABLES:
-                try:
-                    counts[t] = dst_conn.execute(f"SELECT COUNT(*) FROM {t};").fetchone()[0]
-                except sqlite3.OperationalError:
-                    pass
             res_data = {
                 "status": "success",
                 "restored_from": src,
@@ -4120,7 +4208,13 @@ def main():
                 res_data["pre_restore_backup"] = pre_bak
             print(json.dumps(res_data, indent=2))
         except (RuntimeError, OSError, sqlite3.Error) as e:
-            print(json.dumps({"error": f"Restore failed: {e}"}, indent=2))
+            if tmp_restore_path and os.path.exists(tmp_restore_path):
+                for ext in ("", "-wal", "-shm", "-journal"):
+                    try:
+                        os.unlink(tmp_restore_path + ext)
+                    except OSError:
+                        pass
+            print(json.dumps({"error": f"Restore failed: {e}"}, indent=2), file=sys.stderr)
             sys.exit(1)
         finally:
             if src_conn is not None:
@@ -4128,9 +4222,9 @@ def main():
                     src_conn.close()
                 except Exception:
                     pass
-            if dst_conn is not None:
+            if tmp_conn is not None:
                 try:
-                    dst_conn.close()
+                    tmp_conn.close()
                 except Exception:
                     pass
     restore_p.set_defaults(func=run_restore)
