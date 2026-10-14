@@ -1,6 +1,6 @@
 # agent-memory: Autonomous Agent Deployment & Operation Runbook
 
-Guides autonomous AI coding agents through sequential preflight inspection, installation, verification, client registration, and daily operation of `agent-memory` -- skipping verification gates or guessing paths causes broken client registrations or storage-gate failures.
+Guides autonomous AI coding agents through sequential preflight inspection, installation, verification, client registration, and daily operation of `agent-memory` to establish a verified persistent memory store, preventing skipped verification gates or guessed paths from breaking client registrations.
 
 > [!IMPORTANT]
 > **Directive for the Executing AI Agent:**
@@ -13,7 +13,7 @@ Guides autonomous AI coding agents through sequential preflight inspection, inst
 
 ## 1. Operating Invariants & Safety Guardrails
 
-Establishes non-negotiable safety and isolation constraints before executing any shell or MCP commands -- violating these invariants risks clobbering user configs, executing prompt injections, or leaking credentials.
+Establishes non-negotiable safety and isolation constraints before executing any shell or MCP commands to protect user state, preventing config clobbering, stored prompt injections, or credential leaks.
 
 1. **Never hardcode usernames or home paths**: Always resolve paths dynamically using `$HOME` or `$(id -un)`.
 2. **Never overwrite client config files directly**: When adding the MCP server to existing JSON configs, merge the `agent-memory` object under `mcpServers` and never wipe other servers.
@@ -25,7 +25,7 @@ Establishes non-negotiable safety and isolation constraints before executing any
 
 ## 2. Phase 1: Host Inspection Gate (Read-Only)
 
-Audits Python version, SQLite FTS5/JSON1 capabilities, and `/mnt/optane` mount availability prior to installation -- running the installer without verifying host capabilities causes mid-flight aborts.
+Audits Python version, SQLite FTS5/JSON1 capabilities, and `/mnt/optane` mount availability prior to installation to determine the deployment mode, preventing mid-flight installer aborts.
 
 ```bash
 TARGET_USER="$(id -un)"
@@ -43,7 +43,7 @@ echo "OPTANE_CHECK: ${OPTANE_DIR_CHECK}"
 
 ### Deterministic Decision Matrix
 
-Maps the Phase 1 inspection output to the appropriate installation mode -- selecting the wrong deployment branch triggers Optane storage-gate rejections.
+Maps the Phase 1 inspection output to the appropriate installation branch to match host storage hardware, preventing Optane storage-gate rejections.
 
 | Condition | Decision | Action |
 |---|---|---|
@@ -56,7 +56,7 @@ Maps the Phase 1 inspection output to the appropriate installation mode -- selec
 
 ## 3. Phase 2: Deployment Execution Gate
 
-Executes `install.sh` using the branch selected in Phase 1 -- manual file copying skips preflight validation and self-testing.
+Executes `install.sh` using the branch selected in Phase 1 to validate storage, initialize the database, and install the binary, preventing manual file copying from bypassing preflight validation and self-testing.
 
 Navigate to the repository or extracted bundle root:
 
@@ -66,7 +66,7 @@ cd ~/Git/agent-memory-mcp  # Or path where bundle was cloned/extracted
 
 ### Command A: Native Optane Mode
 
-Installs `agent-memory` backed by verified Intel Optane storage at `/mnt/optane/$USER/agent_memory/memory.db` -- fails if `/mnt/optane/$USER` is missing or not on Intel Optane media.
+Installs `agent-memory` backed by verified Intel Optane storage at `/mnt/optane/$USER/agent_memory/memory.db` to enable hardware-durable `fsync` commits, preventing silent fallback to non-Optane storage when `/mnt/optane/$USER` is missing or not on Intel Optane media.
 
 ```bash
 ./install.sh
@@ -74,7 +74,7 @@ Installs `agent-memory` backed by verified Intel Optane storage at `/mnt/optane/
 
 ### Command B: Non-Optane Storage Fallback Mode
 
-Installs `agent-memory` with `ALLOW_NON_OPTANE=1` for standard NVMe/SATA SSDs or virtualized environments -- omitting `--allow-non-optane` on non-Optane hosts aborts preflight.
+Installs `agent-memory` with `ALLOW_NON_OPTANE=1` to support standard NVMe/SATA SSDs or virtualized environments, preventing Optane hardware check aborts on non-Optane hosts.
 
 ```bash
 ./install.sh --allow-non-optane
@@ -92,7 +92,7 @@ Installs `agent-memory` with `ALLOW_NON_OPTANE=1` for standard NVMe/SATA SSDs or
 
 ## 4. Phase 3: Integrity & Health Verification Gate
 
-Runs read-only diagnostics against the installed binary and database -- skipping post-install verification leaves permission or schema errors undetected.
+Runs read-only diagnostics against the installed binary and database to confirm operational readiness, preventing permission or schema errors from going undetected before client registration.
 
 ```bash
 ~/.local/bin/agent-memory doctor
@@ -100,7 +100,7 @@ Runs read-only diagnostics against the installed binary and database -- skipping
 
 ### Expected Output Criteria
 
-Defines the required JSON fields for a healthy installation -- any field not matching these values requires remediation via Section 8 before client registration.
+Defines the required JSON fields for a healthy installation to gate Phase 4 registration, preventing unhealthy database states from being wired into MCP clients.
 
 Verify the command exits with code `0` and outputs JSON containing:
 1. `"healthy": true`
@@ -116,21 +116,21 @@ Verify the command exits with code `0` and outputs JSON containing:
 
 ## 5. Phase 4: Atomic Client Configuration
 
-Registers the `agent-memory` MCP server in the active AI coding client -- overwriting client config files without merging destroys other registered MCP servers.
+Registers the `agent-memory` MCP server in the active AI coding client to expose the `memory_*` tools, preventing unmerged writes from destroying other registered MCP servers.
 
 ### Client Detection & Configuration Rules
 
-Identifies whether client registration was already completed by `install.sh` or requires atomic merge -- manually editing Antigravity's config after `install.sh` risks introducing path drift.
+Identifies whether client registration was already completed by `install.sh` or requires atomic merge to avoid duplicate edits, preventing manual edits from introducing path drift in Antigravity.
 
 1. **Google Antigravity**: If running in Antigravity or `~/.gemini/antigravity-cli` exists, `./install.sh` has already registered the MCP server in `~/.gemini/config/mcp_config.json`. **Do not edit manually.**
 2. **Other Clients (Claude Code, Cursor, Windsurf, Claude Desktop)**: Use the atomic merge Python script below to safely inject the `agent-memory` definition without clobbering existing servers.
 
 ### Safe Merge Script
 
-Merges the `agent-memory` server definition into an existing MCP client JSON configuration with mode `0600` permissions -- direct file truncation or unatomic writes corrupt client settings.
+Merges the `agent-memory` server definition into an existing MCP client JSON configuration with mode `0600` permissions to preserve existing server entries, preventing direct file truncation or unatomic writes from corrupting client settings.
 
 Set `config_path` to your client's configuration file:
-- **Claude Code**: `~/.claude/settings.json` (or `~/.claude/mcp_config.json`)
+- **Claude Code**: `~/.claude.json`
 - **Gemini CLI**: `~/.gemini/config/mcp_config.json`
 - **Cursor**: `~/.cursor/mcp.json` (or `.cursor/mcp.json` in project root)
 - **Windsurf**: `~/.codeium/windsurf/mcp_config.json`
@@ -149,7 +149,7 @@ if os.path.exists(config_path):
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception as e:
+    except (OSError, ValueError, TypeError) as e:
         print(f"Warning: existing config could not be parsed ({e}), backing up first.")
         os.rename(config_path, config_path + ".bak")
         os.chmod(config_path + ".bak", 0o600)
@@ -185,12 +185,12 @@ EOF
 
 ### Claude Code Registration via CLI
 
-Registers `agent-memory` globally in Claude Code using `claude mcp add` -- mismatched `ALLOW_NON_OPTANE` or `AGENT_MEMORY_DB` flags cause runtime storage-gate errors.
+Registers `agent-memory` globally in Claude Code using `claude mcp add` to match the verified `doctor` environment, preventing mismatched `ALLOW_NON_OPTANE` or `AGENT_MEMORY_DB` flags from causing runtime storage-gate errors.
 
 ```bash
 DOC_JSON="$("${HOME}/.local/bin/agent-memory" doctor)"
-DB_PATH="$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["db_path"])' "${DOC_JSON}")"
-ALLOW_FLAG="$(python3 -I -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("allow_non_optane") else "0")' "${DOC_JSON}")"
+DB_PATH="$(python3 -I -c $'import json,sys\nprint(json.loads(sys.argv[1])["db_path"])' "${DOC_JSON}")"
+ALLOW_FLAG="$(python3 -I -c $'import json,sys\nprint("1" if json.loads(sys.argv[1]).get("allow_non_optane") else "0")' "${DOC_JSON}")"
 
 claude mcp add --scope global agent-memory -e ALLOW_NON_OPTANE="${ALLOW_FLAG}" -e AGENT_MEMORY_DB="${DB_PATH}" -- "$(command -v python3)" -I "${HOME}/.local/bin/agent-memory" --mcp
 ```
@@ -199,21 +199,22 @@ claude mcp add --scope global agent-memory -e ALLOW_NON_OPTANE="${ALLOW_FLAG}" -
 
 ## 6. Phase 5: End-to-End Zero-Leak Smoke Test
 
-Executes a full `record` -> `search` -> `recall` -> `forget` probe cycle and removes the test record before finishing -- skipping cleanup leaves synthetic test artifacts in the user's production memory database.
+Executes a full `record` -> `search` -> `recall` -> `forget` probe cycle and removes the test record before finishing to verify end-to-end tool health, preventing synthetic test artifacts from polluting the user's production memory database.
 
 ```bash
 AM="${HOME}/.local/bin/agent-memory"
 
 # 1. Record Probe
 RECORD_RESP="$("${AM}" record "agent-memory probe test verification fact" --entity "ProbeTestEntity" --type "concept" --category "invariant" --tags "test,probe")"
-OBS_ID="$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["observation_id"])' "${RECORD_RESP}")"
+OBS_ID="$(python3 -I -c $'import json,sys\nprint(json.loads(sys.argv[1])["observation_id"])' "${RECORD_RESP}")"
 echo "Recorded Observation ID: ${OBS_ID}"
 
 # 2. Search Probe
 SEARCH_RESP="$("${AM}" search "probe test verification" --category "invariant")"
-FOUND="$(python3 -I -c 'import json,sys; hits = json.loads(sys.argv[1]); print(any(h.get("observation_id") == sys.argv[2] for h in hits))' "${SEARCH_RESP}" "${OBS_ID}")"
+FOUND="$(python3 -I -c $'import json,sys\nhits = json.loads(sys.argv[1])\nprint(any(h.get("observation_id") == sys.argv[2] for h in hits))' "${SEARCH_RESP}" "${OBS_ID}")"
 
 if [ "${FOUND}" != "True" ]; then
+    "${AM}" forget --observation "${OBS_ID}" >/dev/null 2>&1 || true
     echo "ERROR: Probe fact was not found via search!"
     exit 1
 fi
@@ -221,9 +222,10 @@ echo "Search verification passed."
 
 # 3. Recall Probe
 RECALL_RESP="$("${AM}" recall "ProbeTestEntity" --category "invariant")"
-ENTITY_FOUND="$(python3 -I -c 'import json,sys; d = json.loads(sys.argv[1]); print(d.get("name") == "ProbeTestEntity")' "${RECALL_RESP}")"
+ENTITY_FOUND="$(python3 -I -c $'import json,sys\nd = json.loads(sys.argv[1])\nprint(d.get("name") == "ProbeTestEntity")' "${RECALL_RESP}")"
 
 if [ "${ENTITY_FOUND}" != "True" ]; then
+    "${AM}" forget --observation "${OBS_ID}" >/dev/null 2>&1 || true
     echo "ERROR: Probe entity was not found via recall!"
     exit 1
 fi
@@ -231,7 +233,7 @@ echo "Recall verification passed."
 
 # 4. Cleanup (Forget Probe)
 FORGET_RESP="$("${AM}" forget --observation "${OBS_ID}")"
-DELETED="$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1]).get("deleted_observations", 0))' "${FORGET_RESP}")"
+DELETED="$(python3 -I -c $'import json,sys\nprint(json.loads(sys.argv[1]).get("deleted_observations", 0))' "${FORGET_RESP}")"
 
 if [ "${DELETED}" -ne 1 ]; then
     echo "ERROR: Failed to delete probe observation!"
@@ -244,7 +246,7 @@ echo "Cleanup verification passed. Zero residual test data."
 
 ## 7. Agent Operational Protocol During Coding Tasks
 
-Defines the three-stage runtime workflow for task ingestion, untrusted memory firewalling, and post-task consolidation -- ignoring this workflow causes context drift or duplicate observations.
+Defines the three-stage runtime workflow for task ingestion, untrusted memory firewalling, and post-task consolidation to standardize session memory usage, preventing context drift or duplicate observations.
 
 ```text
 +--------------------------------------------------------+
@@ -281,7 +283,7 @@ Defines the three-stage runtime workflow for task ingestion, untrusted memory fi
 
 ### Ontological Vocabulary Contract
 
-Restricts observation categories and relation verbs to the canonical schema vocabulary -- using unapproved categories or inverse verbs fragments retrieval.
+Restricts observation categories and relation verbs to the canonical schema vocabulary to maintain a uniform knowledge graph, preventing unapproved categories or inverse verbs from fragmenting retrieval.
 
 - **Allowed Categories**:
   - **`architecture`**: System topology and component boundaries.
@@ -305,12 +307,12 @@ Restricts observation categories and relation verbs to the canonical schema voca
 
 ## 8. Error Triage & Self-Healing Decision Tree
 
-Maps diagnostic failure symptoms to deterministic recovery procedures -- attempting ad-hoc repairs without following the triage tree risks corrupting the SQLite WAL state.
+Maps diagnostic failure symptoms to deterministic recovery procedures to guide automated self-healing, preventing ad-hoc repairs from corrupting the SQLite WAL state.
 
 | Symptom | Root Cause | Automated Recovery Procedure |
 |---|---|---|
 | `storage_gate: not Intel Optane NVMe` | Host storage is standard flash, cloud volume, or virtual disk. | Run `./install.sh --allow-non-optane`. Storage path will resolve to `~/.local/share/agent-memory/memory.db`. |
-| `writable: no (storage directory ... is not writable)` | Directory permissions mismatch. | Verify current UID matches directory: `ls -ld <dir>`. If owned by user, run `chmod 700 <dir>`. |
+| `writable: no (storage directory ... is not writable)` | Directory or database permissions mismatch. | Verify current UID matches directory: `ls -ld <dir>`. If owned by user, run `chmod 700 <dir>` (and `chmod 600 <db>`). |
 | `is a symlink owned by uid ...` | Target or sidecar file is an unauthorized symlink. | Delete the symlink. `agent-memory` prohibits symlinked sidecars (`-wal`, `-shm`, `-journal`) for integrity. |
 | `fts_index: out of sync` | SQLite full-text index was interrupted during a write. | Run `~/.local/bin/agent-memory init`. If issues persist, run `~/.local/bin/agent-memory init --force` (takes a backup before rebuilding). |
 | `A tool call says storage is unavailable` | Database was locked or permissions changed mid-session. | Run `~/.local/bin/agent-memory doctor`, resolve failing field, and restart client process. |

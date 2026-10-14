@@ -1,6 +1,6 @@
 # Agent Memory MCP Instructions
 
-Provides persistent per-user semantic memory and knowledge graph tools shared across all agent sessions -- unindexed or unverified memory operations cause context drift, duplicate facts, or security policy violations.
+Provides persistent per-user semantic memory and knowledge graph tools so agent sessions retain durable technical context, preventing context drift, duplicate facts, or security policy violations.
 
 - At the start of a task, call `memory_recall` with the project, service, repo, or host name, or call `memory_search` with a few keywords. If `memory_recall` returns not found, fall back to `memory_search`, and always search before recording so facts are not duplicated.
 - Check `has_more_observations`, `has_more_outgoing_relations`, and `has_more_incoming_relations` on recall responses. If true, older facts or relations were omitted, so re-call with `limit=100` or use a targeted `memory_search`.
