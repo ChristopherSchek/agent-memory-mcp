@@ -1,1 +1,30 @@
-{"name":"memory_forget","description":"Delete stored memory. Requires exactly one mode: observation_id (single fact), entity (entity with all facts and relations), or source+target (relation edge(s)).","parameters":{"properties":{"entity":{"description":"Delete this entity and everything attached to it.","type":"string"},"observation_id":{"description":"Delete this single fact by ID.","type":"string"},"relation_type":{"description":"Only delete edges of this type (default: all types between source and target).","type":"string"},"source":{"description":"Relation source (use with target).","type":"string"},"target":{"description":"Relation target (use with source).","type":"string"}},"required":[],"type":"object"}}
+{
+  "name": "memory_forget",
+  "description": "Delete stored memory. Requires exactly one mode: observation_id (single fact), entity (entity with all facts and relations), or source+target (relation edge(s)).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "observation_id": {
+        "type": "string",
+        "description": "Delete this single fact by ID."
+      },
+      "entity": {
+        "type": "string",
+        "description": "Delete this entity and everything attached to it."
+      },
+      "source": {
+        "type": "string",
+        "description": "Relation source (use with target)."
+      },
+      "target": {
+        "type": "string",
+        "description": "Relation target (use with source)."
+      },
+      "relation_type": {
+        "type": "string",
+        "description": "Only delete edges of this type (default: all types between source and target)."
+      }
+    },
+    "required": []
+  }
+}

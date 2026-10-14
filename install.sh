@@ -21,7 +21,7 @@
 #
 # Nothing is installed or registered until preflight, initialisation and self-test pass.
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 umask 022
 
 VERSION="1.0.0"
@@ -40,8 +40,8 @@ while [ $# -gt 0 ]; do
         --allow-non-optane) ALLOW_NON_OPTANE_FLAG=1 ;;
         --allow-non-optane=1|--allow-non-optane=true|--allow-non-optane=yes|--allow-non-optane=on) ALLOW_NON_OPTANE_FLAG=1 ;;
         --require-optane|--no-allow-non-optane|--allow-non-optane=0|--allow-non-optane=false|--allow-non-optane=no|--allow-non-optane=off) ALLOW_NON_OPTANE_FLAG=0 ;;
-        --db) [ $# -ge 2 ] || { echo "Error: --db requires a path" >&2; exit 2; }; DB_OVERRIDE="$2"; shift ;;
-        --db=*) DB_OVERRIDE="${1#--db=}" ;;
+        --db) [ $# -ge 2 ] && [ -n "$2" ] || { echo "Error: --db requires a non-empty path" >&2; exit 2; }; DB_OVERRIDE="$2"; shift ;;
+        --db=*) DB_OVERRIDE="${1#--db=}"; [ -n "${DB_OVERRIDE}" ] || { echo "Error: --db requires a non-empty path" >&2; exit 2; } ;;
         --uninstall) UNINSTALL=1 ;;
         --no-client-config) CLIENT_CONFIG=0 ;;
         -h|--help) usage; exit 0 ;;
@@ -127,15 +127,26 @@ elif action == "remove":
         sys.exit(0)
     del servers["agent-memory"]
 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-if os.path.exists(path) and not os.path.lexists(path + ".agent-memory.bak"):
-    shutil.copy2(path, path + ".agent-memory.bak", follow_symlinks=False)
-mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o600
+bak_path = path + ".agent-memory.bak"
+if os.path.exists(path) and not os.path.lexists(bak_path):
+    shutil.copy2(path, bak_path, follow_symlinks=False)
+    try:
+        os.chmod(bak_path, 0o600)
+    except OSError:
+        pass
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".mcp_config.")
-with os.fdopen(fd, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-os.chmod(tmp, mode)
-os.replace(tmp, path)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PY
 }
 
@@ -153,7 +164,8 @@ if [ "${UNINSTALL}" -eq 1 ]; then
     if [ -z "${DB_HINT}" ] && [ -f "${BIN}" ]; then
         DB_HINT="$("${PY}" -I "${BIN}" doctor 2>/dev/null | "${PY}" -I -c 'import json,sys; print(json.load(sys.stdin).get("db_path",""))' 2>/dev/null || true)"
     fi
-    rm -f "${SKILL_DIR}/SKILL.md"; rmdir "${SKILL_DIR}" 2>/dev/null || true
+    rm -f "${SKILL_DIR}/SKILL.md" "${SKILL_DIR}/references/agent-memory-mcp.md"
+    rmdir "${SKILL_DIR}/references" "${SKILL_DIR}" 2>/dev/null || true
     rm -f "${MCP_DIR}/instructions.md" "${MCP_DIR}"/memory_*.json; rmdir "${MCP_DIR}" 2>/dev/null || true
     rm -f "${BIN}"
     say "Removed ${BIN}, skill and MCP instructions."
@@ -166,6 +178,11 @@ echo "Installing agent-memory v${VERSION} for user ${TARGET_USER}"
 echo "======================================================================"
 say "Python $("${PY}" -I -c 'import platform; print(platform.python_version())') (${PY})"
 [ -f "${BUNDLE_BIN}" ] || die "bundle is incomplete: bin/agent-memory not found next to install.sh."
+[ -f "${SCRIPT_DIR}/mcp/instructions.md" ] || die "bundle is incomplete: mcp/instructions.md not found next to install.sh."
+[ -f "${SCRIPT_DIR}/skill/SKILL.md.template" ] || die "bundle is incomplete: skill/SKILL.md.template not found next to install.sh."
+for _schema in memory_record.json memory_search.json memory_recall.json memory_relate.json memory_forget.json; do
+    [ -f "${SCRIPT_DIR}/mcp/${_schema}" ] || die "bundle is incomplete: mcp/${_schema} not found next to install.sh."
+done
 
 # ------------------------------------------------------------------------------
 # 1. Resolve the runtime environment. The MCP registration always carries an explicit
@@ -208,7 +225,14 @@ PRE_ENV=("${ENV_BASE[@]}")
 # ------------------------------------------------------------------------------
 TMP_BIN=""
 DOCTOR_ERR="$(mktemp)"
-trap 'rm -f "${DOCTOR_ERR}" ${TMP_BIN:+"${TMP_BIN}"}' EXIT
+cleanup() {
+    local rc=$?
+    rm -f "${DOCTOR_ERR}" ${TMP_BIN:+"${TMP_BIN}"}
+    exit "${rc}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 DOCTOR_RC=0
 DOCTOR_OUT="$("${PRE_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>"${DOCTOR_ERR}")" || DOCTOR_RC=$?
 if [ "${DOCTOR_RC}" -ne 0 ]; then
@@ -318,25 +342,37 @@ if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
     say "Registered MCP server 'agent-memory' in ${MCP_CONFIG}"
     mkdir -p "${MCP_DIR}"
     rm -f "${MCP_DIR}"/memory_*.json "${MCP_DIR}/instructions.md"
-    cp -f "${SCRIPT_DIR}/mcp/instructions.md" "${MCP_DIR}/instructions.md" 
+    cp -f "${SCRIPT_DIR}/mcp/instructions.md" "${MCP_DIR}/instructions.md"
     say "Installed MCP instructions to ${MCP_DIR}"
-    if compgen -G "${SCRIPT_DIR}/mcp/memory_*.json" >/dev/null 2>&1; then
-        cp -f "${SCRIPT_DIR}/mcp"/memory_*.json "${MCP_DIR}/"
-        say "Installed MCP tool schemas to ${MCP_DIR}"
-    fi
+    cp -f "${SCRIPT_DIR}/mcp"/memory_*.json "${MCP_DIR}/"
+    say "Installed MCP tool schemas to ${MCP_DIR}"
     mkdir -p "${SKILL_DIR}"
-    "${PY}" -I - "${SCRIPT_DIR}/skill/SKILL.md.template" "${SKILL_DIR}/SKILL.md" "${DB_PATH_RESOLVED}" "${CLI_STR}" "${ALLOW_NON_OPTANE_FLAG}" <<'PY'
+    SKILL_DB_DISPLAY="${DB_PATH_RESOLVED}"
+    SKILL_CLI_DISPLAY="${CLI_STR}"
+    if [ "${ALLOW_NON_OPTANE_FLAG}" = "0" ] && [ "${DB_PATH_RESOLVED}" = "/mnt/optane/${TARGET_USER}/agent_memory/memory.db" ] && [ "${BIN}" = "${HOME_DIR}/.local/bin/agent-memory" ]; then
+        SKILL_DB_DISPLAY='/mnt/optane/${USER}/agent_memory/memory.db'
+        SKILL_CLI_DISPLAY="env ALLOW_NON_OPTANE=0 AGENT_MEMORY_DB=/mnt/optane/\${USER}/agent_memory/memory.db ${PY} -I ~/.local/bin/agent-memory"
+    fi
+    "${PY}" -I - "${SCRIPT_DIR}/skill/SKILL.md.template" "${SKILL_DIR}/SKILL.md" "${SKILL_DB_DISPLAY}" "${SKILL_CLI_DISPLAY}" "${ALLOW_NON_OPTANE_FLAG}" <<'PY'
 import os, sys, tempfile
 src, dst, db, cli, allow = sys.argv[1:6]
 storage_desc = "stored on local persistent storage" if allow == "1" else "stored on a dedicated fast volume"
-text = open(src).read().replace("__DB__", db).replace("__CLI__", cli).replace("__STORAGE_DESC__", storage_desc)
+with open(src, encoding="utf-8") as sf:
+    text = sf.read().replace("__DB__", db).replace("__CLI__", cli).replace("__STORAGE_DESC__", storage_desc)
 dst_dir = os.path.dirname(dst) or "."
 os.makedirs(dst_dir, exist_ok=True)
 fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".SKILL.md.")
-with os.fdopen(fd, "w") as f:
-    f.write(text)
-os.chmod(tmp, 0o644)
-os.replace(tmp, dst)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, dst)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PY
     say "Installed skill to ${SKILL_DIR}/SKILL.md"
 fi

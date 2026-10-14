@@ -1,7 +1,7 @@
 {
   "name": "memory_recall",
   "description": "Get everything known about one entity: type, summary, attributes, recent facts, and incoming/outgoing relations.",
-  "parameters": {
+  "inputSchema": {
     "type": "object",
     "properties": {
       "entity": {
@@ -10,6 +10,13 @@
       },
       "category": {
         "type": "string",
+        "enum": [
+          "architecture",
+          "decision",
+          "invariant",
+          "preference",
+          "debug_finding"
+        ],
         "description": "Optional category filter (e.g. invariant, decision, architecture)."
       },
       "session_id": {
