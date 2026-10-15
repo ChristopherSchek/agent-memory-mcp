@@ -36,6 +36,7 @@ UNINSTALL=0
 CLIENT_CONFIG=1
 DRY_RUN=0
 LOG_DIR=""
+RESULTS_WRITTEN=0
 
 usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -44,10 +45,10 @@ while [ $# -gt 0 ]; do
         --allow-non-optane) ALLOW_NON_OPTANE_FLAG=1 ;;
         --allow-non-optane=1|--allow-non-optane=true|--allow-non-optane=yes|--allow-non-optane=on) ALLOW_NON_OPTANE_FLAG=1 ;;
         --require-optane|--no-allow-non-optane|--allow-non-optane=0|--allow-non-optane=false|--allow-non-optane=no|--allow-non-optane=off) ALLOW_NON_OPTANE_FLAG=0 ;;
-        --db) [ $# -ge 2 ] && [ -n "$2" ] || { echo "Error: --db requires a non-empty path" >&2; exit 2; }; DB_OVERRIDE="$2"; shift ;;
-        --db=*) DB_OVERRIDE="${1#--db=}"; [ -n "${DB_OVERRIDE}" ] || { echo "Error: --db requires a non-empty path" >&2; exit 2; } ;;
-        --log-dir) [ $# -ge 2 ] && [ -n "$2" ] || { echo "Error: --log-dir requires a non-empty directory path" >&2; exit 2; }; LOG_DIR="$2"; shift ;;
-        --log-dir=*) LOG_DIR="${1#--log-dir=}"; [ -n "${LOG_DIR}" ] || { echo "Error: --log-dir requires a non-empty directory path" >&2; exit 2; } ;;
+        --db) [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || { echo "Error: --db requires a non-empty path" >&2; exit 2; }; DB_OVERRIDE="$2"; shift ;;
+        --db=*) DB_OVERRIDE="${1#--db=}"; [ -n "${DB_OVERRIDE}" ] && [[ "${DB_OVERRIDE}" != -* ]] || { echo "Error: --db requires a non-empty path" >&2; exit 2; } ;;
+        --log-dir) [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || { echo "Error: --log-dir requires a non-empty directory path" >&2; exit 2; }; LOG_DIR="$2"; shift ;;
+        --log-dir=*) LOG_DIR="${1#--log-dir=}"; [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" != -* ]] || { echo "Error: --log-dir requires a non-empty directory path" >&2; exit 2; } ;;
         --dry-run) DRY_RUN=1 ;;
         --uninstall) UNINSTALL=1 ;;
         --no-client-config) CLIENT_CONFIG=0 ;;
@@ -87,6 +88,7 @@ with open(dst, "w", encoding="utf-8") as f:
     json.dump(payload, f, indent=2)
     f.write("\n")
 PY
+        RESULTS_WRITTEN=1
     fi
 }
 
@@ -95,6 +97,7 @@ if [ "$(id -u)" -eq 0 ]; then
         1|true|yes|on) ;;
         *)
             printf 'Error: Refusing to install as root. Run as the target user (e.g. without sudo). Set ALLOW_ROOT=1 to override.\n' >&2
+            write_results_json "error" "refusing to install as root"
             exit 1
             ;;
     esac
@@ -142,7 +145,8 @@ orig_path = os.path.abspath(os.path.expanduser(sys.argv[2]))
 path = os.path.realpath(orig_path)
 data = {}
 orig_mode = 0o600
-if os.path.exists(path):
+orig_existed = os.path.exists(path)
+if orig_existed:
     try:
         st_existing = os.stat(path)
         if (st_existing.st_mode & 0o022) == 0:
@@ -160,13 +164,14 @@ if action == "check":
 if action == "get-db":
     entry = servers.get("agent-memory")
     env = entry.get("env") if isinstance(entry, dict) else None
-    print(env.get("AGENT_MEMORY_DB", "") if isinstance(env, dict) else "")
+    val = str(env.get("AGENT_MEMORY_DB", "")).strip() if isinstance(env, dict) else ""
+    print(val if val and "${" not in val else "")
     sys.exit(0)
 if action == "get-allow-non-optane":
     entry = servers.get("agent-memory")
     env = entry.get("env") if isinstance(entry, dict) else None
-    val = str(env.get("ALLOW_NON_OPTANE", "")) if isinstance(env, dict) else ""
-    print("1" if str(val).strip().lower() in ("1", "true", "yes", "on") else "")
+    val = str(env.get("ALLOW_NON_OPTANE", "")).strip() if isinstance(env, dict) else ""
+    print("1" if "${" not in val and val.lower() in ("1", "true", "yes", "on") else "")
     sys.exit(0)
 if action == "add":
     new = json.loads(sys.argv[3])
@@ -180,7 +185,7 @@ elif action == "remove":
 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 os.makedirs(os.path.dirname(orig_path) or ".", exist_ok=True)
 bak_path = orig_path + ".agent-memory.bak"
-if os.path.exists(path) and not os.path.lexists(bak_path):
+if action == "add" and orig_existed and not os.path.lexists(bak_path):
     shutil.copy2(path, bak_path)
     try:
         os.chmod(bak_path, 0o600)
@@ -212,7 +217,11 @@ if [ "${UNINSTALL}" -eq 1 ]; then
         DB_HINT="$(mcp_config_edit get-db "${MCP_CONFIG}")"
         if [ "${DRY_RUN}" -eq 0 ]; then
             mcp_config_edit remove "${MCP_CONFIG}"
-            say "Removed agent-memory from ${MCP_CONFIG} (original kept as ${MCP_CONFIG}.agent-memory.bak)"
+            if [ -f "${MCP_CONFIG}.agent-memory.bak" ] || [ -L "${MCP_CONFIG}.agent-memory.bak" ]; then
+                say "Removed agent-memory from ${MCP_CONFIG} (original kept as ${MCP_CONFIG}.agent-memory.bak)"
+            else
+                say "Removed agent-memory from ${MCP_CONFIG}"
+            fi
         else
             say "[dry-run] Would remove agent-memory from ${MCP_CONFIG}"
         fi
@@ -292,6 +301,9 @@ DOCTOR_ERR="$(mktemp)"
 cleanup() {
     local rc=$?
     rm -f "${DOCTOR_ERR}" ${TMP_BIN:+"${TMP_BIN}"}
+    if [ "${rc}" -ne 0 ] && [ "${RESULTS_WRITTEN:-0}" -eq 0 ]; then
+        write_results_json "error" "aborted (exit ${rc})" || true
+    fi
     exit "${rc}"
 }
 trap cleanup EXIT

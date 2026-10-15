@@ -83,6 +83,14 @@ Measured using `python3 benchmark/benchmark_comparison.py -n 100` across physica
 - **Write Amplification**: Unassisted JSON rewrite patterns re-serialize the entire array on every observation, generating severe O(N^2) write amplification (writing ~1.38 MB to disk for a 27 KB file across 100 writes). SQLite WAL appends only modified 4KB pages (strictly O(N) write volume) with tuned pragmas (`journal_size_limit = 33554432` (32 MB), `wal_autocheckpoint = 2000`, `mmap_size = 268435456` (256 MB), `cache_size = -8192` (8 MB)).
 - **Concurrency & Subagent Safety**: SQLite WAL handles concurrent subagent reads and serialized writes with a 5000 ms busy-timeout queue. Unassisted flat files lack write serialization and corrupt or clobber records during parallel subagent execution.
 - **Linux Page Cache Masking on Read**: In all tests, read/search latency (~0.25 to 0.26 ms) is virtually identical across drives because the ~77 KB working set is completely cached in Linux kernel Page Cache (DRAM). Physical drive media is not queried during warm reads, and the reported latency measures CPU time for Python argument parsing and SQLite FTS5 BM25 index traversal in memory.
+  - *Positive Exemplar*: `Run ./install.sh and verify "healthy": true via ~/.local/bin/agent-memory doctor before starting agent sessions.`
+  - *Negative Exemplar*: `Copy bin/agent-memory manually without running preflight checks or append concurrent observations to flat MEMORY.md files.` (STRICTLY FORBIDDEN)
+
+### Verification & Failure Recovery
+
+Confirms that preflight, self-test, and `doctor` diagnostics pass after running `./install.sh` to verify deployment readiness, preventing uninitialized or misconfigured databases from serving MCP traffic.
+
+- If `./install.sh` or `doctor` exits non-zero, inspect the failing field in the JSON output and consult the Troubleshooting table below before retrying.
 
 ## Configuration
 
@@ -103,7 +111,7 @@ Enforces filesystem permission, symlink, hardware verification, secret hygiene, 
 - **Database Permissions**: The database file and backups must be owned by the calling UID and have mode `0600`.
 - **Symlink & Sidecar Defense**: Unowned symlinks and symlinked or group/world-writable database sidecars (`-wal`, `-shm`, `-journal`) are rejected.
 - **Host Secret Perimeter Defense**: Database paths, backups, and restores inside quarantined credential directories are deterministically blocked.
-- **Secret Hygiene & Hard Isolation**: Raw credentials, private keys, API tokens, and conversational persona prose are rejected on write. Input sizes are bounded (`content` max 8000 chars, `summary` max 2000 chars, `entity` / `session_id` / `relation_type` max 200 chars, `attributes` / `metadata` max 4000 serialized chars).
+- **Secret Hygiene & Hard Isolation**: Server-side `_screen_for_secrets` rejects raw credentials, private keys, API tokens, non-7-bit-ASCII bytes, and roleplay stage-direction markers on write, while the calling agent enforces the full Hard Isolation Rule across all recorded text. Input sizes are bounded (`content` max 8000 chars, `summary` max 2000 chars, `entity` / `session_id` / `relation_type` max 200 chars, `attributes` / `metadata` max 4000 serialized chars).
 - **Optane Hardware Verification**: In Optane mode, `sysfs` resolves the mount to the underlying block device, checks `queue/rotational == 0`, and matches Intel Optane PCI/model IDs. Hybrid Optane H10/H20 drives and network filesystems are rejected.
 
 ### 2. MCP Client Configs
@@ -174,6 +182,14 @@ am benchmark -n 100
 
 - **Allowed Categories**: `architecture`, `decision`, `invariant`, `preference`, `debug_finding`.
 - **Canonical Forward Relation Verbs**: `depends_on`, `hosted_on`, `deploys_to`, `provisions`, `governs`, `references`, `synchronizes_with`, `stores_data_for`, `authenticates_against`.
+  - *Positive Exemplar*: `Configure explicit absolute paths in mcp_config.json and invoke CLI subcommands through the quoted am() wrapper.`
+  - *Negative Exemplar*: `Pass unexpanded ${HOME} variables in MCP args or store database files in group-writable directories.` (STRICTLY FORBIDDEN)
+
+### Verification & Failure Recovery
+
+Validates MCP configuration JSON syntax and runs `am doctor` after updating environment variables or client registrations to confirm valid settings, preventing broken stdio launches.
+
+- If the MCP client fails to connect after a configuration update, run `./install.sh` to validate and rewrite the client registration entry.
 
 ## Troubleshooting
 
@@ -186,3 +202,12 @@ Maps common diagnostic errors from `agent-memory doctor` to their root causes an
 | `is a symlink owned by uid ...` | Symlink target or sidecar owned by different user | Remove symlink or fix ownership. Symlinked sidecars are prohibited. |
 | `fts_index: out of sync` | FTS5 index desynchronized | Run `agent-memory init` (or `init --force` for full rebuild). |
 | `Foreign key violations` | Corrupt database relations | Restore from backup: `agent-memory restore <backup.db>`. |
+
+- *Positive Exemplar*: `Diagnose health failures with agent-memory doctor and rebuild desynchronized FTS5 indexes with agent-memory init --force.`
+- *Negative Exemplar*: `Delete SQLite -wal or -shm sidecar files manually while a writer connection is active.` (STRICTLY FORBIDDEN)
+
+### Verification & Failure Recovery
+
+Re-runs `agent-memory doctor` after executing any remediation step to confirm that `"healthy": true` is restored, preventing incomplete repairs from leaving the store offline.
+
+- If `init --force` cannot repair a corrupted database file, restore the latest pre-migration or manual backup via `agent-memory restore <backup.db>`.
