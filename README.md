@@ -1,20 +1,18 @@
 # agent-memory-mcp
 
-Provides a per-user SQLite semantic memory and knowledge graph store (CLI and stdio MCP server) for AI coding agents to persist durable technical context across sessions, preventing flat `MEMORY.md` files from causing O(N) prompt token blowup and concurrent subagent write corruption.
+Provides a per-user SQLite semantic memory and knowledge graph store (CLI and stdio MCP server) backed by Intel Optane NVMe media by default (or standard storage via `--allow-non-optane`) to persist durable technical context across sessions, preventing flat `MEMORY.md` files from causing O(N) prompt token blowup and concurrent subagent write corruption.
 
-By default, `agent-memory` requires an Intel Optane NVMe SSD to guarantee sub-millisecond durable `fsync` writes without flash wear, while non-Optane storage is supported via an explicit `--allow-non-optane` override flag.
-
-## Quickstart
+## 1. Quickstart & Benchmarks
 
 Walks through runtime prerequisite checks, installation, health verification, and empirical performance benchmarks to deploy a verified local memory server, preventing prerequisite or storage-gate failures.
 
 ### 1. Check Prerequisites
 
-Verifies Python 3.10+ and SQLite FTS5/JSON1 extension availability before running the installer to confirm runtime compatibility, preventing missing SQLite extensions from blocking full-text index creation.
+Verifies Python 3.10+ and SQLite 3.31+ with FTS5 and JSON1 (`json_patch`) extension availability before running the installer to confirm runtime compatibility, preventing missing SQLite extensions from blocking full-text index creation or JSON Merge Patch updates.
 
 ```bash
 python3 -V                                                   # 3.10+ required
-python3 -c $'import sqlite3\nconn = sqlite3.connect(":memory:")\nconn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nprint("SQLite", sqlite3.sqlite_version, "with FTS5 and JSON1: OK")'
+python3 -c $'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 31, 0), sqlite3.sqlite_version\nconn = sqlite3.connect(":memory:")\nconn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nconn.execute("SELECT json_patch(\'{}\', \'{}\')")\nprint("SQLite", sqlite3.sqlite_version, "with FTS5 and JSON1: OK")'
 ```
 
 ### 2. Install
@@ -31,14 +29,15 @@ sudo mkdir -p /mnt/optane/$USER && sudo chown $USER: /mnt/optane/$USER && sudo c
 ```bash
 ./install.sh --allow-non-optane
 ```
-Defaults the database path to `~/.local/share/agent-memory/memory.db` (or `/mnt/optane/$USER/agent_memory/memory.db` if present). Pass an explicit path with `--db /path/to/memory.db`.
+Defaults the database path to `/mnt/optane/$USER/agent_memory/memory.db` when `/mnt/optane/$USER` exists and is owned by `$USER` without group/world write permissions, or `${XDG_DATA_HOME:-~/.local/share}/agent-memory/memory.db` otherwise. Pass an explicit path with `--db /path/to/memory.db`. Additional installer flags include `--require-optane` (`--no-allow-non-optane`), `--no-client-config`, `--dry-run`, `--log-dir /abs/dir`, and `--uninstall`.
 
 ### 3. Verify Health
 
 Confirms database integrity, permissions, storage gate status, and FTS5 index synchronization to validate the installation, preventing runtime MCP tool errors when `"healthy"` is `false`.
 
 ```bash
-~/.local/bin/agent-memory doctor
+~/.local/bin/agent-memory doctor                         # Optane host (or after client config is written)
+ALLOW_NON_OPTANE=1 ~/.local/bin/agent-memory doctor      # Non-Optane host when --no-client-config was used
 ```
 Must return `"healthy": true`.
 
@@ -92,26 +91,33 @@ Confirms that preflight, self-test, and `doctor` diagnostics pass after running 
 
 - If `./install.sh` or `doctor` exits non-zero, inspect the failing field in the JSON output and consult the Troubleshooting table below before retrying.
 
-## Configuration
+## 2. Configuration & Client Registration
 
 Lists environment variables, security gates, MCP client registration snippets, and CLI commands to configure `agent-memory` across host environments, preventing path fallbacks, unauthorized file access, or argument splitting.
 
 | Variable | Description | Default |
 |---|---|---|
-| `AGENT_MEMORY_DB` | Absolute path to SQLite database | `/mnt/optane/$USER/agent_memory/memory.db` (Optane) or `~/.local/share/agent-memory/memory.db` (non-Optane) |
+| `AGENT_MEMORY_DB` | Absolute path to SQLite database | `/mnt/optane/$USER/agent_memory/memory.db` (Optane) or `${XDG_DATA_HOME:-~/.local/share}/agent-memory/memory.db` (non-Optane) |
 | `AGENT_MEMORY_SYNC` | SQLite WAL synchronous mode (`FULL`, `NORMAL`, `OFF`, `EXTRA`) | `FULL` (Optane) or `NORMAL` (non-Optane) |
 | `ALLOW_NON_OPTANE` | Set to `1` to bypass hardware checks for non-Optane storage | `0` |
 | `OPTANE_BASE` | Base directory on `/mnt/optane/$USER` | `/mnt/optane/$USER` |
+| `XDG_DATA_HOME` | Base directory for non-Optane default database path | `~/.local/share` |
+| `AGENT_MEMORY_NO_CFG_FALLBACK` | Set to `1` to disable reading `AGENT_MEMORY_DB`/`ALLOW_NON_OPTANE` from client MCP config files | `0` |
+| `AGENT_MEMORY_BIN_DIR` (`BIN_DIR`) | Installer target directory for `agent-memory` executable | `~/.local/bin` |
+| `AGENT_MEMORY_MCP_DIR` (`MCP_DIR`) | Installer target directory for Antigravity MCP schema files | `~/.gemini/antigravity-cli/mcp/agent-memory` |
+| `AGENT_MEMORY_SKILL_DIR` (`SKILL_DIR`) | Installer target directory for `agent-memory` skill files | `~/.gemini/config/skills/agent-memory` |
+| `AGENT_MEMORY_MCP_CONFIG` (`MCP_CONFIG`) | Installer target path for Antigravity `mcp_config.json` | `~/.gemini/config/mcp_config.json` |
+| `ALLOW_ROOT` | Set to `1` in `install.sh` to override the root-install guard | `0` |
 
 ### 1. Storage Gate & Security Rules
 
 Enforces filesystem permission, symlink, hardware verification, secret hygiene, and persona isolation gates to protect stored observations, preventing unauthorized local access or policy violations.
 
 - **Directory Ownership**: The database directory must be owned by the calling UID and have mode `0700` (not group- or world-writable).
-- **Database Permissions**: The database file and backups must be owned by the calling UID and have mode `0600`.
-- **Symlink & Sidecar Defense**: Unowned symlinks and symlinked or group/world-writable database sidecars (`-wal`, `-shm`, `-journal`) are rejected.
+- **Database Permissions**: The database file, client configuration files modified by `install.sh`, and backups must be owned by the calling UID and have mode `0600`.
+- **Symlink & Sidecar Defense**: Unowned symlinks and symlinked, pre-existing orphan, or group/world-writable database sidecars (`-wal`, `-shm`, `-journal`) are rejected.
 - **Host Secret Perimeter Defense**: Database paths, backups, and restores inside quarantined credential directories are deterministically blocked.
-- **Secret Hygiene & Hard Isolation**: Server-side `_screen_for_secrets` rejects raw credentials, private keys, API tokens, non-7-bit-ASCII bytes, and roleplay stage-direction markers on write, while the calling agent enforces the full Hard Isolation Rule across all recorded text. Input sizes are bounded (`content` max 8000 chars, `summary` max 2000 chars, `entity` / `session_id` / `relation_type` max 200 chars, `attributes` / `metadata` max 4000 serialized chars).
+- **Secret Hygiene & Hard Isolation**: Server-side `_screen_for_secrets` rejects raw credentials, private keys, API tokens, `AGE-SECRET-KEY-1...` keys, non-7-bit-ASCII bytes (including `\r` and C0 control escapes), and roleplay stage-direction markers on write, while the calling agent enforces the full Hard Isolation Rule across all recorded text. Input sizes are bounded (`content` max 8000 chars, `summary` max 2000 chars, `query` max 1000 chars, `entity` / `session_id` / `relation_type` / `observation_id` max 200 chars, `tags` max 20 items of 100 chars each, `attributes` / `metadata` max 4000 serialized chars both before and after JSON Merge Patch).
 - **Optane Hardware Verification**: In Optane mode, `sysfs` resolves the mount to the underlying block device, checks `queue/rotational == 0`, and matches Intel Optane PCI/model IDs. Hybrid Optane H10/H20 drives and network filesystems are rejected.
 
 ### 2. MCP Client Configs
@@ -145,7 +151,7 @@ Client configuration file paths:
 
 ### 3. CLI Commands & Ontology
 
-Demonstrates direct command-line usage via the `am()` shell function and lists canonical categories and relation verbs so operators can query and maintain the store from a shell, preventing unquoted aliases or ad-hoc taxonomy terms from fragmenting retrieval.
+Demonstrates direct command-line usage via the `am()` shell function and lists canonical entity types, categories, and relation verbs so operators can query and maintain the store from a shell, preventing unquoted aliases or ad-hoc taxonomy terms from fragmenting retrieval.
 
 Define a word-splitting-safe shell function in your interactive shell environment:
 ```bash
@@ -155,21 +161,25 @@ am() {
 ```
 
 ```bash
+# Initialize or rebuild schema/FTS5 index
+am init [--force|-f]
+
 # Store a fact
-am record "nginx proxy buffers must be disabled for SSE streaming" --entity gateway --type service --category debug_finding --tags nginx,sse
+am record "nginx proxy buffers must be disabled for SSE streaming" --entity gateway --type service --summary "Edge API gateway" --category debug_finding --tags nginx,sse --confidence 1.0 --session default --attributes '{"port":443}'
 
 # Search
-am search "SSE streaming" --category debug_finding
+am search "SSE streaming" --category debug_finding --session default --limit 10
 
-# Inspect an entity (optionally filtered by category)
-am recall gateway --category debug_finding
+# Inspect an entity (optionally filtered by category or session)
+am recall gateway --category debug_finding --session default --limit 20 --relation-limit 50
 
 # Relate entities
-am relate gateway auth-service depends_on
+am relate gateway auth-service depends_on --weight 1.0 --metadata '{"protocol":"gRPC"}'
 
-# Delete an observation or entity
+# Delete an observation, entity, or relation edge
 am forget --observation <uuid>
 am forget --entity gateway
+am forget --source gateway --target auth-service [--relation-type depends_on]
 
 # Backup and restore
 am backup ~/backup.db
@@ -180,8 +190,9 @@ am doctor
 am benchmark -n 100
 ```
 
-- **Allowed Categories**: `architecture`, `decision`, `invariant`, `preference`, `debug_finding`.
-- **Canonical Forward Relation Verbs**: `depends_on`, `hosted_on`, `deploys_to`, `provisions`, `governs`, `references`, `synchronizes_with`, `stores_data_for`, `authenticates_against`.
+- **Allowed Entity Types**: `service`, `repo`, `pattern`, `concept` (default), `operator`, `host`.
+- **Allowed Categories**: `architecture` (default), `decision`, `invariant`, `preference`, `debug_finding`.
+- **Canonical Forward Relation Verbs**: `depends_on`, `hosted_on`, `deploys_to`, `provisions`, `governs`, `references` (default), `synchronizes_with`, `stores_data_for`, `authenticates_against`.
   - *Positive Exemplar*: `Configure explicit absolute paths in mcp_config.json and invoke CLI subcommands through the quoted am() wrapper.`
   - *Negative Exemplar*: `Pass unexpanded ${HOME} variables in MCP args or store database files in group-writable directories.` (STRICTLY FORBIDDEN)
 
@@ -191,17 +202,19 @@ Validates MCP configuration JSON syntax and runs `am doctor` after updating envi
 
 - If the MCP client fails to connect after a configuration update, run `./install.sh` to validate and rewrite the client registration entry.
 
-## Troubleshooting
+## 3. Troubleshooting & Recovery
 
 Maps common diagnostic errors from `agent-memory doctor` to their root causes and remediation commands to restore database health, preventing unaddressed storage or index errors from blocking MCP tools.
 
-| Error | Cause | Fix |
+1. **Diagnostic Error Reference**:
+
+| `doctor` Output Field | Cause | Fix |
 |---|---|---|
-| `storage_gate: not Intel Optane NVMe` | DB is on standard flash or virtual disk | Run with `--allow-non-optane`, or move DB to `/mnt/optane/$USER`. |
-| `writable: no` | Directory or database permissions incorrect | Run `sudo chown $USER: <dir> && chmod 700 <dir>` (and `chmod 600 <db>`). |
-| `is a symlink owned by uid ...` | Symlink target or sidecar owned by different user | Remove symlink or fix ownership. Symlinked sidecars are prohibited. |
-| `fts_index: out of sync` | FTS5 index desynchronized | Run `agent-memory init` (or `init --force` for full rebuild). |
-| `Foreign key violations` | Corrupt database relations | Restore from backup: `agent-memory restore <backup.db>`. |
+| `storage_gate: ... is not on a verified Intel Optane NVMe device` (or `not under '/mnt/optane/...'`) | DB is on standard flash or virtual disk without non-Optane override | Run `./install.sh --allow-non-optane` (or set `ALLOW_NON_OPTANE=1`), or move DB to `/mnt/optane/$USER`. |
+| `writable: no: '<path>' is not writable by uid ...` (or `is on a read-only mount`) | Directory or database permissions incorrect or read-only mount | Run `sudo chown $USER: <dir> && chmod 700 <dir>` (and `chmod 600 <db>`). |
+| `permissions: error: ... is a symlink owned by uid ...` (or `sidecar ... is a symlink`) | Symlink target or sidecar owned by different user | Remove symlink or fix ownership. Symlinked sidecars are prohibited. |
+| `fts_index: out of sync: <M> indexed vs <N> facts (run 'agent-memory init')` | FTS5 index desynchronized from `observations` table | Run `agent-memory init` (or `agent-memory init --force` for full rebuild). |
+| `foreign_keys: <N> violation(s): ...` | Corrupt database relations | Run `agent-memory init --force` or restore from backup via `agent-memory restore <backup.db>`. |
 
 - *Positive Exemplar*: `Diagnose health failures with agent-memory doctor and rebuild desynchronized FTS5 indexes with agent-memory init --force.`
 - *Negative Exemplar*: `Delete SQLite -wal or -shm sidecar files manually while a writer connection is active.` (STRICTLY FORBIDDEN)
@@ -212,15 +225,15 @@ Re-runs `agent-memory doctor` after executing any remediation step to confirm th
 
 - If `init --force` cannot repair a corrupted database file, restore the latest pre-migration or manual backup via `agent-memory restore <backup.db>`.
 
-## License
+## 4. License & Governance
 
 Governs source distribution and modification under the GNU General Public License v3.0 (`GPL-3.0-only`) to protect author attribution and reciprocal open-source obligations, preventing unauthorized proprietary relicensing or closed-source commercial redistribution.
 
-- **Copyright**: Copyright (c) 2026 Christopher Schek.
-- **SPDX Identifier**: `GPL-3.0-only` (see [`LICENSE`](LICENSE) for full terms).
-- **Modification & Distribution Reciprocity**: Any distribution of modified or unmodified copies requires preserving copyright notices and making the complete corresponding source code available under `GPL-3.0-only`.
-  - *Positive Exemplar*: `Retain the LICENSE file, copyright notices, and SPDX-License-Identifier: GPL-3.0-only headers in all copies and modified distributions.`
-  - *Negative Exemplar*: `Strip copyright notices or distribute agent-memory as part of a closed-source commercial product.` (STRICTLY FORBIDDEN)
+1. **Copyright**: Copyright (c) 2026 Christopher Schek.
+2. **SPDX Identifier**: `GPL-3.0-only` (see [`LICENSE`](LICENSE) for full terms).
+3. **Modification & Distribution Reciprocity**: Any distribution of modified or unmodified copies requires preserving copyright notices and making the complete corresponding source code available under `GPL-3.0-only`.
+   - *Positive Exemplar*: `Retain the LICENSE file, copyright notices, and SPDX-License-Identifier: GPL-3.0-only headers in all copies and modified distributions.`
+   - *Negative Exemplar*: `Strip copyright notices or distribute agent-memory as part of a closed-source commercial product.` (STRICTLY FORBIDDEN)
 
 ### Verification & Failure Recovery
 

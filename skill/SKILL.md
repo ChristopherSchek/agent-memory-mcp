@@ -90,9 +90,9 @@ Documents the input schemas, parameter constraints, and return structures for al
 |---|---|---|
 | `memory_search` | `query` (optional if `category` given, max 2000 chars, at least one required), optional `category`, `session_id` (max 200 chars), `limit` (1 to 100, default 10) | list of facts with `observation_id`, `session_id`, `category`, `content`, `tags`, `confidence`, `created_at`, `entity_name`, `entity_type`, `rank`, `match`. Returns `[]` if no matches. |
 | `memory_recall` | `entity` (required, max 200 chars), optional `category`, `session_id` (max 200 chars), `limit` (1 to 100, default 20), `relation_limit` (1 to 100, default 50) | entity `entity_id`, `name`, `type`, `summary`, `attributes`, `created_at`, `updated_at`, `observations`, `has_more_observations`, `outgoing_relations`, `has_more_outgoing_relations`, `incoming_relations`, `has_more_incoming_relations` |
-| `memory_record` | `content` (required, max 8000 chars), optional `entity` (max 200 chars, auto-created), `entity_type` (requires entity), `summary` (max 2000 chars, requires entity), `category`, `tags` (max 50 items, 100 chars each), `confidence` (0 to 1), `session_id` (max 200 chars), `attributes` (max 4000 serialized chars, requires entity) | `status` (`success`, or `exists` if that entity already has the identical fact), `observation_id`, `entity_id`, `entity_name`, `category`, `session_id` |
-| `memory_relate` | `source`, `target` (required distinct entities, max 200 chars, auto-created), optional `relation_type` (max 200 chars, default `references`), `weight` (0 to 100), `metadata` (max 4000 serialized chars) | `status` (`success`), `relation_id`, `source`, `target`, `relation_type` |
-| `memory_forget` | exactly one mode: (1) `observation_id`, (2) `entity` (cascades to all facts and edges), or (3) `source` + `target` (+ optional `relation_type`) | `status` (`success`) and deleted counts: `deleted_observations`, `deleted_entity`, `deleted_relations` |
+| `memory_record` | `content` (required, max 8000 chars), optional `entity` (max 200 chars, auto-created), `entity_type` (default `concept`, requires entity), `summary` (max 2000 chars, requires entity), `category` (default `architecture`), `tags` (max 50 items, 100 chars each), `confidence` (0 to 1, default 1.0), `session_id` (max 200 chars, default `default`), `attributes` (max 4000 serialized chars pre- and post-merge, requires entity) | `status` (`success`, or `exists` if that entity already has the identical fact), `observation_id`, `entity_id`, `entity_name`, `category`, `session_id` |
+| `memory_relate` | `source`, `target` (required distinct entities, max 200 chars, auto-created), optional `relation_type` (max 200 chars, default `references`), `weight` (0 to 100, default 1.0 on create, unchanged on update when omitted), `metadata` (max 4000 serialized chars pre- and post-merge) | `status` (`success`), `relation_id`, `source`, `target`, `relation_type` |
+| `memory_forget` | exactly one mode (all string arguments max 200 chars): (1) `observation_id`, (2) `entity` (cascades to all facts and edges), or (3) `source` + `target` (+ optional `relation_type`) | Mode (1): `{"status": "success", "deleted_observations": 1}`. Mode (2): `{"status": "success", "deleted_entity": "<canonical_name>", "deleted_observations": N, "deleted_relations": M}`. Mode (3): `{"status": "success", "deleted_relations": N}`. |
 
 - **Categories**: `architecture` (default), `decision`, `invariant`, `preference`, `debug_finding`.
 - **Entity Types**: `service`, `repo`, `pattern`, `concept` (default), `operator`, `host`.
@@ -173,8 +173,9 @@ Defines case-folding and canonical name retention for graph nodes to unify entit
 
 Governs how entity summaries, types, and JSON attributes are merged or deleted to preserve attached records, preventing callers from misusing `memory_forget` and destroying connected observations and relations.
 
-- **JSON Merge Patch**: `attributes` and `metadata` are merged with existing values following RFC 7396 (setting a key to `null` deletes that key, while `{}` is a no-op).
+- **JSON Merge Patch**: `attributes` and `metadata` are merged with existing values following RFC 7396 (setting a key to `null` deletes that key, while `{}` is a no-op) and capped at `4000` serialized characters both before and after merging.
 - **Cascade Warning**: `memory_record` cannot reset an entity's type to `concept` or clear its summary. Calling `memory_forget(entity=...)` cascades deletion to all connected observations and relations, so never call `memory_forget(entity=...)` solely to update an entity's type or summary when existing facts must be preserved.
+- **Orphan Stub Pruning**: When `memory_forget` deletes observations, relations, or an entity, any auto-created `concept` stub entities left with zero observations, zero relations, an empty summary, and empty `{}` attributes are automatically pruned.
 - **Entity Name Requirement**: Specifying `summary`, non-default `entity_type`, or `attributes` without an `entity` name returns a validation error.
 
 ### Sessions and Timestamps
@@ -228,14 +229,16 @@ am() {
 Using `am()` with `"$@"` guarantees that whitespace and special characters are preserved without word-splitting bugs. Always pass CLI arguments directly as separate tokens:
 
 ```bash
-am search terms to look for [--category C] [--limit N]
-am recall "name" [--category C] [--limit N] [--relation-limit N]
-am record "fact" --entity NAME [--type T] [--category C] [--tags a,b]
-am relate SOURCE TARGET depends_on
-am forget --observation ID | --entity NAME | --source S --target T [--type R]
+am init [--force|-f]
+am search [terms ...] [--category|-c C] [--session|-s S] [--limit|-l N]
+am recall "name" [--category|-c C] [--session|-s S] [--limit|-l N] [--relation-limit|--rel-limit N]
+am record "fact" [--entity|-e NAME] [--type|-t T] [--summary TEXT] [--category|-c C] [--tags a,b] [--confidence 0.0-1.0] [--session|-s S] [--attributes|-a JSON]
+am relate SOURCE TARGET [RELATION_TYPE] [--type|-t R] [--weight|-w 0.0-100.0] [--metadata|-m JSON]
+am forget --observation ID | --entity|-e NAME | --source S --target T [--type|--relation-type|-t R]
 am backup /path/to/copy.db
 am restore /path/to/backup.db
 am doctor
+am benchmark [-n|--iterations COUNT]
 ```
 - *Positive Exemplar*: `Invoke am record "Verified invariant" --entity "agent-baseline" --category "invariant" with quoted multi-word arguments.`
 - *Negative Exemplar*: `Pass unquoted multi-word observation strings or option-like database paths to CLI subcommands.` (STRICTLY FORBIDDEN)

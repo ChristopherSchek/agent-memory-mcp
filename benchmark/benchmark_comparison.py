@@ -335,6 +335,9 @@ def print_markdown_comparison(
     print(f"\n# Memory Benchmark Results ({count} Iterations)\n")
     print("Summarizes comparative write latency, context token consumption, and durability across storage tiers and memory architectures to guide storage selection without unbenchmarked performance assumptions.\n")
 
+    print("## 1. Comparative Benchmark Tables\n")
+    print("Presents hardware commit latency and context scaling measurements across storage media and persistence patterns to quantify physical and architectural overhead, preventing unmeasured storage or context bottlenecks.\n")
+
     # Table 1: Physical Storage Benchmark (Pure Hardware & Disk Latency)
     print("### Table 1: Physical Storage Benchmark (Pure Hardware & Disk Latency)\n")
     print("Compares average commit latency across dedicated low-latency media and standard local storage for each persistence pattern to quantify hardware fsync speedup, preventing storage tier misconfiguration.\n")
@@ -372,7 +375,10 @@ def print_markdown_comparison(
     print(f"| **Flat Markdown (MEMORY.md)** | ~{md_tokens:,} tokens (unbounded O(N)) | {md_ttft} | O(N) raw text appends | **Unsafe** (interleaved line corruption) |")
     print(f"| **JSON Rewrite (notes.json)** | ~{json_tokens:,} tokens (unbounded O(N)) | {json_ttft} | O(N^2) full array rewrites | **Unsafe** (full-file overwrite clobber) |")
 
-    print("\n### Operational Guidance & Technical Notes\n")
+    print("\n## 2. Architectural Analysis\n")
+    print("Examines durability barriers, kernel page-cache warm reads, and multi-agent lock contention across storage tiers so operators can interpret benchmark metrics without misreading OS cache effects.\n")
+
+    print("### Operational Guidance & Technical Notes\n")
     print("Details durability trade-offs, kernel page-cache behavior, and concurrency guarantees to explain the benchmark measurements without leaving architectural assumptions implicit.\n")
     print("1. Durability Modes: sync=FULL vs. sync=NORMAL:")
     print("   - sync=FULL (Default on Optane): Issues a physical hardware barrier (fdatasync) directly to the drive controller on every commit. Guarantees zero data loss across sudden host power loss, UPS failure, or kernel panics. On Intel Optane (3D XPoint), byte-addressability commits hardware fsync in sub-millisecond latency with zero flash wear.")

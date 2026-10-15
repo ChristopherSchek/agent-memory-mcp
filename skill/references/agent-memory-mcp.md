@@ -118,12 +118,34 @@ Enforces mandatory security, storage, and isolation invariants across all memory
 3. **Host Secret Perimeter Defense**: Database initialization, connections, backups, and restores enforce [`guard-secret-paths`](../../guard-secret-paths/SKILL.md) and refuse any path inside quarantined credential directories.
 4. **Hard Isolation Rule**: Conversational personas, aristocratic titles, terms of endearment, non-7-bit-ASCII bytes, and roleplay prose must never be written into observations, entity names, summaries, attributes, or relation metadata.
 5. **Storage Gate Failure**: When `ALLOW_NON_OPTANE=0` is set and the database path does not reside on the verified per-user Optane mount point, the server aborts writes to prevent silent performance degradation on unverified media.
-6. **Cross-Discipline Governance**: Operations coordinate across all 15 canonical baseline modules (`guard-secret-paths`, `plain-writing`, `secret-hygiene`, `permissions-hygiene`, `git-forge-governance`, `delegated-execution-scripting`, `principal-tooling`, `skunkworks-scratch`, `cleanup-skunkworks`, `audit-harness`, `update-baseline`, `agent-memory`, `sync-ide-conversations`, `sync-cli-conversations`, `cleanup-conversations`), built-in skills (`agy-customizations`, `antigravity-guide`), and `personas`.
    - *Positive Exemplar*: `Enforce secret screening, guarded-path checks, and 7-bit ASCII Hard Isolation on every memory write.`
    - *Negative Exemplar*: `Point AGENT_MEMORY_DB or backup destinations inside quarantined credential directories or record unmasked secrets.` (STRICTLY FORBIDDEN)
 
 ### Verification & Failure Recovery
 
-Audits database health and cross-repository synchronization after any security or storage error to restore clean-room operation, preventing unverified state from persisting.
+Audits database health and security screening after any security or storage error to restore clean-room operation, preventing unverified state from persisting.
 
 - If a credential pattern or policy violation is detected, execute an immediate hard-stop, scrub the record via `memory_forget`, and verify database cleanliness with `am doctor`.
+
+---
+
+## 5. Hardwired Cross-Discipline Contracts
+
+Binds `agent-memory-mcp` integration to all fifteen canonical baseline modules, built-in skills, and persona isolation rules so every memory transaction preserves host security and three-way repository parity, preventing secret leaks, path quarantine violations, or documentation drift.
+
+1. **`secret-hygiene`**: Pre-write screening and operator workflows enforce [`secret-hygiene`](../../secret-hygiene/SKILL.md) to block raw tokens, keys, or connection strings from entering SQLite storage and trigger an immediate hard-stop upon any exposure.
+2. **`guard-secret-paths`**: Database connections, backups, and restores enforce [`guard-secret-paths`](../../guard-secret-paths/SKILL.md) and reject any target path inside quarantined credential stores.
+3. **`plain-writing` & `personas`**: All stored observations, entity summaries, attributes, relation metadata, and repository documentation adhere to `rules/plain-writing.md` and the Hard Isolation Rule (strict 7-bit ASCII, zero prose semicolons, and zero persona roleplay prose).
+4. **`permissions-hygiene` & `git-forge-governance`**: MCP client registrations and repository updates adhere to [`permissions-hygiene`](../../permissions-hygiene/SKILL.md) and `rules/git-forge-governance.md`.
+5. **`principal-tooling` & `delegated-execution-scripting`**: Source, schema, and benchmark changes are validated via [`principal-tooling`](../../principal-tooling/SKILL.md) (`tool_manager.py`) and `rules/delegated-execution-scripting.md`.
+6. **`skunkworks-scratch`, `cleanup-skunkworks` & `audit-harness`**: Transient test databases and adversarial audit artifacts stay isolated in `~/Git/SkunkWorks/` per [`skunkworks-scratch`](../../skunkworks-scratch/SKILL.md), [`cleanup-skunkworks`](../../cleanup-skunkworks/SKILL.md), and [`audit-harness`](../../audit-harness/SKILL.md).
+7. **`sync-ide-conversations`, `sync-cli-conversations` & `cleanup-conversations`**: Host conversation index workflows coordinate with [`sync-ide-conversations`](../../sync-ide-conversations/SKILL.md), [`sync-cli-conversations`](../../sync-cli-conversations/SKILL.md), and [`cleanup-conversations`](../../cleanup-conversations/SKILL.md).
+8. **`update-baseline`, `agy-customizations` & `antigravity-guide`**: Updates to [`SKILL.md`](../SKILL.md) and `references/agent-memory-mcp.md` maintain byte-for-byte parity across `agent-memory-mcp`, `agent-baseline`, and `~/.gemini/config/skills/agent-memory/` via [`update-baseline`](../../update-baseline/SKILL.md) in alignment with `agy-customizations` and `antigravity-guide`.
+   - *Positive Exemplar*: `Synchronize SKILL.md and references/agent-memory-mcp.md across agent-memory-mcp, agent-baseline, and ~/.gemini/config/skills/agent-memory/ after every edit.`
+   - *Negative Exemplar*: `Modify skill or reference documentation in one repository without updating its companion copy in agent-baseline.` (STRICTLY FORBIDDEN)
+
+### Verification & Failure Recovery
+
+Verifies cross-repository SHA-256 parity and baseline health after modifying `agent-memory-mcp` integration files to prevent configuration drift.
+
+- Run `python3 ~/.gemini/config/skills/update-baseline/scripts/baseline_updater.py check` to confirm zero drift between `agent-baseline` and `~/.gemini/config/`.

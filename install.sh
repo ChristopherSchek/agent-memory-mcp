@@ -8,10 +8,12 @@
 #   ./install.sh                         Install on a host with a verified Intel Optane
 #                                        volume at /mnt/optane/$USER.
 #   ./install.sh --allow-non-optane      Explicit opt-in to run on ordinary storage
-#                [--db /abs/path.db]     (default: /mnt/optane/$USER if it exists,
+#                [--db /abs/path.db]     (default: /mnt/optane/$USER if owned by $USER,
 #                                        else ~/.local/share/agent-memory/memory.db).
+#   ./install.sh --require-optane        Require verified Intel Optane storage (also
+#                                        --no-allow-non-optane or --allow-non-optane=0).
 #   ./install.sh --db /mnt/optane/$USER/custom/memory.db
-#   ./install.sh --no-client-config      Install and self-test only; print client snippets.
+#   ./install.sh --no-client-config      Install and self-test only, then print client snippets.
 #   ./install.sh --dry-run               Run preflight checks without modifying files.
 #   ./install.sh --log-dir /abs/dir      Write Tri-Stream telemetry (results.json, debug.log).
 #   ./install.sh --uninstall             Remove binary, skill and MCP registration (keeps data).
@@ -22,6 +24,8 @@
 #   AGENT_MEMORY_SKILL_DIR / SKILL_DIR   Target directory for agent-memory skill
 #   AGENT_MEMORY_MCP_CONFIG / MCP_CONFIG Target path for client mcp_config.json
 #   ALLOW_ROOT=1                         Override restriction against running as root
+#   (Shell AGENT_MEMORY_DB, OPTANE_BASE, and ALLOW_NON_OPTANE are ignored during install
+#    so the registered MCP entry matches explicit --db / --allow-non-optane flags.)
 #
 # Nothing is installed or registered until preflight, initialisation and self-test pass.
 # ==============================================================================
@@ -40,7 +44,7 @@ DRY_RUN=0
 LOG_DIR=""
 RESULTS_WRITTEN=0
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '4,31p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -129,7 +133,7 @@ die()  { printf 'Error: %s\n' "$*" >&2; log_debug "ERROR: $*"; write_results_jso
 # The interpreter is resolved once and pinned (as an absolute path) in the MCP registration, so the
 # server does not depend on the client's PATH. The launcher path (e.g. /usr/bin/python3) is kept rather
 # than its realpath (e.g. /usr/bin/python3.12) so a distribution Python upgrade does not break the
-# registration; the binary itself refuses to run on Python < 3.10.
+# registration, and the binary itself refuses to run on Python < 3.10.
 command -v python3 >/dev/null 2>&1 || die "python3 (3.10+) is required but was not found in PATH."
 python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
     || die "Python 3.10+ is required (found $(python3 -V 2>&1))."
@@ -151,15 +155,15 @@ orig_existed = os.path.exists(path)
 if orig_existed:
     try:
         st_existing = os.stat(path)
-        if (st_existing.st_mode & 0o022) == 0:
+        if (st_existing.st_mode & 0o077) == 0:
             orig_mode = st_existing.st_mode & 0o777
         with open(path, encoding="utf-8") as f:
             text = f.read()
         data = json.loads(text) if text.strip() else {}
     except (OSError, ValueError, TypeError) as e:
-        sys.exit(f"Error: {path} is not valid JSON ({e}); fix it manually, nothing was changed.")
+        sys.exit(f"Error: {path} is not valid JSON ({e}). Fix it manually (nothing was changed).")
     if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
-        sys.exit(f"Error: {path} must be a JSON object whose 'mcpServers' is an object; nothing was changed.")
+        sys.exit(f"Error: {path} must be a JSON object whose 'mcpServers' is an object (nothing was changed).")
 servers = data.setdefault("mcpServers", {})
 if action == "check":
     sys.exit(0)
@@ -263,7 +267,7 @@ done
 # ------------------------------------------------------------------------------
 for v in AGENT_MEMORY_DB OPTANE_BASE ALLOW_NON_OPTANE; do
     if [ -n "${!v:-}" ]; then
-        warn "Ignoring ${v} from your shell; use --db / --allow-non-optane so the registered MCP server gets the same setting."
+        warn "Ignoring ${v} from your shell. Use --db / --allow-non-optane so the registered MCP server gets the same setting."
     fi
 done
 if [ "${CLIENT_CONFIG}" -eq 1 ] && [ -f "${MCP_CONFIG}" ]; then
@@ -355,7 +359,7 @@ EOF
 fi
 DB_PATH_RESOLVED="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys; print(json.load(sys.stdin).get("db_path", ""))' 2>/dev/null || true)"
 [ -n "${DB_PATH_RESOLVED}" ] || die "preflight doctor did not return a valid db_path."
-say "Preflight passed; database: ${DB_PATH_RESOLVED}"
+say "Preflight passed (database: ${DB_PATH_RESOLVED})"
 [ "${ALLOW_NON_OPTANE_FLAG}" -eq 1 ] && warn "Non-Optane override is active (ALLOW_NON_OPTANE=1)."
 RUN_ENV=("${ENV_BASE[@]}" "AGENT_MEMORY_DB=${DB_PATH_RESOLVED}")
 
@@ -412,7 +416,7 @@ if "memory_record" not in names or "memory_forget" not in names:
 call = resp[3]["result"]
 if call.get("isError") or json.loads(call["content"][0]["text"]) != []:
     sys.exit(f"Self-test failed: MCP tool call: {call}")
-print(f"[+] Self-test passed: record -> search -> forget round trip, MCP handshake and tool call ({len(names)} tools); no data left behind")
+print(f"[+] Self-test passed: record -> search -> forget round trip, MCP handshake and tool call ({len(names)} tools), with no data left behind")
 PY
 
 # ------------------------------------------------------------------------------

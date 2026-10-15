@@ -37,15 +37,16 @@ Audits Python version, SQLite FTS5/JSON1 capabilities, and `/mnt/optane` mount a
 
 ```bash
 TARGET_USER="$(id -un)"
-PYTHON_VER="$(python3 -c $'import sys\nprint(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-SQLITE_VER="$(python3 -c $'import sqlite3\nprint(sqlite3.sqlite_version)')"
-HAS_FTS5="$(python3 -c $'import sqlite3\nc = sqlite3.connect(":memory:")\nc.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nprint("OK")' 2>/dev/null || echo "MISSING")"
+PYTHON_VER="$(python3 -I -c $'import sys\nprint(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+SQLITE_VER="$(python3 -I -c $'import sqlite3\nprint(sqlite3.sqlite_version)')"
+SQLITE_OK="$(python3 -I -c $'import sqlite3\nprint("OK" if sqlite3.sqlite_version_info >= (3, 31, 0) else "OLD")')"
+HAS_FTS5="$(python3 -I -c $'import sqlite3\nc = sqlite3.connect(":memory:")\nc.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nc.execute("SELECT json_patch(\'{}\', \'{}\')")\nprint("OK")' 2>/dev/null || echo "MISSING")"
 OPTANE_DIR_CHECK="$(ls -ld /mnt/optane /mnt/optane/${TARGET_USER} 2>&1 || true)"
 
 echo "USER: ${TARGET_USER}"
 echo "PYTHON: ${PYTHON_VER} (Required: >= 3.10)"
-echo "SQLITE: ${SQLITE_VER} (Required: >= 3.31)"
-echo "FTS5: ${HAS_FTS5} (Required: OK)"
+echo "SQLITE: ${SQLITE_VER} (${SQLITE_OK}, Required: >= 3.31)"
+echo "FTS5_AND_JSON1: ${HAS_FTS5} (Required: OK)"
 echo "OPTANE_CHECK: ${OPTANE_DIR_CHECK}"
 ```
 
@@ -55,9 +56,9 @@ Maps the Phase 1 inspection output to the appropriate installation branch to mat
 
 | Condition | Decision | Action |
 |---|---|---|
-| Python < 3.10 OR SQLite < 3.31 OR FTS5 == MISSING | **Halt** | Report missing runtime dependencies to the operator. Do not proceed. |
-| `/mnt/optane/<user>` exists, owned by user, mode is `0700` (`drwx------`) | **Branch A: Native Optane Mode** | Proceed to Section 3, Command A. |
-| `/mnt/optane` exists, but `/mnt/optane/<user>` does NOT exist | **Branch B: Uninitialized Optane** | Request operator run: `sudo mkdir -p /mnt/optane/$USER && sudo chown $USER: /mnt/optane/$USER && sudo chmod 700 /mnt/optane/$USER`. Once created, proceed to Command A. |
+| Python < 3.10 OR `SQLITE_OK` != `OK` OR `HAS_FTS5` == `MISSING` | **Halt** | Report missing runtime dependencies to the operator. Do not proceed. |
+| `/mnt/optane/<user>` exists, owned by user, mode is `0700` (`drwx------`), and resides on verified Intel Optane media | **Branch A: Native Optane Mode** | Proceed to Section 3, Command A. |
+| `/mnt/optane` exists on Intel Optane media, but `/mnt/optane/<user>` does NOT exist | **Branch B: Uninitialized Optane** | Request operator run: `sudo mkdir -p /mnt/optane/$USER && sudo chown $USER: /mnt/optane/$USER && sudo chmod 700 /mnt/optane/$USER`. Once created, proceed to Command A. |
 | `/mnt/optane` does NOT exist, or host is standard SSD / VM / WSL2 | **Branch C: Non-Optane Storage** | Proceed to Section 3, Command B (`--allow-non-optane`). |
 
 - *Positive Exemplar*: `Execute the read-only host inspection snippet and select Branch A, B, or C deterministically from its output.`
@@ -65,9 +66,9 @@ Maps the Phase 1 inspection output to the appropriate installation branch to mat
 
 ### Verification & Failure Recovery
 
-Confirms that `PYTHON >= 3.10`, `SQLITE >= 3.31`, and `FTS5 == OK` before advancing to Phase 2 to prevent unsupported runtime execution.
+Confirms that `PYTHON >= 3.10`, `SQLITE_OK == OK`, and `FTS5_AND_JSON1 == OK` before advancing to Phase 2 to prevent unsupported runtime execution.
 
-- If `HAS_FTS5` outputs `MISSING`, halt deployment and report that Python's `sqlite3` module was compiled without FTS5 support.
+- If `HAS_FTS5` outputs `MISSING`, halt deployment and report that Python's `sqlite3` module was compiled without FTS5 or JSON1 (`json_patch`) support.
 
 ---
 
@@ -97,9 +98,19 @@ Installs `agent-memory` with `ALLOW_NON_OPTANE=1` to support standard NVMe/SATA 
 ./install.sh --allow-non-optane
 ```
 
+- **Supported Installer Flags**:
+  - `--allow-non-optane`: Enable non-Optane storage (`ALLOW_NON_OPTANE=1`), resolving default database storage to `/mnt/optane/$USER/agent_memory/memory.db` if `/mnt/optane/$USER` exists and is owned by `$USER` (mode `0700`), or `${XDG_DATA_HOME:-~/.local/share}/agent-memory/memory.db` otherwise.
+  - `--require-optane`, `--no-allow-non-optane`: Explicitly require verified Intel Optane NVMe hardware (`ALLOW_NON_OPTANE=0`), overriding `ALLOW_NON_OPTANE=1` in the shell environment.
+  - `--db <path>`: Override the target SQLite database path (`AGENT_MEMORY_DB`).
+  - `--no-client-config`: Skip automatic `~/.gemini/config/mcp_config.json` registration and `SKILL.md` hydration.
+  - `-h`, `--help`: Display installer usage information.
+- **Supported Environment Variables**:
+  - Runtime: `AGENT_MEMORY_DB` (database path override), `ALLOW_NON_OPTANE` (`1` or `0`), `XDG_DATA_HOME` (base directory for non-Optane fallback storage), `AGENT_MEMORY_NO_CFG_FALLBACK` (`1` to disable reading MCP client config files for fallback env discovery).
+  - Installer: `AGENT_MEMORY_INSTALL_DIR` (default `~/.local/bin`), `AGENT_MEMORY_SKILL_DIR` (default `~/.gemini/config/skills/agent-memory`), `AGENT_MEMORY_MCP_DIR` (default `~/.gemini/antigravity-cli/mcp/agent-memory`), `AGENT_MEMORY_MCP_CFG` (default `~/.gemini/config/mcp_config.json`), `ALLOW_ROOT` (`1` to permit running `install.sh` as root).
+
 > [!NOTE]
 > The installer automatically:
-> 1. Validates SQLite FTS5, JSON1, and UPSERT features.
+> 1. Validates SQLite FTS5, JSON1 (`json_patch`), and UPSERT features.
 > 2. Verifies the storage gate and directory permissions (mode `0700`).
 > 3. Creates the database and performs a zero-leak self-test (`record` -> `search` -> `forget` round trip).
 > 4. Copies the binary to `~/.local/bin/agent-memory`.
@@ -121,7 +132,11 @@ Verifies that `./install.sh` exits with code `0` and prints `Self-test passed` b
 Runs read-only diagnostics against the installed binary and database to confirm operational readiness, preventing permission or schema errors from going undetected before client registration.
 
 ```bash
+# Branch A (Optane) or when Antigravity client config was written by install.sh:
 ~/.local/bin/agent-memory doctor
+
+# Branch C (Non-Optane) before MCP client configuration is registered:
+ALLOW_NON_OPTANE=1 ~/.local/bin/agent-memory doctor
 ```
 
 ### Expected Output Criteria
@@ -158,13 +173,13 @@ Registers the `agent-memory` MCP server in the active AI coding client to expose
 Identifies whether client registration was already completed by `install.sh` or requires atomic merge to avoid duplicate edits, preventing manual edits from introducing path drift in Antigravity.
 
 1. **Google Antigravity**: If running in Antigravity or `~/.gemini/antigravity-cli` exists, `./install.sh` has already registered the MCP server in `~/.gemini/config/mcp_config.json`. **Do not edit manually.**
-2. **Other Clients (Claude Code, Cursor, Windsurf, Claude Desktop)**: Use the atomic merge Python script below to safely inject the `agent-memory` definition without clobbering existing servers.
+2. **Other Clients (Claude Code, Cursor, Windsurf, Claude Desktop, VS Code / Cline)**: Use the atomic merge Python script below to safely inject the `agent-memory` definition without clobbering existing servers.
 
 ### Safe Merge Script
 
 Merges the `agent-memory` server definition into an existing MCP client JSON configuration with mode `0600` permissions to preserve existing server entries, preventing direct file truncation or unatomic writes from corrupting client settings.
 
-Set `config_path` to your client's configuration file:
+Set `config_path` to your client's configuration file (for Branch C non-Optane hosts where no client config is registered yet, prefix the command with `ALLOW_NON_OPTANE=1`):
 - **Claude Code**: `~/.claude.json`
 - **Gemini CLI**: `~/.gemini/config/mcp_config.json`
 - **Cursor**: `~/.cursor/mcp.json` (or `.cursor/mcp.json` in project root)
@@ -194,14 +209,20 @@ if "mcpServers" not in data or not isinstance(data["mcpServers"], dict):
     data["mcpServers"] = {}
 
 # Query doctor to resolve exact DB path and Optane flag
-doc_raw = subprocess.check_output([os.path.expanduser("~/.local/bin/agent-memory"), "doctor"], text=True)
-doc = json.loads(doc_raw)
+am_bin = os.path.expanduser("~/.local/bin/agent-memory")
+proc = subprocess.run([am_bin, "doctor"], capture_output=True, text=True)
+if proc.returncode != 0 and os.environ.get("ALLOW_NON_OPTANE") != "1":
+    env_fallback = dict(os.environ, ALLOW_NON_OPTANE="1")
+    proc = subprocess.run([am_bin, "doctor"], capture_output=True, text=True, env=env_fallback)
+if proc.returncode != 0:
+    raise RuntimeError(f"agent-memory doctor failed:\n{proc.stdout}\n{proc.stderr}")
+doc = json.loads(proc.stdout)
 db_path = doc["db_path"]
 allow_non_optane = "1" if doc.get("allow_non_optane") else "0"
 
 data["mcpServers"]["agent-memory"] = {
     "command": sys.executable,
-    "args": ["-I", os.path.expanduser("~/.local/bin/agent-memory"), "--mcp"],
+    "args": ["-I", am_bin, "--mcp"],
     "env": {
         "ALLOW_NON_OPTANE": allow_non_optane,
         "AGENT_MEMORY_DB": db_path
@@ -223,7 +244,8 @@ EOF
 Registers `agent-memory` globally in Claude Code using `claude mcp add` to match the verified `doctor` environment, preventing mismatched `ALLOW_NON_OPTANE` or `AGENT_MEMORY_DB` flags from causing runtime storage-gate errors.
 
 ```bash
-DOC_JSON="$("${HOME}/.local/bin/agent-memory" doctor)"
+# On Branch C (Non-Optane) before any client config is written, prefix with ALLOW_NON_OPTANE=1:
+DOC_JSON="$("${HOME}/.local/bin/agent-memory" doctor 2>/dev/null || ALLOW_NON_OPTANE=1 "${HOME}/.local/bin/agent-memory" doctor)"
 DB_PATH="$(python3 -I -c $'import json,sys\nprint(json.loads(sys.argv[1])["db_path"])' "${DOC_JSON}")"
 ALLOW_FLAG="$(python3 -I -c $'import json,sys\nprint("1" if json.loads(sys.argv[1]).get("allow_non_optane") else "0")' "${DOC_JSON}")"
 
@@ -334,14 +356,22 @@ Defines the three-stage runtime workflow for task ingestion, untrusted memory fi
 
 ### Ontological Vocabulary Contract
 
-Restricts observation categories and relation verbs to the canonical schema vocabulary to maintain a uniform knowledge graph, preventing unapproved categories or inverse verbs from fragmenting retrieval.
+Restricts observation categories, entity types, relation verbs, and input bounds to the canonical schema vocabulary to maintain a uniform knowledge graph, preventing unapproved categories, inverse verbs, or oversized payloads from fragmenting retrieval or failing validation.
 
 - **Allowed Categories**:
-  - **`architecture`**: System topology and component boundaries.
+  - **`architecture`** (default): System topology and component boundaries.
   - **`decision`**: Trade-offs and the rationale behind chosen alternatives.
   - **`invariant`**: Hard constraints, rules, and non-negotiable patterns.
   - **`preference`**: User preferences, coding styles, and environment conventions.
   - **`debug_finding`**: Confirmed root causes and their verified fixes.
+
+- **Allowed Entity Types**:
+  - **`service`**: Running daemon, microservice, API, or background worker.
+  - **`repo`**: Source code repository or package bundle.
+  - **`pattern`**: Reusable architectural pattern, workflow, or convention.
+  - **`concept`** (default): General technical domain, protocol, or abstraction.
+  - **`operator`**: Human engineer or organizational principal.
+  - **`host`**: Physical bare-metal node, virtual machine, or container host.
 
 - **Allowed Forward Relation Verbs**:
   - **`depends_on`**: Runtime or build-time dependency.
@@ -349,11 +379,22 @@ Restricts observation categories and relation verbs to the canonical schema voca
   - **`deploys_to`**: Target deployment environment.
   - **`provisions`**: Infrastructure lifecycle provisioning.
   - **`governs`**: Policy or rule enforcement boundary.
-  - **`references`**: Informational or structural reference.
+  - **`references`** (default): Informational or structural reference.
   - **`synchronizes_with`**: Bidirectional or replica synchronization.
   - **`stores_data_for`**: Backing persistence store.
   - **`authenticates_against`**: Identity or authentication verification target.
-  - *Positive Exemplar*: `Recall the active repository at task start and record new architectural decisions with canonical categories and forward verbs.`
+
+- **Parameter & Payload Bounds**:
+  - `content`: Required non-empty 7-bit ASCII string, max `8000` chars.
+  - `summary`: Optional 7-bit ASCII string, max `2000` chars (requires `entity`).
+  - `query`: Optional search string, max `2000` chars (at least one of `query` or `category` required).
+  - `entity`, `source`, `target`, `session_id`, `relation_type`, `observation_id`: Max `200` chars each.
+  - `tags`: List of up to `50` strings (or comma-separated string), max `100` chars per tag.
+  - `attributes`, `metadata`: JSON object (or JSON object string) up to `4000` serialized characters both before and after RFC 7396 JSON Merge Patch.
+  - `limit`, `relation_limit`: Integer `1` to `100` (`search` default `10`, `recall` default `limit=20` and `relation_limit=50`).
+  - `confidence`: Float `0.0` to `1.0` (default `1.0`).
+  - `weight`: Float `0.0` to `100.0` (default `1.0` on creation, unchanged on update when omitted).
+  - *Positive Exemplar*: `Recall the active repository at task start and record new architectural decisions with canonical categories, entity types, and forward verbs.`
   - *Negative Exemplar*: `Invent ad-hoc category names or store conversational persona prose in observations.` (STRICTLY FORBIDDEN)
 
 ### Verification & Failure Recovery
@@ -370,11 +411,12 @@ Maps diagnostic failure symptoms to deterministic recovery procedures to guide a
 
 | Symptom | Root Cause | Automated Recovery Procedure |
 |---|---|---|
-| `storage_gate: not Intel Optane NVMe` | Host storage is standard flash, cloud volume, or virtual disk. | Run `./install.sh --allow-non-optane`. Storage path will resolve to `~/.local/share/agent-memory/memory.db`. |
-| `writable: no (storage directory ... is not writable)` | Directory or database permissions mismatch. | Verify current UID matches directory: `ls -ld <dir>`. If owned by user, run `chmod 700 <dir>` (and `chmod 600 <db>`). |
-| `is a symlink owned by uid ...` | Target or sidecar file is an unauthorized symlink. | Delete the symlink. `agent-memory` prohibits symlinked sidecars (`-wal`, `-shm`, `-journal`) for integrity. |
-| `fts_index: out of sync` | SQLite full-text index was interrupted during a write. | Run `~/.local/bin/agent-memory init`. If issues persist, run `~/.local/bin/agent-memory init --force` (takes a backup before rebuilding). |
-| `A tool call says storage is unavailable` | Database was locked or permissions changed mid-session. | Run `~/.local/bin/agent-memory doctor`, resolve failing field, and restart client process. |
+| `storage_gate: '<db_path>' is not on a verified Intel Optane NVMe device` | Host storage is standard flash, cloud volume, or virtual disk. | Run `./install.sh --allow-non-optane`. Storage path resolves to `/mnt/optane/$USER/agent_memory/memory.db` if `/mnt/optane/$USER` exists and is owned by `$USER` (mode `0700`), or `${XDG_DATA_HOME:-~/.local/share}/agent-memory/memory.db` otherwise. |
+| `writable: no: '<path>' is not writable by uid <uid>` | Directory or database permissions mismatch. | Verify current UID matches directory: `ls -ld <dir>`. If owned by user, run `chmod 700 <dir>` (and `chmod 600 <db>`). |
+| `permissions: error: '<path>' is a symlink owned by uid <uid>` | Target or sidecar file is a symlink. | Delete the symlink. `agent-memory` prohibits symlinked database or sidecar files (`-wal`, `-shm`, `-journal`) for integrity. |
+| `fts_index: out of sync: <M> indexed vs <N> facts (run 'agent-memory init')` | SQLite full-text index drifted from `observations`. | Run `~/.local/bin/agent-memory init`. If issues persist, run `~/.local/bin/agent-memory init --force` (takes a backup before rebuilding). |
+| `foreign_keys: <N> violation(s): ...` | Referential integrity violation in SQLite tables. | Run `~/.local/bin/agent-memory restore <backup.db>` from the latest clean backup or rebuild via `~/.local/bin/agent-memory init --force`. |
+| `Storage is unavailable` tool call error | Database was locked or permissions changed mid-session. | Run `~/.local/bin/agent-memory doctor`, resolve failing field, and restart client process. |
 | Client cannot find MCP tools after installation | Client was not restarted after config file edit. | Terminate and restart the agent client daemon or editor. |
 
 - *Positive Exemplar*: `Follow the automated recovery procedure matching the exact symptom reported by agent-memory doctor.`
