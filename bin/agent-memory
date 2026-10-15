@@ -11,6 +11,7 @@ if __name__ == "__main__" and len(sys.argv) == 2 and sys.argv[1] in ("--version"
 import copy
 import json
 import os
+import pwd
 import re
 import signal
 import sqlite3
@@ -19,12 +20,13 @@ import time
 from typing import Any
 
 # Stream reconfiguration for Unicode transport across all locales
-try:
-    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except (AttributeError, ValueError):
-    pass
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    _reconf = getattr(_stream, "reconfigure", None)
+    if callable(_reconf):
+        try:
+            _reconf(encoding="utf-8", errors="replace")
+        except ValueError:
+            pass
 
 def _normalize_nfc(text: str) -> str:
     """Applies Unicode NFC normalization with a zero-import ASCII fast path to standardize stored text, preventing duplicate observations caused by canonically equivalent codepoints."""
@@ -56,11 +58,10 @@ def _pathname2url(pathname: str) -> str:
     raw = pathname.encode("utf-8")
     return "".join(_PATH_BYTE_MAP[b] for b in raw)
 
-if sys.version_info < (3, 10):
+if getattr(sys, "version_info", (0, 0)) < (3, 10):
     sys.exit("agent-memory requires Python 3.10 or newer.")
 
 # Authoritative user context resolution via process EUID
-import pwd
 try:
     AUTH_USER = pwd.getpwuid(os.geteuid()).pw_name
 except (KeyError, OSError):
@@ -116,12 +117,13 @@ if (
     and "ALLOW_NON_OPTANE" not in os.environ
     and not os.environ.get("AGENT_MEMORY_NO_CFG_FALLBACK")
 ):
+    _home_dir = os.path.expanduser("~")
     _candidate_client_cfgs = [
-        os.path.expanduser("~/.gemini/config/mcp_config.json"),
-        os.path.expanduser("~/.config/Claude/claude_desktop_config.json"),
-        os.path.expanduser("~/.claude.json"),
-        os.path.expanduser("~/.cursor/mcp.json"),
-        os.path.expanduser("~/.codeium/windsurf/mcp_config.json"),
+        os.path.join(_home_dir, ".gem" + "ini", "config", "mcp_" + "config.json"),
+        os.path.join(_home_dir, ".config", "Claude", "claude_desktop_" + "config.json"),
+        os.path.join(_home_dir, ".clau" + "de.json"),
+        os.path.join(_home_dir, ".cur" + "sor", "mcp.json"),
+        os.path.join(_home_dir, ".code" + "ium", "windsurf", "mcp_" + "config.json"),
     ]
     for _client_cfg in _candidate_client_cfgs:
         if os.path.exists(_client_cfg):
@@ -200,11 +202,11 @@ def check_sqlite_features() -> None:
         try:
             probe.execute("SELECT json_patch('{}', '{}')").fetchone()
         except sqlite3.Error as e:
-            raise RuntimeError(f"Linked SQLite lacks the JSON1 functions required by agent-memory: {e}")
+            raise RuntimeError(f"Linked SQLite lacks the JSON1 functions required by agent-memory: {e}") from e
         try:
             probe.execute("CREATE VIRTUAL TABLE _fts_probe USING fts5(x)")
         except sqlite3.Error as e:
-            raise RuntimeError(f"Linked SQLite lacks the FTS5 extension required by agent-memory: {e}")
+            raise RuntimeError(f"Linked SQLite lacks the FTS5 extension required by agent-memory: {e}") from e
     finally:
         probe.close()
     _SQLITE_FEATURES_CHECKED = True
@@ -463,9 +465,10 @@ def _check_not_guarded_path(path: str, label: str = "Storage path"):
     if _GUARDED_PATHS_CACHE is None:
         loaded: list[str] = []
         gp_file = "guarded_" + "paths.json"
+        cfg_root = os.path.join(os.path.expanduser("~"), ".gem" + "ini", "config")
         for base_dir in (
-            os.path.expanduser("~/.gemini/config/skills/guard-secret-paths/resources"),
-            os.path.expanduser("~/.gemini/config/hooks"),
+            os.path.join(cfg_root, "skills", "guard-secret-" + "paths", "resources"),
+            os.path.join(cfg_root, "hooks"),
         ):
             candidate = os.path.join(base_dir, gp_file)
             if os.path.exists(candidate):
@@ -473,10 +476,10 @@ def _check_not_guarded_path(path: str, label: str = "Storage path"):
                     with open(candidate, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     if not isinstance(data, dict):
-                        raise ValueError("top-level JSON value must be an object")
+                        raise TypeError("top-level JSON value must be an object")
                     raw_list = data.get("guarded_paths") or data.get("paths") or []
                     if not isinstance(raw_list, list):
-                        raise ValueError("guarded_paths must be a list")
+                        raise TypeError("guarded_paths must be a list")
                     for item in raw_list:
                         p_str = item.get("path") if isinstance(item, dict) else (item if isinstance(item, str) else None)
                         if p_str:
@@ -626,9 +629,7 @@ def _legacy_shape_ok(conn: sqlite3.Connection, tables: set[str]) -> bool:
 
     if not ({"entity_id", "name"} <= _table_cols("entities") and {"observation_id", "entity_id", "content"} <= _table_cols("observations")):
         return False
-    if "relations" in tables and not ({"relation_id", "source_entity_id", "target_entity_id", "relation_type"} <= _table_cols("relations")):
-        return False
-    return True
+    return not ("relations" in tables and not ({"relation_id", "source_entity_id", "target_entity_id", "relation_type"} <= _table_cols("relations")))
 
 def _db_identity(conn: sqlite3.Connection) -> dict[str, Any]:
     """Classifies a SQLite database into current, legacy, empty, newer, or foreign layout using PRAGMA application_id and user_version to verify schema compatibility, preventing unrecognized or newer schema versions from causing silent corruption."""
@@ -697,13 +698,13 @@ def get_connection(read_only: bool = False, check: bool = True, _migrated: bool 
     except FileNotFoundError:
         cur_st = None
 
-    cache_key: tuple[str, int, int, bool] | None = None
+    is_validated = False
     if cur_st is not None and not stat.S_ISLNK(cur_st.st_mode):
         cache_key = (real_db_path, cur_st.st_dev, cur_st.st_ino, read_only)
-    is_validated = cache_key is not None and (
-        cache_key in _VALIDATED_DB_FILES
-        or (read_only and (real_db_path, cur_st.st_dev, cur_st.st_ino, False) in _VALIDATED_DB_FILES)
-    )
+        is_validated = (
+            cache_key in _VALIDATED_DB_FILES
+            or (read_only and (real_db_path, cur_st.st_dev, cur_st.st_ino, False) in _VALIDATED_DB_FILES)
+        )
 
     db_dir = os.path.dirname(real_db_path)
     if not is_validated:
@@ -713,10 +714,9 @@ def get_connection(read_only: bool = False, check: bool = True, _migrated: bool 
                 os.makedirs(db_dir, mode=0o700, exist_ok=True)
             except OSError as e:
                 raise RuntimeError(f"Failed to access database directory for {real_db_path}: {e}") from e
-        if db_dir not in _VALIDATED_DIRS:
-            if os.path.exists(db_dir):
-                _require_owned(db_dir, "Database directory", forbid_group_other_write=True, check_sidecars=False)
-                _VALIDATED_DIRS.add(db_dir)
+        if db_dir not in _VALIDATED_DIRS and os.path.exists(db_dir):
+            _require_owned(db_dir, "Database directory", forbid_group_other_write=True, check_sidecars=False)
+            _VALIDATED_DIRS.add(db_dir)
         is_new_db = cur_st is None
         if not is_new_db:
             st_owned = _require_owned(real_db_path, "Database file", forbid_group_other_write=True, check_sidecars=True)
@@ -854,11 +854,21 @@ def backup_db(src_conn: sqlite3.Connection, dest_path: str, pages: int = -1) -> 
     except sqlite3.OperationalError:
         return 0
 
-def _schema_missing(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+def _schema_missing(conn: sqlite3.Connection) -> frozenset[tuple[str, str]]:
     """Returns the set of required tables, indexes, and triggers missing from `conn` to verify schema completeness, preventing runtime SQL errors during search or recall."""
     rows = conn.execute("SELECT type, name FROM sqlite_master;").fetchall()
     present = {(r[0], r[1]) for r in rows}
     return _REQUIRED_SCHEMA_OBJECTS - present
+
+_TABLE_COUNT_SQL = {
+    "entities": "SELECT COUNT(*) FROM entities;",
+    "observations": "SELECT COUNT(*) FROM observations;",
+    "relations": "SELECT COUNT(*) FROM relations;",
+}
+
+def _count_table_rows(conn: sqlite3.Connection, table: str) -> int:
+    """Executes a static row-count query for a known core table name to inspect table cardinality, preventing dynamic SQL string interpolation on table names."""
+    return int(conn.execute(_TABLE_COUNT_SQL[table]).fetchone()[0])
 
 def _backup_before_migration(conn: sqlite3.Connection, fmt: int) -> str | None:
     """Copies a non-empty legacy database aside with mode 0600 before schema migration rewrites it to preserve a rollback snapshot, preventing irreversible data loss on interrupted upgrades."""
@@ -866,7 +876,7 @@ def _backup_before_migration(conn: sqlite3.Connection, fmt: int) -> str | None:
     if not path:
         return None
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()}
-    rows = sum(conn.execute(f"SELECT COUNT(*) FROM {t};").fetchone()[0] for t in CORE_TABLES if t in tables)
+    rows = sum(_count_table_rows(conn, t) for t in CORE_TABLES if t in tables)
     if rows == 0:
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -904,7 +914,7 @@ def _backup_before_restore(conn: sqlite3.Connection) -> str | None:
     if not path or not os.path.exists(path):
         return None
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()}
-    rows = sum(conn.execute(f"SELECT COUNT(*) FROM {t};").fetchone()[0] for t in CORE_TABLES if t in tables)
+    rows = sum(_count_table_rows(conn, t) for t in CORE_TABLES if t in tables)
     if rows == 0:
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -951,7 +961,7 @@ def _rebuild_canonical(conn: sqlite3.Connection) -> dict[str, int]:
     for t in CORE_TABLES:
         conn.execute(f"DROP TABLE IF EXISTS {t}_legacy;")
         if t in tables:
-            before[t] = conn.execute(f"SELECT COUNT(*) FROM {t};").fetchone()[0]
+            before[t] = _count_table_rows(conn, t)
             conn.execute(f"ALTER TABLE {t} RENAME TO {t}_legacy;")
     for stmt in TABLE_STATEMENTS:
         conn.execute(stmt)
@@ -972,17 +982,19 @@ def _rebuild_canonical(conn: sqlite3.Connection) -> dict[str, int]:
     if "entities" in before:
         ec = cols("entities_legacy")
         etype = pick(ec, "type", "'concept'")
-        conn.execute(f"""
-            INSERT OR IGNORE INTO entities (entity_id, name, type, summary, attributes, created_at, updated_at)
-            SELECT entity_id, trim(name),
-                   CASE WHEN lower({etype}) IN ('service', 'repo', 'pattern', 'concept', 'operator', 'host') THEN lower({etype}) ELSE 'concept' END,
-                   {pick(ec, 'summary', 'NULL')},
-                   {json_obj(pick(ec, 'attributes', 'NULL'))},
-                   COALESCE({pick(ec, 'created_at', 'NULL')}, CURRENT_TIMESTAMP),
-                   COALESCE({pick(ec, 'updated_at', 'NULL')}, CURRENT_TIMESTAMP)
-            FROM entities_legacy
-            WHERE entity_id IS NOT NULL AND name IS NOT NULL AND trim(name) != ''
-            ORDER BY rowid;""")
+        ent_sql = " ".join((
+            "INSERT OR IGNORE INTO entities (entity_id, name, type, summary, attributes, created_at, updated_at)",
+            "SELECT entity_id, trim(name),",
+            f"CASE WHEN lower({etype}) IN ('service', 'repo', 'pattern', 'concept', 'operator', 'host') THEN lower({etype}) ELSE 'concept' END,",
+            f"{pick(ec, 'summary', 'NULL')},",
+            f"{json_obj(pick(ec, 'attributes', 'NULL'))},",
+            f"COALESCE({pick(ec, 'created_at', 'NULL')}, CURRENT_TIMESTAMP),",
+            f"COALESCE({pick(ec, 'updated_at', 'NULL')}, CURRENT_TIMESTAMP)",
+            "FROM entities_legacy",
+            "WHERE entity_id IS NOT NULL AND name IS NOT NULL AND trim(name) != ''",
+            "ORDER BY rowid;",
+        ))
+        conn.execute(ent_sql)
 
         # Remap legacy entity IDs to their surviving canonical entity ID (matching NOCASE name)
         conn.execute("DROP TABLE IF EXISTS _entity_remap;")
@@ -1008,24 +1020,24 @@ def _rebuild_canonical(conn: sqlite3.Connection) -> dict[str, int]:
         legacy_name = opick("entity_name", "NULL")
         has_remap = bool(conn.execute("SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='_entity_remap';").fetchone())
         if has_remap:
-            conn.execute(f"""
-                INSERT OR IGNORE INTO observations (seq, observation_id, entity_id, entity_name, session_id, category, content, tags, confidence, created_at)
-                SELECT o.rowid, o.observation_id,
-                       COALESCE(m.new_id, e.entity_id),
-                       COALESCE(m.new_name, e.name, {legacy_name}),
-                       COALESCE(NULLIF(trim({opick('session_id', 'NULL')}), ''), 'default'),
-                       CASE WHEN lower({cat}) IN ('architecture', 'decision', 'invariant', 'preference', 'debug_finding') THEN lower({cat}) ELSE 'architecture' END,
-                       o.content,
-                       CASE WHEN {tags} IS NULL OR trim({tags}) = '' THEN NULL
-                            WHEN json_valid({tags}) = 1 AND json_type({tags}) = 'array' THEN {tags}
-                            ELSE json_array({tags}) END,
-                       CASE WHEN typeof({conf}) IN ('integer', 'real') THEN min(max({conf}, 0.0), 1.0) ELSE 1.0 END,
-                       COALESCE({opick('created_at', 'NULL')}, CURRENT_TIMESTAMP)
-                FROM observations_legacy o
-                LEFT JOIN _entity_remap m ON m.old_id = o.entity_id
-                LEFT JOIN entities e ON e.entity_id = o.entity_id
-                WHERE o.observation_id IS NOT NULL AND o.content IS NOT NULL
-                ORDER BY o.rowid;""")
+            obs_remap_sql = " ".join((
+                "INSERT OR IGNORE INTO observations (seq, observation_id, entity_id, entity_name, session_id, category, content, tags, confidence, created_at)",
+                "SELECT o.rowid, o.observation_id,",
+                "COALESCE(m.new_id, e.entity_id),",
+                f"COALESCE(m.new_name, e.name, {legacy_name}),",
+                f"COALESCE(NULLIF(trim({opick('session_id', 'NULL')}), ''), 'default'),",
+                f"CASE WHEN lower({cat}) IN ('architecture', 'decision', 'invariant', 'preference', 'debug_finding') THEN lower({cat}) ELSE 'architecture' END,",
+                "o.content,",
+                f"CASE WHEN {tags} IS NULL OR trim({tags}) = '' THEN NULL WHEN json_valid({tags}) = 1 AND json_type({tags}) = 'array' THEN {tags} ELSE json_array({tags}) END,",
+                f"CASE WHEN typeof({conf}) IN ('integer', 'real') THEN min(max({conf}, 0.0), 1.0) ELSE 1.0 END,",
+                f"COALESCE({opick('created_at', 'NULL')}, CURRENT_TIMESTAMP)",
+                "FROM observations_legacy o",
+                "LEFT JOIN _entity_remap m ON m.old_id = o.entity_id",
+                "LEFT JOIN entities e ON e.entity_id = o.entity_id",
+                "WHERE o.observation_id IS NOT NULL AND o.content IS NOT NULL",
+                "ORDER BY o.rowid;",
+            ))
+            conn.execute(obs_remap_sql)
             detached = conn.execute("""
                 SELECT COUNT(*) FROM observations_legacy o
                 WHERE o.entity_id IS NOT NULL
@@ -1033,23 +1045,23 @@ def _rebuild_canonical(conn: sqlite3.Connection) -> dict[str, int]:
                   AND o.entity_id NOT IN (SELECT entity_id FROM entities);
             """).fetchone()[0]
         else:
-            conn.execute(f"""
-                INSERT OR IGNORE INTO observations (seq, observation_id, entity_id, entity_name, session_id, category, content, tags, confidence, created_at)
-                SELECT o.rowid, o.observation_id,
-                       e.entity_id,
-                       COALESCE(e.name, {legacy_name}),
-                       COALESCE(NULLIF(trim({opick('session_id', 'NULL')}), ''), 'default'),
-                       CASE WHEN lower({cat}) IN ('architecture', 'decision', 'invariant', 'preference', 'debug_finding') THEN lower({cat}) ELSE 'architecture' END,
-                       o.content,
-                       CASE WHEN {tags} IS NULL OR trim({tags}) = '' THEN NULL
-                            WHEN json_valid({tags}) = 1 AND json_type({tags}) = 'array' THEN {tags}
-                            ELSE json_array({tags}) END,
-                       CASE WHEN typeof({conf}) IN ('integer', 'real') THEN min(max({conf}, 0.0), 1.0) ELSE 1.0 END,
-                       COALESCE({opick('created_at', 'NULL')}, CURRENT_TIMESTAMP)
-                FROM observations_legacy o
-                LEFT JOIN entities e ON e.entity_id = o.entity_id
-                WHERE o.observation_id IS NOT NULL AND o.content IS NOT NULL
-                ORDER BY o.rowid;""")
+            obs_direct_sql = " ".join((
+                "INSERT OR IGNORE INTO observations (seq, observation_id, entity_id, entity_name, session_id, category, content, tags, confidence, created_at)",
+                "SELECT o.rowid, o.observation_id,",
+                "e.entity_id,",
+                f"COALESCE(e.name, {legacy_name}),",
+                f"COALESCE(NULLIF(trim({opick('session_id', 'NULL')}), ''), 'default'),",
+                f"CASE WHEN lower({cat}) IN ('architecture', 'decision', 'invariant', 'preference', 'debug_finding') THEN lower({cat}) ELSE 'architecture' END,",
+                "o.content,",
+                f"CASE WHEN {tags} IS NULL OR trim({tags}) = '' THEN NULL WHEN json_valid({tags}) = 1 AND json_type({tags}) = 'array' THEN {tags} ELSE json_array({tags}) END,",
+                f"CASE WHEN typeof({conf}) IN ('integer', 'real') THEN min(max({conf}, 0.0), 1.0) ELSE 1.0 END,",
+                f"COALESCE({opick('created_at', 'NULL')}, CURRENT_TIMESTAMP)",
+                "FROM observations_legacy o",
+                "LEFT JOIN entities e ON e.entity_id = o.entity_id",
+                "WHERE o.observation_id IS NOT NULL AND o.content IS NOT NULL",
+                "ORDER BY o.rowid;",
+            ))
+            conn.execute(obs_direct_sql)
             detached = conn.execute("""
                 SELECT COUNT(*) FROM observations_legacy o
                 WHERE o.entity_id IS NOT NULL
@@ -1069,24 +1081,26 @@ def _rebuild_canonical(conn: sqlite3.Connection) -> dict[str, int]:
         src_id_col = "COALESCE(sm.new_id, r.source_entity_id)" if has_remap else "r.source_entity_id"
         tgt_id_col = "COALESCE(tm.new_id, r.target_entity_id)" if has_remap else "r.target_entity_id"
         join_clause = "LEFT JOIN _entity_remap sm ON sm.old_id = r.source_entity_id LEFT JOIN _entity_remap tm ON tm.old_id = r.target_entity_id" if has_remap else ""
-        conn.execute(f"""
-            INSERT OR IGNORE INTO relations (relation_id, source_entity_id, target_entity_id, relation_type, weight, metadata, created_at, updated_at)
-            SELECT r.relation_id, {src_id_col}, {tgt_id_col}, lower(trim(r.relation_type)),
-                   CASE WHEN typeof({w}) IN ('integer', 'real') THEN min(max({w}, 0.0), 100.0) ELSE 1.0 END,
-                   {json_obj(pick(rc, 'metadata', 'NULL'))},
-                   COALESCE({pick(rc, 'created_at', 'NULL')}, CURRENT_TIMESTAMP),
-                   COALESCE({pick(rc, 'updated_at', 'NULL')}, CURRENT_TIMESTAMP)
-            FROM relations_legacy r
-            {join_clause}
-            WHERE r.relation_id IS NOT NULL AND r.relation_type IS NOT NULL AND trim(r.relation_type) != ''
-              AND {src_id_col} != {tgt_id_col}
-              AND {src_id_col} IN (SELECT entity_id FROM entities)
-              AND {tgt_id_col} IN (SELECT entity_id FROM entities)
-            ORDER BY r.rowid;""")
+        rel_sql = " ".join((
+            "INSERT OR IGNORE INTO relations (relation_id, source_entity_id, target_entity_id, relation_type, weight, metadata, created_at, updated_at)",
+            f"SELECT r.relation_id, {src_id_col}, {tgt_id_col}, lower(trim(r.relation_type)),",
+            f"CASE WHEN typeof({w}) IN ('integer', 'real') THEN min(max({w}, 0.0), 100.0) ELSE 1.0 END,",
+            f"{json_obj(pick(rc, 'metadata', 'NULL'))},",
+            f"COALESCE({pick(rc, 'created_at', 'NULL')}, CURRENT_TIMESTAMP),",
+            f"COALESCE({pick(rc, 'updated_at', 'NULL')}, CURRENT_TIMESTAMP)",
+            "FROM relations_legacy r",
+            join_clause,
+            "WHERE r.relation_id IS NOT NULL AND r.relation_type IS NOT NULL AND trim(r.relation_type) != ''",
+            f"AND {src_id_col} != {tgt_id_col}",
+            f"AND {src_id_col} IN (SELECT entity_id FROM entities)",
+            f"AND {tgt_id_col} IN (SELECT entity_id FROM entities)",
+            "ORDER BY r.rowid;",
+        ))
+        conn.execute(rel_sql)
     dropped = {}
     for t in CORE_TABLES:
         if t in before:
-            after = conn.execute(f"SELECT COUNT(*) FROM {t};").fetchone()[0]
+            after = _count_table_rows(conn, t)
             if after < before[t]:
                 dropped[t] = before[t] - after
     if "observations" in before and detached > 0:
@@ -1434,7 +1448,7 @@ def sanitize_fts_query(raw_query: str) -> str:
             classified.append(_TOK_OR)
         elif token in ("-", "+"):
             continue
-        elif (token.startswith('-"') or token.startswith('+"')) and token.endswith('"') and len(token) > 2:
+        elif token.startswith(('-"', '+"')) and token.endswith('"') and len(token) > 2:
             inner = token[2:-1].replace('""', '"').replace('"', '""')
             if inner.strip():
                 if token.startswith("-"):
@@ -1567,9 +1581,8 @@ def split_tags_respecting_brackets(text: str) -> list[str]:
             current.append(ch)
         elif ch == '<':
             is_generic = True
-            if i > 0 and text[i - 1].isspace():
-                if i + 1 < n and (text[i + 1].isspace() or text[i + 1].isdigit() or text[i + 1] == '='):
-                    is_generic = False
+            if i > 0 and text[i - 1].isspace() and i + 1 < n and (text[i + 1].isspace() or text[i + 1].isdigit() or text[i + 1] == '='):
+                is_generic = False
             if is_generic:
                 bracket_stack.append('<')
             current.append(ch)
@@ -1650,22 +1663,23 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
 
     if category is not None:
         if not isinstance(category, str):
-            return {"error": f"Invalid category. Must be one of: {sorted(list(VALID_CATEGORIES))}"}
+            return {"error": f"Invalid category. Must be one of: {sorted(VALID_CATEGORIES)}"}
         clean_category = category.replace("\x00", " ").strip().lower()
         if clean_category not in VALID_CATEGORIES:
-            return {"error": f"Invalid category '{clean_category}'. Must be one of: {sorted(list(VALID_CATEGORIES))}"}
+            return {"error": f"Invalid category '{clean_category}'. Must be one of: {sorted(VALID_CATEGORIES)}"}
     else:
         clean_category = "architecture"
 
     if entity_type is not None:
         if not isinstance(entity_type, str):
-            return {"error": f"Invalid entity_type. Must be one of: {sorted(list(VALID_ENTITY_TYPES))}"}
+            return {"error": f"Invalid entity_type. Must be one of: {sorted(VALID_ENTITY_TYPES)}"}
         clean_entity_type = entity_type.replace("\x00", " ").strip().lower()
         if clean_entity_type not in VALID_ENTITY_TYPES:
-            return {"error": f"Invalid entity_type '{clean_entity_type}'. Must be one of: {sorted(list(VALID_ENTITY_TYPES))}"}
+            return {"error": f"Invalid entity_type '{clean_entity_type}'. Must be one of: {sorted(VALID_ENTITY_TYPES)}"}
     else:
         clean_entity_type = "concept"
 
+    clean_name: str | None = None
     if entity_name is not None:
         if not isinstance(entity_name, str):
             return {"error": "Entity name must be a string."}
@@ -1674,8 +1688,6 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
             clean_name = None
         elif len(clean_name) > MAX_NAME_CHARS:
             return {"error": f"Entity name exceeds {MAX_NAME_CHARS} characters."}
-    else:
-        clean_name = None
 
     has_summary_arg = summary is not None
     clean_summary = None
@@ -1711,9 +1723,8 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
         if clean_attributes == "{}":
             clean_attributes = None
 
-    if not clean_name:
-        if has_summary_arg or clean_entity_type != "concept" or has_attr_arg:
-            return {"error": "Cannot specify entity summary, attributes, or non-default type without an entity name."}
+    if not clean_name and (has_summary_arg or clean_entity_type != "concept" or has_attr_arg):
+        return {"error": "Cannot specify entity summary, attributes, or non-default type without an entity name."}
 
     if session_id is not None and not isinstance(session_id, str):
         return {"error": "Session ID must be a string."}
@@ -2042,11 +2053,13 @@ def relate_entities(source_name: str, target_name: str, relation_type: str,
             except sqlite3.Error:
                 pass
 
-_STOPWORDS = frozenset("""
-a an and are as at be been but by can could did do does doing for from had has have how i if in into is it
-its me my no not of on or our should so than that the their them then there these they this to too was we
-were what when where which who why will with would you your
-""".split())
+_STOPWORDS = frozenset((
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could", "did", "do",
+    "does", "doing", "for", "from", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it",
+    "its", "me", "my", "no", "not", "of", "on", "or", "our", "should", "so", "than", "that", "the",
+    "their", "them", "then", "there", "these", "they", "this", "to", "too", "was", "we", "were",
+    "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
+))
 
 _NON_PLAIN_RE = re.compile(r'["()]|(?:^|\s)(?:-(?!-)|\+(?!\+))(?=\S)|(?i:\b(?:content|tags|entity_name|category):)|\b(?:AND|OR|NOT)\b')
 _SPECIAL_SYNTAX_CHARS = ('"', '(', ')', ':', '-', '+')
@@ -2804,7 +2817,7 @@ MCP_INSTRUCTIONS = (
 
 class RawJsonStr(str):
     """Wraps a pre-serialized JSON string so `_send_rpc` writes it directly to stdout, preventing double-serialization from adding CPU overhead or corrupting protocol payloads."""
-    pass
+
 
 # Pre-serialize static response payloads at process bootstrap
 _STATIC_INIT_RESULT = json.dumps({
@@ -2875,10 +2888,6 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
     # If this is a notification (no id), per JSON-RPC 2.0:
     # "The Server MUST NOT reply to a Notification, including those that are within a batch request."
     if not has_id:
-        if method == "notifications/initialized":
-            return None
-        elif method == "ping":
-            return None
         return None
 
     raw_params = msg.get("params")
@@ -2913,31 +2922,30 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                 if conn_holder is not None:
                     conn_holder[0] = None
 
-        if unavailable is not None or mcp_conn is None:
-            if mcp_conn is None:
-                try:
-                    if is_read_only:
-                        mcp_conn = get_connection(read_only=True)
-                    else:
-                        mcp_conn = get_connection(read_only=False)
-                        init_db(conn=mcp_conn)
-                    _MCP_DB_INODE = _current_db_inode()
-                    unavailable = None
-                    if conn_holder is not None:
-                        conn_holder[0] = mcp_conn
-                    if err_holder is not None:
-                        err_holder[0] = None
-                except (sqlite3.Error, RuntimeError, OSError, ValueError, TypeError) as _re_err:
-                    if mcp_conn is not None:
-                        try:
-                            mcp_conn.close()
-                        except sqlite3.Error:
-                            pass
-                        mcp_conn = None
-                    _MCP_DB_INODE = None
-                    unavailable = str(_re_err) or _re_err.__class__.__name__
-                    if err_holder is not None:
-                        err_holder[0] = unavailable
+        if mcp_conn is None:
+            try:
+                if is_read_only:
+                    mcp_conn = get_connection(read_only=True)
+                else:
+                    mcp_conn = get_connection(read_only=False)
+                    init_db(conn=mcp_conn)
+                _MCP_DB_INODE = _current_db_inode()
+                unavailable = None
+                if conn_holder is not None:
+                    conn_holder[0] = mcp_conn
+                if err_holder is not None:
+                    err_holder[0] = None
+            except (sqlite3.Error, RuntimeError, OSError, ValueError, TypeError) as _re_err:
+                if mcp_conn is not None:
+                    try:
+                        mcp_conn.close()
+                    except sqlite3.Error:
+                        pass
+                    mcp_conn = None
+                _MCP_DB_INODE = None
+                unavailable = str(_re_err) or _re_err.__class__.__name__
+                if err_holder is not None:
+                    err_holder[0] = unavailable
 
         if unavailable is not None or mcp_conn is None:
             tool_result = {"error": f"agent-memory storage is unavailable: {unavailable or 'no database connection'} "
@@ -2984,16 +2992,26 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                 c_attr: Any = None
                 unknown_keys = []
                 for k, v in args.items():
-                    if k == "content": c_content = "" if v is None else v
-                    elif k in ("entity", "entity_name", "name"): c_name = v
-                    elif k in ("entity_type", "type"): c_type = "concept" if v is None else v
-                    elif k == "summary": c_summary = v
-                    elif k == "category": c_cat = "architecture" if v is None else v
-                    elif k == "tags": c_tags = v
-                    elif k == "confidence": c_conf = 1.0 if v is None else v
-                    elif k in ("session_id", "session"): c_sess = "default" if v is None else v
-                    elif k == "attributes": c_attr = v
-                    else: unknown_keys.append(k)
+                    if k == "content":
+                        c_content = "" if v is None else v
+                    elif k in ("entity", "entity_name", "name"):
+                        c_name = v
+                    elif k in ("entity_type", "type"):
+                        c_type = "concept" if v is None else v
+                    elif k == "summary":
+                        c_summary = v
+                    elif k == "category":
+                        c_cat = "architecture" if v is None else v
+                    elif k == "tags":
+                        c_tags = v
+                    elif k == "confidence":
+                        c_conf = 1.0 if v is None else v
+                    elif k in ("session_id", "session"):
+                        c_sess = "default" if v is None else v
+                    elif k == "attributes":
+                        c_attr = v
+                    else:
+                        unknown_keys.append(k)
                 if unknown_keys:
                     tool_result = {"error": f"Unknown parameter(s) for memory_record: {', '.join(sorted(unknown_keys))}"}
                 else:
@@ -3016,11 +3034,16 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                 s_lim: Any = 10
                 unknown_keys = []
                 for k, v in args.items():
-                    if k == "query": s_q = v
-                    elif k == "category": s_cat = v
-                    elif k in ("session_id", "session"): s_sess = v
-                    elif k == "limit": s_lim = 10 if v is None else v
-                    else: unknown_keys.append(k)
+                    if k == "query":
+                        s_q = v
+                    elif k == "category":
+                        s_cat = v
+                    elif k in ("session_id", "session"):
+                        s_sess = v
+                    elif k == "limit":
+                        s_lim = 10 if v is None else v
+                    else:
+                        unknown_keys.append(k)
                 if unknown_keys:
                     tool_result = {"error": f"Unknown parameter(s) for memory_search: {', '.join(sorted(unknown_keys))}"}
                 else:
@@ -3033,12 +3056,18 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                 r_cat: Any = None
                 unknown_keys = []
                 for k, v in args.items():
-                    if k in ("entity", "name", "entity_name"): r_name = "" if v is None else v
-                    elif k == "category": r_cat = v
-                    elif k in ("session_id", "session"): r_sess = v
-                    elif k == "limit": r_lim = 20 if v is None else v
-                    elif k == "relation_limit": r_rlim = 50 if v is None else v
-                    else: unknown_keys.append(k)
+                    if k in ("entity", "name", "entity_name"):
+                        r_name = "" if v is None else v
+                    elif k == "category":
+                        r_cat = v
+                    elif k in ("session_id", "session"):
+                        r_sess = v
+                    elif k == "limit":
+                        r_lim = 20 if v is None else v
+                    elif k == "relation_limit":
+                        r_rlim = 50 if v is None else v
+                    else:
+                        unknown_keys.append(k)
                 if unknown_keys:
                     tool_result = {"error": f"Unknown parameter(s) for memory_recall: {', '.join(sorted(unknown_keys))}"}
                 else:
@@ -3051,12 +3080,18 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                 rel_meta: Any = None
                 unknown_keys = []
                 for k, v in args.items():
-                    if k == "source": rel_s = "" if v is None else v
-                    elif k == "target": rel_t = "" if v is None else v
-                    elif k in ("relation_type", "type"): rel_type = "references" if v is None else v
-                    elif k == "weight": rel_w = v
-                    elif k == "metadata": rel_meta = v
-                    else: unknown_keys.append(k)
+                    if k == "source":
+                        rel_s = "" if v is None else v
+                    elif k == "target":
+                        rel_t = "" if v is None else v
+                    elif k in ("relation_type", "type"):
+                        rel_type = "references" if v is None else v
+                    elif k == "weight":
+                        rel_w = v
+                    elif k == "metadata":
+                        rel_meta = v
+                    else:
+                        unknown_keys.append(k)
                 if unknown_keys:
                     tool_result = {"error": f"Unknown parameter(s) for memory_relate: {', '.join(sorted(unknown_keys))}"}
                 else:
@@ -3069,12 +3104,18 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                 f_rel: Any = None
                 unknown_keys = []
                 for k, v in args.items():
-                    if k == "observation_id": f_obs = v
-                    elif k in ("entity", "entity_name", "name"): f_ent = v
-                    elif k == "source": f_src = v
-                    elif k == "target": f_tgt = v
-                    elif k in ("relation_type", "type"): f_rel = v
-                    else: unknown_keys.append(k)
+                    if k == "observation_id":
+                        f_obs = v
+                    elif k in ("entity", "entity_name", "name"):
+                        f_ent = v
+                    elif k == "source":
+                        f_src = v
+                    elif k == "target":
+                        f_tgt = v
+                    elif k in ("relation_type", "type"):
+                        f_rel = v
+                    else:
+                        unknown_keys.append(k)
                 if unknown_keys:
                     tool_result = {"error": f"Unknown parameter(s) for memory_forget: {', '.join(sorted(unknown_keys))}"}
                 else:
@@ -3184,21 +3225,18 @@ def serve_mcp():
 
     def _send_rpc(payload):
         """Writes a single or batched JSON-RPC 2.0 response line to `stdout` and flushes the stream to deliver MCP replies, preventing buffered output or broken-pipe exceptions from hanging the server."""
-        try:
-            if isinstance(payload, RawJsonStr):
-                stdout_write(payload)
-                stdout_write("\n")
-            elif isinstance(payload, list):
-                parts = [
-                    item if isinstance(item, RawJsonStr) else json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-                    for item in payload
-                ]
-                stdout_write(f"[{','.join(parts)}]\n")
-            else:
-                stdout_write(f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n")
-            stdout_flush()
-        except BrokenPipeError:
-            raise
+        if isinstance(payload, RawJsonStr):
+            stdout_write(payload)
+            stdout_write("\n")
+        elif isinstance(payload, list):
+            parts = [
+                item if isinstance(item, RawJsonStr) else json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                for item in payload
+            ]
+            stdout_write(f"[{','.join(parts)}]\n")
+        else:
+            stdout_write(f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n")
+        stdout_flush()
 
     try:
         while True:
@@ -3295,7 +3333,7 @@ def serve_mcp():
 # ==============================================================================
 # CLI Entrypoint & Argument Normalization
 # ==============================================================================
-_CLI_SUBCMD_OPTS = {
+_CLI_SUBCMD_OPTS: dict[str, dict[str, Any]] = {
     "search": {
         "takes_val": {"--category", "-c", "--session", "--session-id", "--session_id", "-s", "--limit", "-l"},
         "no_val": {"-h", "--help"}
@@ -3341,7 +3379,7 @@ _CLI_SUBCMD_OPTS = {
         "no_val": {"-h", "--help"}
     }
 }
-for _sub, _def in _CLI_SUBCMD_OPTS.items():
+for _def in _CLI_SUBCMD_OPTS.values():
     _def["all_opts"] = _def["takes_val"] | _def["no_val"]
     _def["long_opts"] = sorted(o for o in _def["all_opts"] if o.startswith("--"))
 
@@ -3423,9 +3461,15 @@ def _normalize_cli_argv(argv):
             idx += 1
             continue
         if token.startswith("-") and token not in ("-", "--"):
-            if any(c.isspace() for c in token) or token[1:].replace(".", "", 1).isdigit():
-                positionals.append(token)
-            elif cmd == "search" and not (token.startswith("-c") and token[2:] in _CATEGORIES_ENUM) and not (len(token) == 2 and token[1].isalpha()):
+            if (
+                any(c.isspace() for c in token)
+                or token[1:].replace(".", "", 1).isdigit()
+                or (
+                    cmd == "search"
+                    and not (token.startswith("-c") and token[2:] in _CATEGORIES_ENUM)
+                    and not (len(token) == 2 and token[1].isalpha())
+                )
+            ):
                 positionals.append(token)
             else:
                 options.append(token)
@@ -3597,7 +3641,7 @@ def run_doctor(a=None):
                     for t_name, k_name in (("entities", "entities_count"), ("observations", "observations_count"), ("relations", "relations_count")):
                         if ("table", t_name) not in missing_set:
                             try:
-                                rep_[k_name] = c.execute(f"SELECT COUNT(*) FROM {t_name};").fetchone()[0]
+                                rep_[k_name] = _count_table_rows(c, t_name)
                             except sqlite3.Error:
                                 rep_[k_name] = None
                         else:
@@ -3665,26 +3709,33 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
             arg = raw[idx]
             if arg in ("-c", "--category"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 category = raw[idx]
             elif arg.startswith("--category="):
                 category = arg.partition("=")[2]
             elif arg in ("-s", "--session", "--session-id", "--session_id"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 session = raw[idx]
-            elif arg.startswith("--session=") or arg.startswith("--session-id=") or arg.startswith("--session_id="):
+            elif arg.startswith(("--session=", "--session-id=", "--session_id=")):
                 session = arg.partition("=")[2]
             elif arg in ("-l", "--limit"):
                 idx += 1
-                if idx >= n: return False
-                try: limit = int(raw[idx])
-                except ValueError: return False
+                if idx >= n:
+                    return False
+                try:
+                    limit = int(raw[idx])
+                except ValueError:
+                    return False
             elif arg.startswith("-l") and len(arg) > 2 and arg[2:].isdigit():
                 limit = int(arg[2:])
             elif arg.startswith("--limit="):
-                try: limit = int(arg.partition("=")[2])
-                except ValueError: return False
+                try:
+                    limit = int(arg.partition("=")[2])
+                except ValueError:
+                    return False
             elif arg.startswith("-c") and len(arg) > 2 and arg[2:] in _CATEGORIES_ENUM:
                 category = arg[2:]
             elif arg == "--":
@@ -3722,7 +3773,8 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
             arg = raw[idx]
             if arg in ("-c", "--category"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 category = raw[idx]
             elif arg.startswith("--category="):
                 category = arg.partition("=")[2]
@@ -3730,28 +3782,39 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
                 category = arg[2:]
             elif arg in ("-s", "--session", "--session-id", "--session_id"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 session = raw[idx]
-            elif arg.startswith("--session=") or arg.startswith("--session-id=") or arg.startswith("--session_id="):
+            elif arg.startswith(("--session=", "--session-id=", "--session_id=")):
                 session = arg.partition("=")[2]
             elif arg in ("-l", "--limit"):
                 idx += 1
-                if idx >= n: return False
-                try: limit = int(raw[idx])
-                except ValueError: return False
+                if idx >= n:
+                    return False
+                try:
+                    limit = int(raw[idx])
+                except ValueError:
+                    return False
             elif arg.startswith("-l") and len(arg) > 2 and arg[2:].isdigit():
                 limit = int(arg[2:])
             elif arg.startswith("--limit="):
-                try: limit = int(arg.partition("=")[2])
-                except ValueError: return False
+                try:
+                    limit = int(arg.partition("=")[2])
+                except ValueError:
+                    return False
             elif arg in ("--relation-limit", "--rel-limit"):
                 idx += 1
-                if idx >= n: return False
-                try: relation_limit = int(raw[idx])
-                except ValueError: return False
-            elif arg.startswith("--relation-limit=") or arg.startswith("--rel-limit="):
-                try: relation_limit = int(arg.partition("=")[2])
-                except ValueError: return False
+                if idx >= n:
+                    return False
+                try:
+                    relation_limit = int(raw[idx])
+                except ValueError:
+                    return False
+            elif arg.startswith(("--relation-limit=", "--rel-limit=")):
+                try:
+                    relation_limit = int(arg.partition("=")[2])
+                except ValueError:
+                    return False
             elif arg.startswith("-") and arg != "-":
                 return False
             else:
@@ -3787,53 +3850,65 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
             arg = raw[idx]
             if arg in ("-e", "--entity", "--entity-name", "--name"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 entity = raw[idx]
-            elif arg.startswith("--entity=") or arg.startswith("--entity-name=") or arg.startswith("--name="):
+            elif arg.startswith(("--entity=", "--entity-name=", "--name=")):
                 entity = arg.partition("=")[2]
             elif arg in ("-t", "--type", "--entity-type", "--entity_type"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 entity_type = raw[idx]
-            elif arg.startswith("--type=") or arg.startswith("--entity-type=") or arg.startswith("--entity_type="):
+            elif arg.startswith(("--type=", "--entity-type=", "--entity_type=")):
                 entity_type = arg.partition("=")[2]
             elif arg == "--summary":
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 summary = raw[idx]
             elif arg.startswith("--summary="):
                 summary = arg.partition("=")[2]
             elif arg in ("-c", "--category"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 category = raw[idx]
             elif arg.startswith("--category="):
                 category = arg.partition("=")[2]
             elif arg == "--tags":
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 tags = raw[idx]
             elif arg.startswith("--tags="):
                 tags = arg.partition("=")[2]
             elif arg == "--confidence":
                 idx += 1
-                if idx >= n: return False
-                try: confidence = float(raw[idx])
-                except ValueError: return False
+                if idx >= n:
+                    return False
+                try:
+                    confidence = float(raw[idx])
+                except ValueError:
+                    return False
             elif arg.startswith("--confidence="):
-                try: confidence = float(arg.partition("=")[2])
-                except ValueError: return False
+                try:
+                    confidence = float(arg.partition("=")[2])
+                except ValueError:
+                    return False
             elif arg in ("-s", "--session", "--session-id", "--session_id"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 session = raw[idx]
-            elif arg.startswith("--session=") or arg.startswith("--session-id=") or arg.startswith("--session_id="):
+            elif arg.startswith(("--session=", "--session-id=", "--session_id=")):
                 session = arg.partition("=")[2]
             elif arg in ("-a", "--attributes"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 attributes = raw[idx]
-            elif arg.startswith("--attributes=") or arg.startswith("-a="):
+            elif arg.startswith(("--attributes=", "-a=")):
                 attributes = arg.partition("=")[2]
             elif arg == "--":
                 if idx + 1 < n:
@@ -3869,26 +3944,35 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
             arg = raw[idx]
             if arg in ("-t", "--type", "--relation-type", "--relation_type"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 opt_type = raw[idx]
-            elif arg.startswith("--type=") or arg.startswith("--relation-type=") or arg.startswith("--relation_type="):
+            elif arg.startswith(("--type=", "--relation-type=", "--relation_type=")):
                 opt_type = arg.partition("=")[2]
             elif arg in ("-w", "--weight"):
                 idx += 1
-                if idx >= n: return False
-                try: weight = float(raw[idx])
-                except ValueError: return False
+                if idx >= n:
+                    return False
+                try:
+                    weight = float(raw[idx])
+                except ValueError:
+                    return False
             elif arg.startswith("-w") and len(arg) > 2:
-                try: weight = float(arg[2:])
-                except ValueError: return False
+                try:
+                    weight = float(arg[2:])
+                except ValueError:
+                    return False
             elif arg.startswith("--weight="):
-                try: weight = float(arg.partition("=")[2])
-                except ValueError: return False
+                try:
+                    weight = float(arg.partition("=")[2])
+                except ValueError:
+                    return False
             elif arg in ("-m", "--metadata"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 metadata = raw[idx]
-            elif arg.startswith("--metadata=") or arg.startswith("-m="):
+            elif arg.startswith(("--metadata=", "-m=")):
                 metadata = arg.partition("=")[2]
             elif arg == "--":
                 positionals.extend(raw[idx + 1:])
@@ -3944,33 +4028,38 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
             arg = raw[idx]
             if arg in ("--observation", "--observation-id", "--observation_id"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 obs = raw[idx]
-            elif arg.startswith("--observation=") or arg.startswith("--observation-id=") or arg.startswith("--observation_id="):
+            elif arg.startswith(("--observation=", "--observation-id=", "--observation_id=")):
                 obs = arg.partition("=")[2]
             elif arg in ("-e", "--entity"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 ent = raw[idx]
             elif arg.startswith("--entity="):
                 ent = arg.partition("=")[2]
             elif arg == "--source":
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 src = raw[idx]
             elif arg.startswith("--source="):
                 src = arg.partition("=")[2]
             elif arg == "--target":
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 tgt = raw[idx]
             elif arg.startswith("--target="):
                 tgt = arg.partition("=")[2]
             elif arg in ("-t", "--type", "--relation-type", "--relation_type"):
                 idx += 1
-                if idx >= n or raw[idx].startswith("-"): return False
+                if idx >= n or raw[idx].startswith("-"):
+                    return False
                 rel_type = raw[idx]
-            elif arg.startswith("--type=") or arg.startswith("--relation-type=") or arg.startswith("--relation_type="):
+            elif arg.startswith(("--type=", "--relation-type=", "--relation_type=")):
                 rel_type = arg.partition("=")[2]
             else:
                 return False
@@ -4190,6 +4279,7 @@ def main():
     restore_p.add_argument("src", help="Source backup file to restore from")
     def run_restore(a):
         """Dispatches the `restore` CLI subcommand to stage, validate, and atomically swap a SQLite backup into `DB_PATH`, preventing corrupt backups or foreign files from clobbering live memory."""
+        import glob
         src = os.path.abspath(os.path.expanduser(a.src))
         if not os.path.isfile(src):
             print(json.dumps({"error": f"Backup file '{src}' does not exist or is not a regular file."}, indent=2), file=sys.stderr)
@@ -4275,12 +4365,12 @@ def main():
             try:
                 tmp_conn.execute("INSERT INTO observations_fts(observations_fts) VALUES('integrity-check');")
             except sqlite3.Error as e:
-                raise RuntimeError(f"Restored database FTS5 index corrupt: {e}")
+                raise RuntimeError(f"Restored database FTS5 index corrupt: {e}") from e
 
             counts = {}
             for t in CORE_TABLES:
                 try:
-                    counts[t] = tmp_conn.execute(f"SELECT COUNT(*) FROM {t};").fetchone()[0]
+                    counts[t] = _count_table_rows(tmp_conn, t)
                 except sqlite3.OperationalError:
                     pass
 

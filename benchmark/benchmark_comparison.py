@@ -148,7 +148,7 @@ def benchmark_mcp_engine(bin_path: str, db_path: str, allow_non_optane: bool, co
     env["AGENT_MEMORY_DB"] = db_path
 
     cmd = [sys.executable, "-I", bin_path, "benchmark", "-n", str(count)]
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300, check=False)
     if res.returncode != 0:
         raise RuntimeError(f"agent-memory benchmark failed (code {res.returncode}): {res.stderr}\n{res.stdout}")
 
@@ -169,7 +169,7 @@ def benchmark_mcp_engine(bin_path: str, db_path: str, allow_non_optane: bool, co
     if file_size == 0 and os.path.exists(db_path):
         file_size = os.path.getsize(db_path)
     n_toks = estimate_tokens("X" * (5 * 200))
-    ctx_str = " ".join(("~300 to 1,200", "tokens (bounded O(K))"))
+    ctx_str = "~300 to 1,200 tokens (bounded O(K))"
 
     if not media_name:
         media_name = "Samsung 840 EVO (MZ-7TE120BW)" if allow_non_optane else "Intel Optane M10 (MEMPEK1J032GA)"

@@ -297,8 +297,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-DOCTOR_RC=0
-DOCTOR_OUT="$("${PRE_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>"${DOCTOR_ERR}")" || DOCTOR_RC=$?
+DOCTOR_OUT="$("${PRE_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>"${DOCTOR_ERR}")" || true
 PREFLIGHT_OK="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys
 try: d = json.load(sys.stdin)
 except (ValueError, TypeError): print("0"); raise SystemExit
@@ -452,7 +451,7 @@ if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
     SKILL_DB_DISPLAY="${DB_PATH_RESOLVED}"
     SKILL_CLI_DISPLAY="${CLI_STR}"
     if [ "${ALLOW_NON_OPTANE_FLAG}" = "0" ] && [ "${DB_PATH_RESOLVED}" = "/mnt/optane/${TARGET_USER}/agent_memory/memory.db" ] && [ "${BIN}" = "${HOME_DIR}/.local/bin/agent-memory" ]; then
-        SKILL_DB_DISPLAY='/mnt/optane/${USER}/agent_memory/memory.db'
+        SKILL_DB_DISPLAY="/mnt/optane/\${USER}/agent_memory/memory.db"
         SKILL_CLI_DISPLAY="env ALLOW_NON_OPTANE=0 AGENT_MEMORY_DB=\"/mnt/optane/\${USER}/agent_memory/memory.db\" ${PY} -I \"\${HOME}/.local/bin/agent-memory\""
     fi
     "${PY}" -I - "${SCRIPT_DIR}/skill/SKILL.md.template" "${SKILL_DIR}/SKILL.md" "${SKILL_DB_DISPLAY}" "${SKILL_CLI_DISPLAY}" "${ALLOW_NON_OPTANE_FLAG}" <<'PY'
