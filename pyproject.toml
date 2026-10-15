@@ -1,0 +1,20 @@
+[project]
+name = "agent-memory-mcp"
+version = "1.0.0"
+description = "Per-user SQLite WAL + FTS5 persistent memory and knowledge graph CLI and stdio MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+[tool.ruff]
+include = ["*.py", "bin/agent-memory"]
+line-length = 140
+target-version = "py310"
+
+[tool.mypy]
+files = ["bin/agent-memory", "tests/test_agent_memory.py", "benchmark/benchmark_comparison.py"]
+python_version = "3.10"
+scripts_are_modules = true
+
+[tool.bandit]
+targets = ["bin/agent-memory", "tests", "benchmark"]
