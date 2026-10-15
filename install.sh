@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Christopher Schek
+# SPDX-License-Identifier: GPL-3.0-only
 # ==============================================================================
 # agent-memory installer (v1.0.0, schema 1.0)
 # Per-user, Optane-backed persistent memory for AI agents (CLI + stdio MCP server).
@@ -10,6 +12,8 @@
 #                                        else ~/.local/share/agent-memory/memory.db).
 #   ./install.sh --db /mnt/optane/$USER/custom/memory.db
 #   ./install.sh --no-client-config      Install and self-test only; print client snippets.
+#   ./install.sh --dry-run               Run preflight checks without modifying files.
+#   ./install.sh --log-dir /abs/dir      Write Tri-Stream telemetry (results.json, debug.log).
 #   ./install.sh --uninstall             Remove binary, skill and MCP registration (keeps data).
 #
 # Environment variables:
@@ -21,7 +25,8 @@
 #
 # Nothing is installed or registered until preflight, initialisation and self-test pass.
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
+umask 077
 
 VERSION="1.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,16 +36,22 @@ ALLOW_NON_OPTANE_FLAG=""
 DB_OVERRIDE=""
 UNINSTALL=0
 CLIENT_CONFIG=1
+DRY_RUN=0
+LOG_DIR=""
+RESULTS_WRITTEN=0
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --allow-non-optane) ALLOW_NON_OPTANE_FLAG=1 ;;
         --allow-non-optane=1|--allow-non-optane=true|--allow-non-optane=yes|--allow-non-optane=on) ALLOW_NON_OPTANE_FLAG=1 ;;
         --require-optane|--no-allow-non-optane|--allow-non-optane=0|--allow-non-optane=false|--allow-non-optane=no|--allow-non-optane=off) ALLOW_NON_OPTANE_FLAG=0 ;;
-        --db) [ $# -ge 2 ] || { echo "Error: --db requires a path" >&2; exit 2; }; DB_OVERRIDE="$2"; shift ;;
-        --db=*) DB_OVERRIDE="${1#--db=}" ;;
+        --db) [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || { echo "Error: --db requires a non-empty path" >&2; exit 2; }; DB_OVERRIDE="$2"; shift ;;
+        --db=*) DB_OVERRIDE="${1#--db=}"; [ -n "${DB_OVERRIDE}" ] && [[ "${DB_OVERRIDE}" != -* ]] || { echo "Error: --db requires a non-empty path" >&2; exit 2; } ;;
+        --log-dir) [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || { echo "Error: --log-dir requires a non-empty directory path" >&2; exit 2; }; LOG_DIR="$2"; shift ;;
+        --log-dir=*) LOG_DIR="${1#--log-dir=}"; [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" != -* ]] || { echo "Error: --log-dir requires a non-empty directory path" >&2; exit 2; } ;;
+        --dry-run) DRY_RUN=1 ;;
         --uninstall) UNINSTALL=1 ;;
         --no-client-config) CLIENT_CONFIG=0 ;;
         -h|--help) usage; exit 0 ;;
@@ -49,11 +60,46 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+if [ -n "${LOG_DIR}" ]; then
+    mkdir -p "${LOG_DIR}"
+    chmod 700 "${LOG_DIR}"
+fi
+
+log_debug() {
+    if [ -n "${LOG_DIR}" ]; then
+        printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "${LOG_DIR}/debug.log"
+    fi
+}
+
+write_results_json() {
+    local status="$1"
+    local detail="$2"
+    if [ -n "${LOG_DIR}" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -I - "${LOG_DIR}/results.json" "${status}" "${detail}" "${DB_PATH_RESOLVED:-}" "${DRY_RUN}" "${UNINSTALL}" <<'PY'
+import json, sys, time
+dst, status, detail, db_path, dry_run, uninstall = sys.argv[1:7]
+payload = {
+    "status": status,
+    "detail": detail,
+    "db_path": db_path,
+    "dry_run": dry_run == "1",
+    "uninstall": uninstall == "1",
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+}
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+    f.write("\n")
+PY
+        RESULTS_WRITTEN=1
+    fi
+}
+
 if [ "$(id -u)" -eq 0 ]; then
     case "${ALLOW_ROOT:-0}" in
         1|true|yes|on) ;;
         *)
             printf 'Error: Refusing to install as root. Run as the target user (e.g. without sudo). Set ALLOW_ROOT=1 to override.\n' >&2
+            write_results_json "error" "refusing to install as root"
             exit 1
             ;;
     esac
@@ -62,7 +108,12 @@ fi
 TARGET_USER="$(id -un)"
 HOME_DIR="${HOME:-}"
 if [ -z "${HOME_DIR}" ]; then
-    HOME_DIR="$(getent passwd "${TARGET_USER}" | cut -d: -f6)"
+    if command -v getent >/dev/null 2>&1; then
+        HOME_DIR="$(getent passwd "${TARGET_USER}" | cut -d: -f6)"
+    fi
+    if [ -z "${HOME_DIR}" ] && command -v python3 >/dev/null 2>&1; then
+        HOME_DIR="$(python3 -I -c 'import os; print(os.path.expanduser("~"))')"
+    fi
 fi
 BIN_DIR="${AGENT_MEMORY_BIN_DIR:-${BIN_DIR:-${HOME_DIR}/.local/bin}}"
 BIN="${BIN_DIR}/agent-memory"
@@ -71,9 +122,9 @@ MCP_DIR="${AGENT_MEMORY_MCP_DIR:-${MCP_DIR:-${GEMINI_DIR}/antigravity-cli/mcp/ag
 SKILL_DIR="${AGENT_MEMORY_SKILL_DIR:-${SKILL_DIR:-${GEMINI_DIR}/config/skills/agent-memory}}"
 MCP_CONFIG="${AGENT_MEMORY_MCP_CONFIG:-${MCP_CONFIG:-${GEMINI_DIR}/config/mcp_config.json}}"
 
-say()  { printf '[+] %s\n' "$*"; }
-warn() { printf '[!] %s\n' "$*" >&2; }
-die()  { printf 'Error: %s\n' "$*" >&2; exit 1; }
+say()  { printf '[+] %s\n' "$*"; log_debug "INFO: $*"; }
+warn() { printf '[!] %s\n' "$*" >&2; log_debug "WARN: $*"; }
+die()  { printf 'Error: %s\n' "$*" >&2; log_debug "ERROR: $*"; write_results_json "error" "$*"; exit 1; }
 
 # The interpreter is resolved once and pinned (as an absolute path) in the MCP registration, so the
 # server does not depend on the client's PATH. The launcher path (e.g. /usr/bin/python3) is kept rather
@@ -88,17 +139,24 @@ PY="$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.executable))')"
 # Read or update the agent-memory entry in an MCP JSON config safely: abort on malformed JSON,
 # keep the original as <config>.agent-memory.bak (written once), write atomically through
 # symlinks, preserve other servers and any extra keys of an existing entry.
-mcp_config_edit() {  # $1=check|get-db|add|remove  $2=config path  [$3=entry-json]
+mcp_config_edit() {  # $1=check|get-db|get-allow-non-optane|add|remove  $2=config path  [$3=entry-json]
     "${PY}" -I - "$@" <<'PY'
 import json, os, shutil, sys, tempfile
-action, path = sys.argv[1], os.path.realpath(sys.argv[2])
+action = sys.argv[1]
+orig_path = os.path.abspath(os.path.expanduser(sys.argv[2]))
+path = os.path.realpath(orig_path)
 data = {}
-if os.path.exists(path):
+orig_mode = 0o600
+orig_existed = os.path.exists(path)
+if orig_existed:
     try:
-        with open(path) as f:
+        st_existing = os.stat(path)
+        if (st_existing.st_mode & 0o022) == 0:
+            orig_mode = st_existing.st_mode & 0o777
+        with open(path, encoding="utf-8") as f:
             text = f.read()
         data = json.loads(text) if text.strip() else {}
-    except Exception as e:
+    except (OSError, ValueError, TypeError) as e:
         sys.exit(f"Error: {path} is not valid JSON ({e}); fix it manually, nothing was changed.")
     if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
         sys.exit(f"Error: {path} must be a JSON object whose 'mcpServers' is an object; nothing was changed.")
@@ -108,13 +166,14 @@ if action == "check":
 if action == "get-db":
     entry = servers.get("agent-memory")
     env = entry.get("env") if isinstance(entry, dict) else None
-    print(env.get("AGENT_MEMORY_DB", "") if isinstance(env, dict) else "")
+    val = str(env.get("AGENT_MEMORY_DB", "")).strip() if isinstance(env, dict) else ""
+    print(val if val and "${" not in val else "")
     sys.exit(0)
 if action == "get-allow-non-optane":
     entry = servers.get("agent-memory")
     env = entry.get("env") if isinstance(entry, dict) else None
-    val = str(env.get("ALLOW_NON_OPTANE", "")) if isinstance(env, dict) else ""
-    print("1" if str(val).strip().lower() in ("1", "true", "yes", "on") else "")
+    val = str(env.get("ALLOW_NON_OPTANE", "")).strip() if isinstance(env, dict) else ""
+    print("1" if "${" not in val and val.lower() in ("1", "true", "yes", "on") else "")
     sys.exit(0)
 if action == "add":
     new = json.loads(sys.argv[3])
@@ -126,15 +185,27 @@ elif action == "remove":
         sys.exit(0)
     del servers["agent-memory"]
 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-if os.path.exists(path) and not os.path.lexists(path + ".agent-memory.bak"):
-    shutil.copy2(path, path + ".agent-memory.bak", follow_symlinks=False)
-mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o600
+os.makedirs(os.path.dirname(orig_path) or ".", exist_ok=True)
+bak_path = orig_path + ".agent-memory.bak"
+if action == "add" and orig_existed and not os.path.lexists(bak_path):
+    shutil.copy2(path, bak_path)
+    try:
+        os.chmod(bak_path, 0o600)
+    except OSError:
+        pass
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".mcp_config.")
-with os.fdopen(fd, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-os.chmod(tmp, mode)
-os.replace(tmp, path)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, orig_mode)
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PY
 }
 
@@ -143,20 +214,34 @@ PY
 # ------------------------------------------------------------------------------
 if [ "${UNINSTALL}" -eq 1 ]; then
     DB_HINT=""
-    if [ -f "${MCP_CONFIG}" ]; then
+    if [ -f "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ]; then
         mcp_config_edit check "${MCP_CONFIG}" || die "nothing was removed."
         DB_HINT="$(mcp_config_edit get-db "${MCP_CONFIG}")"
-        mcp_config_edit remove "${MCP_CONFIG}"
-        say "Removed agent-memory from ${MCP_CONFIG} (original kept as ${MCP_CONFIG}.agent-memory.bak)"
+        if [ "${DRY_RUN}" -eq 0 ]; then
+            mcp_config_edit remove "${MCP_CONFIG}"
+            if [ -f "${MCP_CONFIG}.agent-memory.bak" ] || [ -L "${MCP_CONFIG}.agent-memory.bak" ]; then
+                say "Removed agent-memory from ${MCP_CONFIG} (original kept as ${MCP_CONFIG}.agent-memory.bak)"
+            else
+                say "Removed agent-memory from ${MCP_CONFIG}"
+            fi
+        else
+            say "[dry-run] Would remove agent-memory from ${MCP_CONFIG}"
+        fi
     fi
     if [ -z "${DB_HINT}" ] && [ -f "${BIN}" ]; then
         DB_HINT="$("${PY}" -I "${BIN}" doctor 2>/dev/null | "${PY}" -I -c 'import json,sys; print(json.load(sys.stdin).get("db_path",""))' 2>/dev/null || true)"
     fi
-    rm -f "${SKILL_DIR}/SKILL.md"; rmdir "${SKILL_DIR}" 2>/dev/null || true
-    rm -f "${MCP_DIR}/instructions.md" "${MCP_DIR}"/memory_*.json; rmdir "${MCP_DIR}" 2>/dev/null || true
-    rm -f "${BIN}"
-    say "Removed ${BIN}, skill and MCP instructions."
+    if [ "${DRY_RUN}" -eq 0 ]; then
+        rm -f "${SKILL_DIR}/SKILL.md" "${SKILL_DIR}/references/agent-memory-mcp.md"
+        rmdir "${SKILL_DIR}/references" "${SKILL_DIR}" 2>/dev/null || true
+        rm -f "${MCP_DIR}/instructions.md" "${MCP_DIR}"/memory_*.json; rmdir "${MCP_DIR}" 2>/dev/null || true
+        rm -f "${BIN}"
+        say "Removed ${BIN}, skill and MCP instructions."
+    else
+        say "[dry-run] Would remove ${BIN}, ${SKILL_DIR}, and ${MCP_DIR}."
+    fi
     say "Your memory database was kept${DB_HINT:+ at ${DB_HINT}}. Delete it manually if you no longer need it."
+    write_results_json "ok" "uninstall completed"
     exit 0
 fi
 
@@ -165,6 +250,12 @@ echo "Installing agent-memory v${VERSION} for user ${TARGET_USER}"
 echo "======================================================================"
 say "Python $("${PY}" -I -c 'import platform; print(platform.python_version())') (${PY})"
 [ -f "${BUNDLE_BIN}" ] || die "bundle is incomplete: bin/agent-memory not found next to install.sh."
+[ -f "${SCRIPT_DIR}/mcp/instructions.md" ] || die "bundle is incomplete: mcp/instructions.md not found next to install.sh."
+[ -f "${SCRIPT_DIR}/skill/SKILL.md.template" ] || die "bundle is incomplete: skill/SKILL.md.template not found next to install.sh."
+[ -f "${SCRIPT_DIR}/skill/references/agent-memory-mcp.md" ] || die "bundle is incomplete: skill/references/agent-memory-mcp.md not found next to install.sh."
+for _schema in memory_record.json memory_search.json memory_recall.json memory_relate.json memory_forget.json; do
+    [ -f "${SCRIPT_DIR}/mcp/${_schema}" ] || die "bundle is incomplete: mcp/${_schema} not found next to install.sh."
+done
 
 # ------------------------------------------------------------------------------
 # 1. Resolve the runtime environment. The MCP registration always carries an explicit
@@ -175,19 +266,21 @@ for v in AGENT_MEMORY_DB OPTANE_BASE ALLOW_NON_OPTANE; do
         warn "Ignoring ${v} from your shell; use --db / --allow-non-optane so the registered MCP server gets the same setting."
     fi
 done
-if [ -f "${MCP_CONFIG}" ]; then
+if [ "${CLIENT_CONFIG}" -eq 1 ] && [ -f "${MCP_CONFIG}" ]; then
+    EXISTING_ALLOW="$(mcp_config_edit get-allow-non-optane "${MCP_CONFIG}" 2>/dev/null || true)"
+    if [ -z "${ALLOW_NON_OPTANE_FLAG:-}" ] && [ "${EXISTING_ALLOW}" = "1" ]; then
+        ALLOW_NON_OPTANE_FLAG=1
+        say "Preserving ALLOW_NON_OPTANE=1 from ${MCP_CONFIG}"
+    fi
     if [ -z "${DB_OVERRIDE}" ]; then
         EXISTING_DB="$(mcp_config_edit get-db "${MCP_CONFIG}" 2>/dev/null || true)"
         if [ -n "${EXISTING_DB}" ]; then
-            DB_OVERRIDE="${EXISTING_DB}"
-            say "Preserving registered database path from ${MCP_CONFIG}: ${DB_OVERRIDE}"
-        fi
-    fi
-    if [ -z "${ALLOW_NON_OPTANE_FLAG:-}" ]; then
-        EXISTING_ALLOW="$(mcp_config_edit get-allow-non-optane "${MCP_CONFIG}" 2>/dev/null || true)"
-        if [ "${EXISTING_ALLOW}" = "1" ]; then
-            ALLOW_NON_OPTANE_FLAG=1
-            say "Preserving ALLOW_NON_OPTANE=1 from ${MCP_CONFIG}"
+            if [ "${ALLOW_NON_OPTANE_FLAG:-0}" = "0" ] && [ "${EXISTING_ALLOW}" = "1" ] && [[ "${EXISTING_DB}" != /mnt/optane/* ]]; then
+                say "Ignoring non-Optane database path from ${MCP_CONFIG} (${EXISTING_DB}) because Optane mode is required"
+            else
+                DB_OVERRIDE="${EXISTING_DB}"
+                say "Preserving registered database path from ${MCP_CONFIG}: ${DB_OVERRIDE}"
+            fi
         fi
     fi
 fi
@@ -198,7 +291,7 @@ if [ -n "${DB_OVERRIDE}" ]; then
         *) die "--db must be an absolute path (got '${DB_OVERRIDE}')." ;;
     esac
 fi
-ENV_BASE=(env -u AGENT_MEMORY_DB -u OPTANE_BASE -u ALLOW_NON_OPTANE "ALLOW_NON_OPTANE=${ALLOW_NON_OPTANE_FLAG}")
+ENV_BASE=(env -u AGENT_MEMORY_DB -u OPTANE_BASE -u ALLOW_NON_OPTANE "AGENT_MEMORY_NO_CFG_FALLBACK=1" "ALLOW_NON_OPTANE=${ALLOW_NON_OPTANE_FLAG}")
 PRE_ENV=("${ENV_BASE[@]}")
 [ -n "${DB_OVERRIDE}" ] && PRE_ENV+=("AGENT_MEMORY_DB=${DB_OVERRIDE}")
 
@@ -207,20 +300,45 @@ PRE_ENV=("${ENV_BASE[@]}")
 # ------------------------------------------------------------------------------
 TMP_BIN=""
 DOCTOR_ERR="$(mktemp)"
-trap 'rm -f "${DOCTOR_ERR}" ${TMP_BIN:+"${TMP_BIN}"}' EXIT
-DOCTOR_RC=0
-DOCTOR_OUT="$("${PRE_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>"${DOCTOR_ERR}")" || DOCTOR_RC=$?
-if [ "${DOCTOR_RC}" -ne 0 ]; then
+cleanup() {
+    local rc=$?
+    rm -f "${DOCTOR_ERR}" ${TMP_BIN:+"${TMP_BIN}"}
+    if [ "${rc}" -ne 0 ] && [ "${RESULTS_WRITTEN:-0}" -eq 0 ]; then
+        write_results_json "error" "aborted (exit ${rc})" || true
+    fi
+    exit "${rc}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+DOCTOR_OUT="$("${PRE_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>"${DOCTOR_ERR}")" || true
+PREFLIGHT_OK="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys
+try: d = json.load(sys.stdin)
+except (ValueError, TypeError): print("0"); raise SystemExit
+if d.get("healthy") is True:
+    print("1"); raise SystemExit
+gate_ok = str(d.get("storage_gate", "")).startswith("ok")
+feat_ok = str(d.get("sqlite_features", "")).startswith("ok")
+writ_ok = str(d.get("writable", "")).startswith("ok")
+perm_ok = str(d.get("permissions", "")).startswith("ok")
+db_err = d.get("db_error")
+integ = d.get("integrity", "ok")
+integ_ok = (integ == "ok") or bool(d.get("needs_init"))
+fk_ok = str(d.get("foreign_keys", "ok")) == "ok"
+print("1" if (gate_ok and feat_ok and writ_ok and perm_ok and not db_err and integ_ok and fk_ok) else "0")
+' 2>/dev/null || echo "0")"
+
+if [ "${PREFLIGHT_OK}" != "1" ]; then
     echo "${DOCTOR_OUT}" >&2
     cat "${DOCTOR_ERR}" >&2
     GATE_FAILED="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys
 try: d = json.load(sys.stdin)
-except Exception: print(0); raise SystemExit
-print(0 if str(d.get("storage_gate", "")).startswith("ok") else 1)' 2>/dev/null || echo 0)"
+except (ValueError, TypeError): print(1); raise SystemExit
+print(0 if str(d.get("storage_gate", "")).startswith("ok") else 1)' 2>/dev/null || echo 1)"
     WRITABLE_FAILED="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys
 try: d = json.load(sys.stdin)
-except Exception: print(0); raise SystemExit
-print(0 if str(d.get("writable", "")).startswith("ok") else 1)' 2>/dev/null || echo 0)"
+except (ValueError, TypeError): print(1); raise SystemExit
+print(0 if str(d.get("writable", "")).startswith("ok") else 1)' 2>/dev/null || echo 1)"
     echo >&2
     echo "Preflight failed: see the fields above that are not \"ok\". Nothing was changed." >&2
     if { [ "${GATE_FAILED}" = "1" ] || [ "${WRITABLE_FAILED}" = "1" ]; } && [ "${ALLOW_NON_OPTANE_FLAG}" -eq 0 ]; then
@@ -232,9 +350,11 @@ To run on ordinary storage instead (slower, explicit opt-in):
     ./install.sh --allow-non-optane [--db /absolute/path/memory.db]
 EOF
     fi
+    write_results_json "error" "preflight failed"
     exit 1
 fi
-DB_PATH_RESOLVED="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys; print(json.load(sys.stdin)["db_path"])')"
+DB_PATH_RESOLVED="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys; print(json.load(sys.stdin).get("db_path", ""))' 2>/dev/null || true)"
+[ -n "${DB_PATH_RESOLVED}" ] || die "preflight doctor did not return a valid db_path."
 say "Preflight passed; database: ${DB_PATH_RESOLVED}"
 [ "${ALLOW_NON_OPTANE_FLAG}" -eq 1 ] && warn "Non-Optane override is active (ALLOW_NON_OPTANE=1)."
 RUN_ENV=("${ENV_BASE[@]}" "AGENT_MEMORY_DB=${DB_PATH_RESOLVED}")
@@ -243,7 +363,13 @@ RUN_ENV=("${ENV_BASE[@]}" "AGENT_MEMORY_DB=${DB_PATH_RESOLVED}")
 DO_ANTIGRAVITY=0
 if [ "${CLIENT_CONFIG}" -eq 1 ] && { [ -d "${GEMINI_DIR}/antigravity-cli" ] || [ -e "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ] || command -v agy >/dev/null 2>&1; }; then
     DO_ANTIGRAVITY=1
-    mcp_config_edit check "${MCP_CONFIG}" || exit 1
+    mcp_config_edit check "${MCP_CONFIG}" || die "invalid client config ${MCP_CONFIG}"
+fi
+
+if [ "${DRY_RUN}" -eq 1 ]; then
+    say "[dry-run] Preflight passed. Would initialize ${DB_PATH_RESOLVED} and install ${BIN}."
+    write_results_json "ok" "dry-run preflight passed"
+    exit 0
 fi
 
 # ------------------------------------------------------------------------------
@@ -251,6 +377,7 @@ fi
 #    binary, before anything is installed or registered.
 # ------------------------------------------------------------------------------
 "${RUN_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" init
+"${RUN_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor >/dev/null || die "post-init doctor check failed."
 
 "${RUN_ENV[@]}" "${PY}" -I - "${PY}" "${BUNDLE_BIN}" <<'PY'
 import json, subprocess, sys, uuid
@@ -262,11 +389,17 @@ def run(*a, inp=None):
     return p.stdout
 tok = "installprobe" + uuid.uuid4().hex[:12]
 oid = json.loads(run("record", f"agent-memory install self-test {tok}", "--session", "install-selftest"))["observation_id"]
-hits = json.loads(run("search", tok))
-if not any(h.get("observation_id") == oid for h in hits):
-    sys.exit(f"Self-test failed: probe not found by search: {hits}")
-if json.loads(run("forget", "--observation", oid)).get("deleted_observations") != 1:
-    sys.exit("Self-test failed: probe could not be deleted")
+deleted = False
+try:
+    hits = json.loads(run("search", tok))
+    if not any(h.get("observation_id") == oid for h in hits):
+        sys.exit(f"Self-test failed: probe not found by search: {hits}")
+    if json.loads(run("forget", "--observation", oid)).get("deleted_observations") != 1:
+        sys.exit("Self-test failed: probe could not be deleted")
+    deleted = True
+finally:
+    if not deleted:
+        subprocess.run([*cmd, "forget", "--observation", oid], capture_output=True, text=True, timeout=30)
 msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "installer", "version": "1"}}},
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
@@ -286,6 +419,7 @@ PY
 # 4. Install the binary (atomic replace)
 # ------------------------------------------------------------------------------
 mkdir -p "${BIN_DIR}"
+chmod 755 "${BIN_DIR}" 2>/dev/null || true
 TMP_BIN="$(mktemp "${BIN_DIR}/.agent-memory.XXXXXX")"
 cp "${BUNDLE_BIN}" "${TMP_BIN}"
 chmod 755 "${TMP_BIN}"
@@ -316,29 +450,49 @@ if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
     mcp_config_edit add "${MCP_CONFIG}" "${ENTRY_JSON}"
     say "Registered MCP server 'agent-memory' in ${MCP_CONFIG}"
     mkdir -p "${MCP_DIR}"
+    chmod 755 "${MCP_DIR}" 2>/dev/null || true
     rm -f "${MCP_DIR}"/memory_*.json "${MCP_DIR}/instructions.md"
-    cp -f "${SCRIPT_DIR}/mcp/instructions.md" "${MCP_DIR}/instructions.md" 
+    cp -f "${SCRIPT_DIR}/mcp/instructions.md" "${MCP_DIR}/instructions.md"
+    chmod 644 "${MCP_DIR}/instructions.md"
     say "Installed MCP instructions to ${MCP_DIR}"
-    if compgen -G "${SCRIPT_DIR}/mcp/memory_*.json" >/dev/null 2>&1; then
-        cp -f "${SCRIPT_DIR}/mcp"/memory_*.json "${MCP_DIR}/"
-        say "Installed MCP tool schemas to ${MCP_DIR}"
+    cp -f "${SCRIPT_DIR}/mcp"/memory_*.json "${MCP_DIR}/"
+    chmod 644 "${MCP_DIR}"/memory_*.json
+    say "Installed MCP tool schemas to ${MCP_DIR}"
+    mkdir -p "${SKILL_DIR}/references"
+    chmod 755 "${SKILL_DIR}" "${SKILL_DIR}/references" 2>/dev/null || true
+    cp -f "${SCRIPT_DIR}/skill/references/agent-memory-mcp.md" "${SKILL_DIR}/references/agent-memory-mcp.md"
+    chmod 644 "${SKILL_DIR}/references/agent-memory-mcp.md"
+    SKILL_DB_DISPLAY="${DB_PATH_RESOLVED}"
+    SKILL_CLI_DISPLAY="${CLI_STR}"
+    if [ "${ALLOW_NON_OPTANE_FLAG}" = "0" ] && [ "${DB_PATH_RESOLVED}" = "/mnt/optane/${TARGET_USER}/agent_memory/memory.db" ] && [ "${BIN}" = "${HOME_DIR}/.local/bin/agent-memory" ]; then
+        SKILL_DB_DISPLAY="/mnt/optane/\${USER}/agent_memory/memory.db"
+        SKILL_CLI_DISPLAY="env ALLOW_NON_OPTANE=0 AGENT_MEMORY_DB=\"/mnt/optane/\${USER}/agent_memory/memory.db\" ${PY} -I \"\${HOME}/.local/bin/agent-memory\""
     fi
-    mkdir -p "${SKILL_DIR}"
-    "${PY}" -I - "${SCRIPT_DIR}/skill/SKILL.md.template" "${SKILL_DIR}/SKILL.md" "${DB_PATH_RESOLVED}" "${CLI_STR}" "${ALLOW_NON_OPTANE_FLAG}" <<'PY'
+    "${PY}" -I - "${SCRIPT_DIR}/skill/SKILL.md.template" "${SKILL_DIR}/SKILL.md" "${SKILL_DB_DISPLAY}" "${SKILL_CLI_DISPLAY}" "${ALLOW_NON_OPTANE_FLAG}" <<'PY'
 import os, sys, tempfile
 src, dst, db, cli, allow = sys.argv[1:6]
 storage_desc = "stored on local persistent storage" if allow == "1" else "stored on a dedicated fast volume"
-text = open(src).read().replace("__DB__", db).replace("__CLI__", cli).replace("__STORAGE_DESC__", storage_desc)
+with open(src, encoding="utf-8") as sf:
+    text = sf.read().replace("__DB__", db).replace("__CLI__", cli).replace("__STORAGE_DESC__", storage_desc)
 dst_dir = os.path.dirname(dst) or "."
 os.makedirs(dst_dir, exist_ok=True)
 fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".SKILL.md.")
-with os.fdopen(fd, "w") as f:
-    f.write(text)
-os.chmod(tmp, 0o644)
-os.replace(tmp, dst)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, dst)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PY
-    say "Installed skill to ${SKILL_DIR}/SKILL.md"
+    say "Installed skill and reference to ${SKILL_DIR}"
 fi
+
+write_results_json "ok" "installation completed"
 
 echo "======================================================================"
 echo "agent-memory v${VERSION} installed."
