@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "agent-memory-mcp"
 version = "1.0.0"
@@ -8,6 +12,7 @@ license = { file = "LICENSE" }
 
 [tool.ruff]
 include = ["*.py", "bin/agent-memory"]
+extend-include = ["bin/agent-memory"]
 line-length = 140
 target-version = "py310"
 
@@ -18,3 +23,4 @@ scripts_are_modules = true
 
 [tool.bandit]
 targets = ["bin/agent-memory", "tests", "benchmark"]
+

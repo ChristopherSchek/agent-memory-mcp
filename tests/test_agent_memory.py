@@ -439,6 +439,167 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(cat2, "invariant")
         self.assertEqual(q2, '"escaped "" quote"')
 
+    def test_c01_to_c05_regression_contracts(self) -> None:
+        """Verifies plain-text backslash acceptance, NUL and nested attribute secret/persona rejection, symlink and 0-byte DB guards, read-only non-mutation, signal handler restoration, and backup/restore MCP inode hot-swap."""
+        import signal
+
+        ok_regex = self.am.record_observation(
+            content=r"Validate regex \bword\b and \Bnon-boundary in C:\repos\bin",
+            entity_name="regex-ent",
+        )
+        self.assertEqual(ok_regex.get("status"), "success")
+
+        nul_obs = self.am.record_observation(
+            content="Null\x00byte in content",
+            entity_name="nul-ent",
+        )
+        self.assertIn("error", nul_obs)
+
+        attr_sec = self.am.record_observation(
+            content="Valid content",
+            entity_name="attr-sec-ent",
+            attributes={"cfg": "sec" + 'ret = "my val with spaces"'},
+        )
+        self.assertIn("error", attr_sec)
+
+        attr_persona = self.am.record_observation(
+            content="Valid content",
+            entity_name="attr-persona-ent",
+            attributes={"note": "*Stage direction action*"},
+        )
+        self.assertIn("error", attr_persona)
+
+        tag_persona = self.am.record_observation(
+            content="Valid content",
+            entity_name="tag-persona-ent",
+            tags=["*Stage direction action*"],
+        )
+        self.assertIn("error", tag_persona)
+
+        meta_persona = self.am.relate_entities(
+            "src-ent",
+            "dst-ent",
+            "depends_on",
+            metadata={"note": "*Stage direction action*"},
+        )
+        self.assertIn("error", meta_persona)
+
+        with self.assertRaises(RuntimeError):
+            self.am._check_not_guarded_path(
+                os.path.join("~", "." + "ssh", "memory.db"), "DB_PATH"
+            )
+
+        self.assertFalse(
+            self.am._fast_cli_dispatch(["agent-memory", "search", "-l=5", "RHEL"])
+        )
+        self.assertFalse(
+            self.am._fast_cli_dispatch(["agent-memory", "record", "first", "--", "second"])
+        )
+        norm_forget = self.am._normalize_cli_argv(
+            ["agent-memory", "forget", "extra", "-o", "obs-1"]
+        )
+        self.assertEqual(norm_forget[:3], ["agent-memory", "forget", "-o"])
+
+        zero_orphan = os.path.join(self.tmpdir.name, "zero_orphan.db")
+        with open(zero_orphan, "wb"):
+            pass
+        os.chmod(zero_orphan, 0o600)
+        with open(zero_orphan + "-wal", "wb") as f:
+            f.write(b"orphan wal")
+        os.chmod(zero_orphan + "-wal", 0o600)
+        self.am.DB_PATH = zero_orphan
+        self.am._RAW_DB_PATH = zero_orphan
+        with self.assertRaises(RuntimeError) as cm_zo:
+            self.am.get_connection()
+        self.assertIn("sidecar", str(cm_zo.exception))
+
+        sym_target = os.path.join(self.tmpdir.name, "sym_subdir", "real.db")
+        sym_link = os.path.join(self.tmpdir.name, "link.db")
+        os.symlink(sym_target, sym_link)
+        self.am._RAW_DB_PATH = sym_link
+        self.am.DB_PATH = os.path.realpath(sym_link)
+        conn = self.am.get_connection()
+        self.am.init_db(conn)
+        conn.close()
+        self.assertTrue(os.path.isfile(sym_target))
+
+        os.chmod(sym_target, 0o644)
+        ro_conn = self.am.get_connection(read_only=True)
+        ro_conn.close()
+        self.assertEqual(os.stat(sym_target).st_mode & 0o777, 0o644)
+        os.chmod(sym_target, 0o600)
+        os.chmod(os.path.dirname(sym_target), 0o700)
+
+        self.am.record_observation(content="Before backup", entity_name="bak-ent")
+        bak_path = os.path.join(self.tmpdir.name, "backup.db")
+        orig_stdout = sys.stdout
+        orig_argv = sys.argv
+        try:
+            sys.stdout = io.StringIO()
+            sys.argv = ["agent-memory", "backup", bak_path]
+            self.am.main()
+        finally:
+            sys.stdout = orig_stdout
+            sys.argv = orig_argv
+
+        conn_holder = [None]
+        err_holder = [None]
+        try:
+            r1 = self.am.process_single_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "memory_recall", "arguments": {"entity": "bak-ent"}},
+                },
+                conn_holder[0],
+                self.am.TOOLS,
+                conn_holder=conn_holder,
+                err_holder=err_holder,
+            )
+            self.assertFalse(json.loads(str(r1))["result"].get("isError"))
+            self.am.record_observation(content="After backup", entity_name="post-bak-ent")
+            try:
+                sys.stdout = io.StringIO()
+                sys.argv = ["agent-memory", "restore", bak_path]
+                self.am.main()
+            finally:
+                sys.stdout = orig_stdout
+                sys.argv = orig_argv
+            r2 = self.am.process_single_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "memory_recall",
+                        "arguments": {"entity": "post-bak-ent"},
+                    },
+                },
+                conn_holder[0],
+                self.am.TOOLS,
+                conn_holder=conn_holder,
+                err_holder=err_holder,
+            )
+            self.assertTrue(json.loads(str(r2))["result"].get("isError"))
+        finally:
+            if conn_holder[0] is not None:
+                conn_holder[0].close()
+
+        prev_int = signal.getsignal(signal.SIGINT)
+        prev_term = signal.getsignal(signal.SIGTERM)
+        try:
+            sys.stdout = io.StringIO()
+            sys.argv = ["agent-memory", "benchmark", "-n", "2"]
+            self.am.main()
+        finally:
+            sys.stdout = orig_stdout
+            sys.argv = orig_argv
+        self.assertEqual(signal.getsignal(signal.SIGINT), prev_int)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), prev_term)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

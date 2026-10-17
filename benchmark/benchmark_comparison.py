@@ -200,6 +200,8 @@ def benchmark_mcp_engine(
     saved_env = {k: os.environ.get(k) for k in env_keys}
     saved_argv = sys.argv[:]
     saved_stdout = sys.stdout
+    saved_sigint = signal.getsignal(signal.SIGINT)
+    saved_sigterm = signal.getsignal(signal.SIGTERM)
     buf = io.StringIO()
     try:
         os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
@@ -227,6 +229,11 @@ def benchmark_mcp_engine(
     finally:
         sys.stdout = saved_stdout
         sys.argv = saved_argv
+        try:
+            signal.signal(signal.SIGINT, saved_sigint)
+            signal.signal(signal.SIGTERM, saved_sigterm)
+        except (ValueError, AttributeError):
+            pass
         for k, val in saved_env.items():
             if val is None:
                 os.environ.pop(k, None)
@@ -412,6 +419,17 @@ def main() -> None:
     results_json_path = os.path.join(log_dir, "results.json") if log_dir else ""
     if log_dir:
         os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(log_dir, 0o700)
+        except OSError:
+            pass
+        with open(debug_log_path, "w", encoding="utf-8"):
+            pass
+        os.chmod(debug_log_path, 0o600)
+        with open(results_json_path, "w", encoding="utf-8") as rf:
+            json.dump({"status": "running", "count": args.count, "results": []}, rf, indent=2)
+            rf.write("\n")
+        os.chmod(results_json_path, 0o600)
 
     def _log_debug(msg: str) -> None:
         """Emits timestamped diagnostic progress to stderr and debug.log to preserve execution telemetry without polluting stdout."""
@@ -419,6 +437,10 @@ def main() -> None:
         if debug_log_path:
             with open(debug_log_path, "a", encoding="utf-8") as df:
                 df.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}\n")
+            try:
+                os.chmod(debug_log_path, 0o600)
+            except OSError:
+                pass
 
     results: list[dict[str, Any]] = []
     try:
@@ -513,22 +535,32 @@ def main() -> None:
             with open(results_json_path, "w", encoding="utf-8") as rf:
                 json.dump({"status": "ok", "count": args.count, "results": results}, rf, indent=2)
                 rf.write("\n")
+            os.chmod(results_json_path, 0o600)
 
         if args.json:
             print(json.dumps(results, indent=2))
         else:
             print_markdown_comparison(results, args.count, optane_label=optane_label, flash_label=flash_label)
-    except (RuntimeError, OSError, ValueError, TypeError) as exc:
-        _log_debug(f"[!] Benchmark execution failed: {exc}")
+    except BaseException as exc:
+        if isinstance(exc, SystemExit) and exc.code in (0, None):
+            raise
+        err_msg = f"Interrupted ({exc})" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else str(exc)
+        _log_debug(f"[!] Benchmark execution failed: {err_msg}")
         if results_json_path:
             try:
                 with open(results_json_path, "w", encoding="utf-8") as rf:
-                    json.dump({"status": "error", "error": str(exc), "count": args.count, "results": results}, rf, indent=2)
+                    json.dump({"status": "error", "error": err_msg, "count": args.count, "results": results}, rf, indent=2)
                     rf.write("\n")
+                os.chmod(results_json_path, 0o600)
             except OSError:
                 pass
+        if isinstance(exc, SystemExit):
+            raise
+        if isinstance(exc, KeyboardInterrupt):
+            sys.exit(130)
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
