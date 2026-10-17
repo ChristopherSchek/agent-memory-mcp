@@ -70,7 +70,7 @@ Record the following durable items:
 
 Never record the following prohibited items:
 - **Secrets and Credentials**: Raw tokens, API keys, private keys, connection strings, or passwords.
-- **Persona or Roleplay Prose**: Conversational persona names, aristocratic titles, terms of endearment, non-7-bit-ASCII bytes, or stylistic flourishes (strictly forbidden by the Hard Isolation Rule).
+- **Persona or Roleplay Prose**: Conversational persona names, roleplay titles, terms of endearment, non-7-bit-ASCII bytes, or stylistic flourishes (strictly forbidden by the Hard Isolation Rule).
 - **Transient State**: Ephemeral task status, scratch output, or large logs (content is limited to 8000 characters).
 - **Redundant Facts**: Information already obvious from standard repository inspection.
   - *Positive Exemplar*: `Record verified architectural invariants and root causes in clinical 7-bit ASCII technical prose.`
@@ -282,7 +282,7 @@ Binds `agent-memory` operations to all fifteen canonical baseline modules, built
 7. **`principal-tooling`**: Code and documentation changes to `agent-memory` are validated dynamically via [`principal-tooling`](../principal-tooling/SKILL.md) (`tool_manager.py`).
 8. **`skunkworks-scratch` & `cleanup-skunkworks`**: Transient diagnostic scripts, benchmark outputs, and test databases adhere to [`skunkworks-scratch`](../skunkworks-scratch/SKILL.md) and [`cleanup-skunkworks`](../cleanup-skunkworks/SKILL.md) and never pollute active git working trees.
 9. **`audit-harness`**: Adversarial audits of `agent-memory` adhere to [`audit-harness`](../audit-harness/SKILL.md) and persist dual-confirmed architectural decisions and invariants.
-10. **`sync-ide-conversations`, `sync-cli-conversations` & `cleanup-conversations`**: Conversation index synchronization and cleanup workflows on `sg-antigravity-pd1` and macOS workstations coordinate with [`sync-ide-conversations`](../sync-ide-conversations/SKILL.md), [`sync-cli-conversations`](../sync-cli-conversations/SKILL.md), and [`cleanup-conversations`](../cleanup-conversations/SKILL.md).
+10. **`sync-ide-conversations`, `sync-cli-conversations` & `cleanup-conversations`**: Conversation index synchronization and cleanup workflows on `linux-host-01` and macOS workstations coordinate with [`sync-ide-conversations`](../sync-ide-conversations/SKILL.md), [`sync-cli-conversations`](../sync-cli-conversations/SKILL.md), and [`cleanup-conversations`](../cleanup-conversations/SKILL.md).
 11. **`update-baseline`, `agy-customizations` & `antigravity-guide`**: Updates to `SKILL.md` or [`references/agent-memory-mcp.md`](references/agent-memory-mcp.md) maintain byte-for-byte parity across `agent-memory-mcp`, `agent-baseline`, and `~/.gemini/config/skills/agent-memory/` via [`update-baseline`](../update-baseline/SKILL.md) in alignment with `agy-customizations` and `antigravity-guide`.
     - *Positive Exemplar*: `Synchronize SKILL.md and references/agent-memory-mcp.md across agent-memory-mcp, agent-baseline, and ~/.gemini/config/skills/agent-memory/ after any edit.`
     - *Negative Exemplar*: `Modify skill documentation in one repository while leaving unhydrated placeholders or drifted copies in agent-baseline.` (STRICTLY FORBIDDEN)

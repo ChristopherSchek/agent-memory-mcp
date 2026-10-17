@@ -61,8 +61,8 @@ class TestAgentMemoryHermetic(unittest.TestCase):
     def test_record_search_recall_relate_and_forget(self) -> None:
         """Verifies the complete lifecycle of recording observations, linking entities, searching via FTS5, recalling entity graphs, and forgetting records to confirm CRUD and cascade invariants, preventing orphaned records or search desynchronization."""
         rec = self.am.record_observation(
-            content="Host sg-antigravity-pd1 runs RHEL 10 with Kernel 6.12.",
-            entity_name="sg-antigravity-pd1",
+            content="Host linux-host-01 runs RHEL 10 with Kernel 6.12.",
+            entity_name="linux-host-01",
             entity_type="host",
             summary="Primary bare-metal RHEL 10 host",
             category="architecture",
@@ -75,8 +75,8 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertTrue(obs_id)
 
         dup = self.am.record_observation(
-            content="Host sg-antigravity-pd1 runs RHEL 10 with Kernel 6.12.",
-            entity_name="sg-antigravity-pd1",
+            content="Host linux-host-01 runs RHEL 10 with Kernel 6.12.",
+            entity_name="linux-host-01",
             entity_type="host",
             category="architecture",
         )
@@ -85,7 +85,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
 
         rel = self.am.relate_entities(
             source_name="agent-baseline",
-            target_name="sg-antigravity-pd1",
+            target_name="linux-host-01",
             relation_type="deploys_to",
             weight=1.0,
         )
@@ -95,8 +95,8 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertIsInstance(search_res, list)
         self.assertGreaterEqual(len(search_res), 1)
 
-        recall_res = self.am.recall_entity(name="sg-antigravity-pd1")
-        self.assertEqual(recall_res["name"], "sg-antigravity-pd1")
+        recall_res = self.am.recall_entity(name="linux-host-01")
+        self.assertEqual(recall_res["name"], "linux-host-01")
         self.assertEqual(len(recall_res["observations"]), 1)
 
         forget_res = self.am.forget_memory(observation_id=obs_id)
@@ -104,12 +104,12 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(forget_res.get("deleted_observations"), 1)
         self.assertEqual(self.am.search_memory(query="RHEL 10", category="architecture"), [])
 
-        ent_forget = self.am.forget_memory(entity="sg-antigravity-pd1")
+        ent_forget = self.am.forget_memory(entity="linux-host-01")
         self.assertEqual(ent_forget.get("status"), "success")
-        self.assertEqual(ent_forget.get("deleted_entity"), "sg-antigravity-pd1")
+        self.assertEqual(ent_forget.get("deleted_entity"), "linux-host-01")
         self.assertEqual(ent_forget.get("deleted_observations"), 0)
         self.assertEqual(ent_forget.get("deleted_relations"), 1)
-        self.assertIn("error", self.am.recall_entity("sg-antigravity-pd1"))
+        self.assertIn("error", self.am.recall_entity("linux-host-01"))
         self.assertIn("error", self.am.recall_entity("agent-baseline"))
 
     def test_mcp_jsonrpc_lifecycle(self) -> None:
