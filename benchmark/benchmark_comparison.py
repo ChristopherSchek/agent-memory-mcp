@@ -200,6 +200,8 @@ def benchmark_mcp_engine(
     saved_env = {k: os.environ.get(k) for k in env_keys}
     saved_argv = sys.argv[:]
     saved_stdout = sys.stdout
+    saved_sigint = signal.getsignal(signal.SIGINT)
+    saved_sigterm = signal.getsignal(signal.SIGTERM)
     buf = io.StringIO()
     try:
         os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
@@ -227,6 +229,11 @@ def benchmark_mcp_engine(
     finally:
         sys.stdout = saved_stdout
         sys.argv = saved_argv
+        try:
+            signal.signal(signal.SIGINT, saved_sigint)
+            signal.signal(signal.SIGTERM, saved_sigterm)
+        except (ValueError, AttributeError):
+            pass
         for k, val in saved_env.items():
             if val is None:
                 os.environ.pop(k, None)
@@ -335,6 +342,9 @@ def print_markdown_comparison(
     print(f"\n# Memory Benchmark Results ({count} Iterations)\n")
     print("Summarizes comparative write latency, context token consumption, and durability across storage tiers and memory architectures to guide storage selection without unbenchmarked performance assumptions.\n")
 
+    print("## 1. Comparative Benchmark Tables\n")
+    print("Presents hardware commit latency and context scaling measurements across storage media and persistence patterns to quantify physical and architectural overhead, preventing unmeasured storage or context bottlenecks.\n")
+
     # Table 1: Physical Storage Benchmark (Pure Hardware & Disk Latency)
     print("### Table 1: Physical Storage Benchmark (Pure Hardware & Disk Latency)\n")
     print("Compares average commit latency across dedicated low-latency media and standard local storage for each persistence pattern to quantify hardware fsync speedup, preventing storage tier misconfiguration.\n")
@@ -372,7 +382,10 @@ def print_markdown_comparison(
     print(f"| **Flat Markdown (MEMORY.md)** | ~{md_tokens:,} tokens (unbounded O(N)) | {md_ttft} | O(N) raw text appends | **Unsafe** (interleaved line corruption) |")
     print(f"| **JSON Rewrite (notes.json)** | ~{json_tokens:,} tokens (unbounded O(N)) | {json_ttft} | O(N^2) full array rewrites | **Unsafe** (full-file overwrite clobber) |")
 
-    print("\n### Operational Guidance & Technical Notes\n")
+    print("\n## 2. Architectural Analysis\n")
+    print("Examines durability barriers, kernel page-cache warm reads, and multi-agent lock contention across storage tiers so operators can interpret benchmark metrics without misreading OS cache effects.\n")
+
+    print("### Operational Guidance & Technical Notes\n")
     print("Details durability trade-offs, kernel page-cache behavior, and concurrency guarantees to explain the benchmark measurements without leaving architectural assumptions implicit.\n")
     print("1. Durability Modes: sync=FULL vs. sync=NORMAL:")
     print("   - sync=FULL (Default on Optane): Issues a physical hardware barrier (fdatasync) directly to the drive controller on every commit. Guarantees zero data loss across sudden host power loss, UPS failure, or kernel panics. On Intel Optane (3D XPoint), byte-addressability commits hardware fsync in sub-millisecond latency with zero flash wear.")
@@ -406,6 +419,17 @@ def main() -> None:
     results_json_path = os.path.join(log_dir, "results.json") if log_dir else ""
     if log_dir:
         os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(log_dir, 0o700)
+        except OSError:
+            pass
+        with open(debug_log_path, "w", encoding="utf-8"):
+            pass
+        os.chmod(debug_log_path, 0o600)
+        with open(results_json_path, "w", encoding="utf-8") as rf:
+            json.dump({"status": "running", "count": args.count, "results": []}, rf, indent=2)
+            rf.write("\n")
+        os.chmod(results_json_path, 0o600)
 
     def _log_debug(msg: str) -> None:
         """Emits timestamped diagnostic progress to stderr and debug.log to preserve execution telemetry without polluting stdout."""
@@ -413,6 +437,10 @@ def main() -> None:
         if debug_log_path:
             with open(debug_log_path, "a", encoding="utf-8") as df:
                 df.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}\n")
+            try:
+                os.chmod(debug_log_path, 0o600)
+            except OSError:
+                pass
 
     results: list[dict[str, Any]] = []
     try:
@@ -507,22 +535,32 @@ def main() -> None:
             with open(results_json_path, "w", encoding="utf-8") as rf:
                 json.dump({"status": "ok", "count": args.count, "results": results}, rf, indent=2)
                 rf.write("\n")
+            os.chmod(results_json_path, 0o600)
 
         if args.json:
             print(json.dumps(results, indent=2))
         else:
             print_markdown_comparison(results, args.count, optane_label=optane_label, flash_label=flash_label)
-    except (RuntimeError, OSError, ValueError, TypeError) as exc:
-        _log_debug(f"[!] Benchmark execution failed: {exc}")
+    except BaseException as exc:
+        if isinstance(exc, SystemExit) and exc.code in (0, None):
+            raise
+        err_msg = f"Interrupted ({exc})" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else str(exc)
+        _log_debug(f"[!] Benchmark execution failed: {err_msg}")
         if results_json_path:
             try:
                 with open(results_json_path, "w", encoding="utf-8") as rf:
-                    json.dump({"status": "error", "error": str(exc), "count": args.count, "results": results}, rf, indent=2)
+                    json.dump({"status": "error", "error": err_msg, "count": args.count, "results": results}, rf, indent=2)
                     rf.write("\n")
+                os.chmod(results_json_path, 0o600)
             except OSError:
                 pass
+        if isinstance(exc, SystemExit):
+            raise
+        if isinstance(exc, KeyboardInterrupt):
+            sys.exit(130)
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
