@@ -11,7 +11,8 @@ __pycache__/
 *.sqlite
 *.sqlite3
 
-# Test artifacts & scratch
+# Test artifacts, build outputs & scratch
+dist/
 scratch/
 tmp/
 *.bak

@@ -1,34 +1,7 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Christopher Schek
 # SPDX-License-Identifier: GPL-3.0-only
-# ==============================================================================
-# agent-memory installer (v1.0.0, schema 1.0)
-# Per-user, Optane-backed persistent memory for AI agents (CLI + stdio MCP server).
-#
-#   ./install.sh                         Install on a host with a verified Intel Optane
-#                                        volume at /mnt/optane/$USER.
-#   ./install.sh --allow-non-optane      Explicit opt-in to run on ordinary storage
-#                [--db /abs/path.db]     (default: /mnt/optane/$USER if owned by $USER,
-#                                        else ~/.local/share/agent-memory/memory.db).
-#   ./install.sh --require-optane        Require verified Intel Optane storage (also
-#                                        --no-allow-non-optane or --allow-non-optane=0).
-#   ./install.sh --db /mnt/optane/$USER/custom/memory.db
-#   ./install.sh --no-client-config      Install and self-test only, then print client snippets.
-#   ./install.sh --dry-run               Run preflight checks without modifying files.
-#   ./install.sh --log-dir /abs/dir      Write Tri-Stream telemetry (results.json, debug.log).
-#   ./install.sh --uninstall             Remove binary, skill and MCP registration (keeps data).
-#
-# Environment variables:
-#   AGENT_MEMORY_BIN_DIR / BIN_DIR       Target directory for agent-memory binary
-#   AGENT_MEMORY_MCP_DIR / MCP_DIR       Target directory for MCP instructions
-#   AGENT_MEMORY_SKILL_DIR / SKILL_DIR   Target directory for agent-memory skill
-#   AGENT_MEMORY_MCP_CONFIG / MCP_CONFIG Target path for client mcp_config.json
-#   ALLOW_ROOT=1                         Override restriction against running as root
-#   (Shell AGENT_MEMORY_DB, OPTANE_BASE, and ALLOW_NON_OPTANE are ignored during install
-#    so the registered MCP entry matches explicit --db / --allow-non-optane flags.)
-#
-# Nothing is installed or registered until preflight, initialisation and self-test pass.
-# ==============================================================================
+# Installs, validates, or uninstalls the agent-memory binary, skill files, and MCP server registration so persistent memory operates safely, preventing unverified storage or broken client configs.
 set -Eeuo pipefail
 umask 077
 
@@ -47,9 +20,37 @@ DB_PATH_RESOLVED=""
 TMP_BIN=""
 DOCTOR_ERR=""
 
-usage() { sed -n '4,31p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() {
+    cat <<'EOF'
+agent-memory installer (v1.0.0, schema 1.0)
+Per-user, Optane-backed persistent memory for AI agents (CLI + stdio MCP server).
 
-# Pre-scan arguments for --log-dir so early argument/validation failures are logged
+  ./install.sh                         Install on a host with a verified Intel Optane
+                                       volume at /mnt/optane/$USER.
+  ./install.sh --allow-non-optane      Explicit opt-in to run on ordinary storage
+               [--db /abs/path.db]     (default: /mnt/optane/$USER if owned by $USER,
+                                       else ~/.local/share/agent-memory/memory.db).
+  ./install.sh --require-optane        Require verified Intel Optane storage (also
+                                       --no-allow-non-optane or --allow-non-optane=0).
+  ./install.sh --db /mnt/optane/$USER/custom/memory.db
+  ./install.sh --no-client-config      Install and self-test only, then print client snippets.
+  ./install.sh --dry-run               Run preflight checks without modifying files.
+  ./install.sh --log-dir /abs/dir      Write Tri-Stream telemetry (results.json, debug.log).
+  ./install.sh --uninstall             Remove binary, skill and MCP registration (keeps data).
+
+Environment variables:
+  AGENT_MEMORY_BIN_DIR / BIN_DIR       Target directory for agent-memory binary
+  AGENT_MEMORY_MCP_DIR / MCP_DIR       Target directory for MCP instructions
+  AGENT_MEMORY_SKILL_DIR / SKILL_DIR   Target directory for agent-memory skill
+  AGENT_MEMORY_MCP_CONFIG / MCP_CONFIG Target path for client mcp_config.json
+  ALLOW_ROOT=1                         Override restriction against running as root
+  (Shell AGENT_MEMORY_DB, OPTANE_BASE, and ALLOW_NON_OPTANE are ignored during install
+   so the registered MCP entry matches explicit --db / --allow-non-optane flags.)
+
+Nothing is installed or registered until preflight, initialisation and self-test pass.
+EOF
+}
+
 _prev_is_log_dir=0
 for _arg in "$@"; do
     if [ "${_prev_is_log_dir}" -eq 1 ]; then
@@ -218,10 +219,7 @@ SKILL_DIR="$(expand_tilde_path "${AGENT_MEMORY_SKILL_DIR:-${SKILL_DIR:-${GEMINI_
 MCP_CONFIG="$(expand_tilde_path "${AGENT_MEMORY_MCP_CONFIG:-${MCP_CONFIG:-${GEMINI_DIR}/config/mcp_config.json}}")"
 [ -n "${DB_OVERRIDE}" ] && DB_OVERRIDE="$(expand_tilde_path "${DB_OVERRIDE}")"
 
-# The interpreter is resolved once and pinned (as an absolute path) in the MCP registration, so the
-# server does not depend on the client's PATH. The launcher path (e.g. /usr/bin/python3) is kept rather
-# than its realpath (e.g. /usr/bin/python3.12) so a distribution Python upgrade does not break the
-# registration, and the binary itself refuses to run on Python < 3.10.
+# Pin the launcher path (e.g. /usr/bin/python3) rather than its realpath so distribution Python upgrades do not break MCP registration.
 command -v python3 >/dev/null 2>&1 || die "python3 (3.10+) is required but was not found in PATH."
 python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
     || die "Python 3.10+ is required (found $(python3 -V 2>&1))."
@@ -245,7 +243,6 @@ for label, val in (
     if not os.path.isabs(val):
         sys.exit(f"{label} must be an absolute path (got '{val}').")
 if os.path.isfile(bundle_bin):
-    env_Copy = os.environ.copy()
     os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
     os.environ["ALLOW_NON_OPTANE"] = "1"
     loader = importlib.machinery.SourceFileLoader("am_path_guard", bundle_bin)
@@ -286,10 +283,7 @@ install_file_atomic() {
     mv -f "${tmp}" "${dst}"
 }
 
-# Read or update the agent-memory entry in an MCP JSON config safely: abort on malformed JSON,
-# keep the original as <config>.agent-memory.bak (written once), write atomically through
-# symlinks, preserve other servers and any extra keys of an existing entry.
-mcp_config_edit() {  # $1=check|get-db|get-allow-non-optane|add|remove  $2=config path  [$3=entry-json]
+mcp_config_edit() {
     "${PY}" -I - "$@" <<'PY'
 import json, os, shutil, stat, sys, tempfile
 action = sys.argv[1]
@@ -381,9 +375,6 @@ except BaseException:
 PY
 }
 
-# ------------------------------------------------------------------------------
-# Uninstall
-# ------------------------------------------------------------------------------
 if [ "${UNINSTALL}" -eq 1 ]; then
     DB_HINT=""
     if [ -f "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ]; then
@@ -424,16 +415,12 @@ echo "======================================================================"
 say "Python $("${PY}" -I -c 'import platform; print(platform.python_version())') (${PY})"
 [ -f "${BUNDLE_BIN}" ] || die "bundle is incomplete: bin/agent-memory not found next to install.sh."
 [ -f "${SCRIPT_DIR}/mcp/instructions.md" ] || die "bundle is incomplete: mcp/instructions.md not found next to install.sh."
-[ -f "${SCRIPT_DIR}/skill/SKILL.md.template" ] || die "bundle is incomplete: skill/SKILL.md.template not found next to install.sh."
+[ -f "${SCRIPT_DIR}/skill/SKILL.md" ] || die "bundle is incomplete: skill/SKILL.md not found next to install.sh."
 [ -f "${SCRIPT_DIR}/skill/references/agent-memory-mcp.md" ] || die "bundle is incomplete: skill/references/agent-memory-mcp.md not found next to install.sh."
 for _schema in memory_record.json memory_search.json memory_recall.json memory_relate.json memory_forget.json; do
     [ -f "${SCRIPT_DIR}/mcp/${_schema}" ] || die "bundle is incomplete: mcp/${_schema} not found next to install.sh."
 done
 
-# ------------------------------------------------------------------------------
-# 1. Resolve the runtime environment. The MCP registration always carries an explicit
-#    env block (ALLOW_NON_OPTANE and AGENT_MEMORY_DB), so inherited variables cannot change it.
-# ------------------------------------------------------------------------------
 for v in AGENT_MEMORY_DB OPTANE_BASE ALLOW_NON_OPTANE; do
     if [ -n "${!v:-}" ]; then
         warn "Ignoring ${v} from your shell. Use --db / --allow-non-optane so the registered MCP server gets the same setting."
@@ -470,9 +457,6 @@ ENV_BASE=(env -u AGENT_MEMORY_DB -u OPTANE_BASE -u ALLOW_NON_OPTANE "AGENT_MEMOR
 PRE_ENV=("${ENV_BASE[@]}")
 [ -n "${DB_OVERRIDE}" ] && PRE_ENV+=("AGENT_MEMORY_DB=${DB_OVERRIDE}")
 
-# ------------------------------------------------------------------------------
-# 2. Preflight (read-only): SQLite features, storage gate, writability, existing database
-# ------------------------------------------------------------------------------
 DOCTOR_ERR="$(mktemp)"
 DOCTOR_OUT="$("${PRE_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>"${DOCTOR_ERR}")" || true
 PREFLIGHT_OK="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys
@@ -523,7 +507,6 @@ say "Preflight passed (database: ${DB_PATH_RESOLVED})"
 [ "${ALLOW_NON_OPTANE_FLAG}" -eq 1 ] && warn "Non-Optane override is active (ALLOW_NON_OPTANE=1)."
 RUN_ENV=("${ENV_BASE[@]}" "AGENT_MEMORY_DB=${DB_PATH_RESOLVED}")
 
-# Antigravity is configured only when it is actually present (Gemini CLI also uses ~/.gemini).
 DO_ANTIGRAVITY=0
 if [ "${CLIENT_CONFIG}" -eq 1 ] && { [ -d "${GEMINI_DIR}/antigravity-cli" ] || [ -e "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ] || command -v agy >/dev/null 2>&1; }; then
     DO_ANTIGRAVITY=1
@@ -536,10 +519,6 @@ if [ "${DRY_RUN}" -eq 1 ]; then
     exit 0
 fi
 
-# ------------------------------------------------------------------------------
-# 3. Initialise (or migrate, with an automatic backup) and self-test using the bundle
-#    binary, before anything is installed or registered.
-# ------------------------------------------------------------------------------
 INIT_OUT="$("${RUN_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" init 2>&1)" || die "database init failed: ${INIT_OUT}"
 say "${INIT_OUT}"
 POST_DOCTOR_OUT="$("${RUN_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>&1)" || {
@@ -585,9 +564,6 @@ PY
 )" || die "${SELFTEST_OUT}"
 say "${SELFTEST_OUT}"
 
-# ------------------------------------------------------------------------------
-# 4. Install the binary (atomic replace)
-# ------------------------------------------------------------------------------
 if [ ! -d "${BIN_DIR}" ]; then
     mkdir -p "${BIN_DIR}"
     chmod 755 "${BIN_DIR}" 2>/dev/null || true
@@ -600,9 +576,6 @@ TMP_BIN=""
 "${RUN_ENV[@]}" "${PY}" -I "${BIN}" --version >/dev/null || die "installed binary does not run: ${BIN}"
 say "Installed ${BIN}"
 
-# ------------------------------------------------------------------------------
-# 5. Client integration
-# ------------------------------------------------------------------------------
 ENTRY_JSON="$("${PY}" -I - "${PY}" "${BIN}" "${ALLOW_NON_OPTANE_FLAG}" "${DB_PATH_RESOLVED}" <<'PY'
 import json, sys
 py, b, allow, db = sys.argv[1:5]
@@ -633,29 +606,8 @@ if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
     mkdir -p "${SKILL_DIR}/references"
     chmod 700 "${SKILL_DIR}" "${SKILL_DIR}/references" 2>/dev/null || true
     install_file_atomic "${SCRIPT_DIR}/skill/references/agent-memory-mcp.md" "${SKILL_DIR}/references/agent-memory-mcp.md" 600
-    SKILL_DB_DISPLAY="/mnt/optane/\${USER}/agent_memory/memory.db"
-    SKILL_CLI_DISPLAY="env ALLOW_NON_OPTANE=0 AGENT_MEMORY_DB=\"/mnt/optane/\${USER}/agent_memory/memory.db\" ${PY} -I \"\${HOME}/.local/bin/agent-memory\""
-    "${PY}" -I - "${SCRIPT_DIR}/skill/SKILL.md.template" "${SKILL_DIR}/SKILL.md" "${SKILL_DB_DISPLAY}" "${SKILL_CLI_DISPLAY}" <<'PY'
-import os, sys, tempfile
-src, dst, db, cli = sys.argv[1:5]
-with open(src, encoding="utf-8") as sf:
-    text = sf.read().replace("__DB__", db).replace("__CLI__", cli).replace("__STORAGE_DESC__", "stored on a dedicated fast volume")
-dst_dir = os.path.dirname(dst) or "."
-os.makedirs(dst_dir, exist_ok=True)
-fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".SKILL.md.")
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, dst)
-except BaseException:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-PY
-    say "Installed skill and reference to ${SKILL_DIR}"
+    install_file_atomic "${SCRIPT_DIR}/skill/SKILL.md" "${SKILL_DIR}/SKILL.md" 600
+    say "Installed skill files to ${SKILL_DIR}"
 fi
 
 write_results_json "ok" "installation completed"

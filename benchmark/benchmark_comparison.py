@@ -18,7 +18,7 @@ from typing import Any
 
 
 def detect_storage_label(target_path: str, fallback: str) -> str:
-    """Resolves the underlying block device model from `/proc/mounts` and `/sys/block` for `target_path` to label benchmark tables accurately, falling back to `fallback` when sysfs metadata is unavailable."""
+    """Resolves the underlying block device model from `/proc/mounts` and `/sys/block` for `target_path` so benchmark tables display accurate hardware labels, preventing missing sysfs metadata from crashing label detection."""
     try:
         real_path = os.path.realpath(target_path)
         while not os.path.exists(real_path) and real_path != "/":
@@ -56,15 +56,14 @@ def detect_storage_label(target_path: str, fallback: str) -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """Estimates the LLM prompt token count from character length (~4 characters per token) to model per-turn context consumption, preventing unmeasured payload growth from hiding O(N) context window saturation."""
+    """Estimates the LLM prompt token count from character length (~4 characters per token) so per-turn context consumption is modeled accurately, preventing unmeasured payload growth from hiding O(N) context window saturation."""
     return max(1, len(text) // 4)
 
 
 def benchmark_unassisted_markdown(base_dir: str, count: int, media_name: str = "Standard Local Storage") -> dict[str, Any]:
-    """Benchmarks an unassisted agent appending and scanning a flat MEMORY.md file to measure baseline flat-file overhead, preventing unindexed markdown files from masking linear O(N) context ingestion and write concurrency hazards."""
+    """Benchmarks an unassisted agent appending and scanning a flat MEMORY.md file so baseline flat-file overhead is quantified, preventing unindexed markdown files from masking linear O(N) context ingestion and write concurrency hazards."""
     md_path = os.path.join(base_dir, "MEMORY.md")
 
-    # 1. Write benchmark (Append + fsync)
     t0 = time.perf_counter()
     bytes_written = 0
     for i in range(count):
@@ -82,7 +81,6 @@ def benchmark_unassisted_markdown(base_dir: str, count: int, media_name: str = "
             os.fsync(f.fileno())
     write_ms = (time.perf_counter() - t0) * 1000
 
-    # 2. Search benchmark (Linear scan over full file)
     t_search = time.perf_counter()
     hits_found = 0
     for i in range(count):
@@ -120,11 +118,10 @@ def benchmark_unassisted_markdown(base_dir: str, count: int, media_name: str = "
 
 
 def benchmark_unassisted_json(base_dir: str, count: int, media_name: str = "Standard Local Storage") -> dict[str, Any]:
-    """Benchmarks an unassisted agent rewriting a structured notes.json file on every observation to measure serialization overhead, preventing full-file JSON rewrites from hiding O(N^2) disk write amplification and concurrent write clobbering."""
+    """Benchmarks an unassisted agent rewriting a structured notes.json file on every observation so serialization overhead is quantified, preventing full-file JSON rewrites from hiding O(N^2) disk write amplification and concurrent write clobbering."""
     json_path = os.path.join(base_dir, "notes.json")
     records: list[dict[str, Any]] = []
 
-    # 1. Write benchmark (Read-Modify-Write full file + fsync)
     t0 = time.perf_counter()
     bytes_written_total = 0
     for i in range(count):
@@ -143,7 +140,6 @@ def benchmark_unassisted_json(base_dir: str, count: int, media_name: str = "Stan
             os.fsync(f.fileno())
     write_ms = (time.perf_counter() - t0) * 1000
 
-    # 2. Search benchmark (Deserialization + in-memory linear filter)
     t_search = time.perf_counter()
     hits_found = 0
     for i in range(count):
@@ -189,7 +185,7 @@ def benchmark_mcp_engine(
     media_name: str = "",
     sync_override: str = "",
 ) -> dict[str, Any]:
-    """Executes the built-in `agent-memory benchmark` subcommand in an isolated module context to measure SQLite WAL write latency, FTS5 search latency, and database byte size, preventing inherited environment variables or unparsed metrics from misreporting storage footprint."""
+    """Executes the built-in `agent-memory benchmark` subcommand in an isolated module context so SQLite WAL write latency, FTS5 search latency, and database byte size are measured accurately, preventing inherited environment variables or unparsed metrics from misreporting storage footprint."""
     env_keys = (
         "AGENT_MEMORY_NO_CFG_FALLBACK",
         "ALLOW_NON_OPTANE",
@@ -297,7 +293,7 @@ def fmt_lat(ms: float) -> str:
 
 
 def estimate_turn_latency_str(tokens: int, is_bounded: bool = False) -> str:
-    """Estimates LLM prompt prefill delay (TTFT) from context token volume to quantify prompt latency overhead, preventing unbounded flat-file token growth from hiding per-turn prefill stalls."""
+    """Estimates LLM prompt prefill delay (TTFT) from context token volume so prompt latency overhead is quantified, preventing unbounded flat-file token growth from hiding per-turn prefill stalls."""
     if is_bounded or tokens <= 1200:
         return "~45 to 90 ms"
     elif tokens < 3000:
@@ -345,7 +341,6 @@ def print_markdown_comparison(
     print("## 1. Comparative Benchmark Tables\n")
     print("Presents hardware commit latency and context scaling measurements across storage media and persistence patterns to quantify physical and architectural overhead, preventing unmeasured storage or context bottlenecks.\n")
 
-    # Table 1: Physical Storage Benchmark (Pure Hardware & Disk Latency)
     print("### Table 1: Physical Storage Benchmark (Pure Hardware & Disk Latency)\n")
     print("Compares average commit latency across dedicated low-latency media and standard local storage for each persistence pattern to quantify hardware fsync speedup, preventing storage tier misconfiguration.\n")
     print(f"| Implementation / Pattern | {optane_label} | {flash_label} | Hardware Speedup | Durability Level |")
@@ -373,7 +368,6 @@ def print_markdown_comparison(
     json_ttft = estimate_turn_latency_str(json_tokens, is_bounded=False)
     mcp_ttft = estimate_turn_latency_str(300, is_bounded=True)
 
-    # Table 2: AI Agent Scaling & Safety Benchmark (Pure Architecture & Context Health)
     print("\n### Table 2: AI Agent Scaling & Safety Benchmark (Architecture & Context Health)\n")
     print("Evaluates prompt context token overhead, time-to-first-token prefill delay, write amplification, and concurrency safety across architectures to prevent unbounded context bloat and concurrent write corruption.\n")
     print(f"| Architecture / Pattern | Context Tokens (at {count} notes) | Est. LLM Prefill Delay (TTFT) | Disk Write Amplification | Multi-Agent Concurrency Safety |")
@@ -398,7 +392,7 @@ def print_markdown_comparison(
 
 
 def main() -> None:
-    """Parses CLI arguments and executes comparative memory benchmarks across local and dedicated storage tiers to report latency and token scaling, preventing unverified storage configurations from masking I/O bottlenecks."""
+    """Parses CLI arguments and executes comparative memory benchmarks across local and dedicated storage tiers so latency and token scaling are reported deterministically, preventing unverified storage configurations from masking I/O bottlenecks."""
     os.umask(0o077)
     try:
         signal.signal(signal.SIGTERM, lambda s, f: sys.exit(143))
@@ -417,6 +411,16 @@ def main() -> None:
     log_dir = os.path.abspath(os.path.expanduser(args.log_dir)) if args.log_dir else ""
     debug_log_path = os.path.join(log_dir, "debug.log") if log_dir else ""
     results_json_path = os.path.join(log_dir, "results.json") if log_dir else ""
+
+    def _write_results_json(payload: dict[str, Any]) -> None:
+        """Writes the Tri-Stream results.json payload with mode 0600 permissions so execution status is persisted safely, preventing world-readable telemetry files."""
+        if not results_json_path:
+            return
+        with open(results_json_path, "w", encoding="utf-8") as rf:
+            json.dump(payload, rf, indent=2)
+            rf.write("\n")
+        os.chmod(results_json_path, 0o600)
+
     if log_dir:
         os.makedirs(log_dir, mode=0o700, exist_ok=True)
         try:
@@ -426,13 +430,10 @@ def main() -> None:
         with open(debug_log_path, "w", encoding="utf-8"):
             pass
         os.chmod(debug_log_path, 0o600)
-        with open(results_json_path, "w", encoding="utf-8") as rf:
-            json.dump({"status": "running", "count": args.count, "results": []}, rf, indent=2)
-            rf.write("\n")
-        os.chmod(results_json_path, 0o600)
+        _write_results_json({"status": "running", "count": args.count, "results": []})
 
     def _log_debug(msg: str) -> None:
-        """Emits timestamped diagnostic progress to stderr and debug.log to preserve execution telemetry without polluting stdout."""
+        """Emits timestamped diagnostic progress to stderr and debug.log so execution telemetry is preserved, preventing diagnostic output from polluting stdout."""
         print(msg, file=sys.stderr)
         if debug_log_path:
             with open(debug_log_path, "a", encoding="utf-8") as df:
@@ -464,51 +465,33 @@ def main() -> None:
         flash_label = detect_storage_label(home_dir, "Standard Local Storage")
         optane_label = detect_storage_label(optane_user_dir, "Dedicated Optane Volume")
 
-        # 1. Benchmarks on Standard Storage
+        def _run_storage_tier(base_dir: str, label: str, allow_non_optane: bool, db_prefix: str) -> None:
+            """Runs flat-file and SQLite MCP benchmarks inside a temporary directory on a target storage tier so media comparisons execute identically, preventing divergent benchmark harness setup."""
+            with tempfile.TemporaryDirectory(dir=base_dir, prefix=".am_bench_") as td:
+                results.append(benchmark_unassisted_markdown(td, args.count, media_name=label))
+                results.append(benchmark_unassisted_json(td, args.count, media_name=label))
+                for sync_mode, suffix in (("FULL", "full"), ("NORMAL", "norm")):
+                    db_file = os.path.join(td, f"{db_prefix}_{suffix}.db")
+                    results.append(
+                        benchmark_mcp_engine(
+                            bin_path,
+                            db_file,
+                            allow_non_optane=allow_non_optane,
+                            count=args.count,
+                            media_name=label,
+                            sync_override=sync_mode,
+                        )
+                    )
+
         _log_debug(f"[*] Running benchmarks on standard local storage ({flash_label})...")
-        with tempfile.TemporaryDirectory(dir=home_dir, prefix=".am_bench_") as flash_td:
-            res_md_flash = benchmark_unassisted_markdown(flash_td, args.count, media_name=flash_label)
-            results.append(res_md_flash)
+        _run_storage_tier(home_dir, flash_label, allow_non_optane=True, db_prefix="bench_flash")
 
-            res_json_flash = benchmark_unassisted_json(flash_td, args.count, media_name=flash_label)
-            results.append(res_json_flash)
-
-            flash_db_full = os.path.join(flash_td, "bench_flash_full.db")
-            res_mcp_flash_full = benchmark_mcp_engine(
-                bin_path, flash_db_full, allow_non_optane=True, count=args.count, media_name=flash_label, sync_override="FULL"
-            )
-            results.append(res_mcp_flash_full)
-
-            flash_db_norm = os.path.join(flash_td, "bench_flash_norm.db")
-            res_mcp_flash_norm = benchmark_mcp_engine(
-                bin_path, flash_db_norm, allow_non_optane=True, count=args.count, media_name=flash_label, sync_override="NORMAL"
-            )
-            results.append(res_mcp_flash_norm)
-
-        # 2. Benchmarks on Dedicated Optane Volume
         if has_optane:
             _log_debug(f"[*] Running benchmarks on dedicated Optane media ({optane_label})...")
-            with tempfile.TemporaryDirectory(dir=optane_user_dir, prefix=".am_bench_") as optane_td:
-                res_md_optane = benchmark_unassisted_markdown(optane_td, args.count, media_name=optane_label)
-                results.append(res_md_optane)
-
-                res_json_optane = benchmark_unassisted_json(optane_td, args.count, media_name=optane_label)
-                results.append(res_json_optane)
-
-                optane_db_full = os.path.join(optane_td, "bench_optane_full.db")
-                res_mcp_optane_full = benchmark_mcp_engine(
-                    bin_path, optane_db_full, allow_non_optane=False, count=args.count, media_name=optane_label, sync_override="FULL"
-                )
-                results.append(res_mcp_optane_full)
-
-                optane_db_norm = os.path.join(optane_td, "bench_optane_norm.db")
-                res_mcp_optane_norm = benchmark_mcp_engine(
-                    bin_path, optane_db_norm, allow_non_optane=False, count=args.count, media_name=optane_label, sync_override="NORMAL"
-                )
-                results.append(res_mcp_optane_norm)
+            _run_storage_tier(optane_user_dir, optane_label, allow_non_optane=False, db_prefix="bench_optane")
 
         def _rank(r: dict[str, Any]) -> int:
-            """Computes a deterministic sort rank for benchmark entries to order results from fastest to slowest without nondeterministic row ordering."""
+            """Computes a deterministic sort rank for benchmark entries so results order from fastest to slowest, preventing nondeterministic row ordering."""
             p = r.get("pattern", "")
             m = r.get("media", "")
             is_optane = m == optane_label or "Optane" in m
@@ -531,29 +514,19 @@ def main() -> None:
         for idx, r in enumerate(results, 1):
             r["rank"] = idx
 
-        if results_json_path:
-            with open(results_json_path, "w", encoding="utf-8") as rf:
-                json.dump({"status": "ok", "count": args.count, "results": results}, rf, indent=2)
-                rf.write("\n")
-            os.chmod(results_json_path, 0o600)
+        _write_results_json({"status": "ok", "count": args.count, "results": results})
 
         if args.json:
             print(json.dumps(results, indent=2))
         else:
             print_markdown_comparison(results, args.count, optane_label=optane_label, flash_label=flash_label)
     except BaseException as exc:
-        if isinstance(exc, SystemExit) and exc.code in (0, None):
-            raise
         err_msg = f"Interrupted ({exc})" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else str(exc)
         _log_debug(f"[!] Benchmark execution failed: {err_msg}")
-        if results_json_path:
-            try:
-                with open(results_json_path, "w", encoding="utf-8") as rf:
-                    json.dump({"status": "error", "error": err_msg, "count": args.count, "results": results}, rf, indent=2)
-                    rf.write("\n")
-                os.chmod(results_json_path, 0o600)
-            except OSError:
-                pass
+        try:
+            _write_results_json({"status": "error", "error": err_msg, "count": args.count, "results": results})
+        except OSError:
+            pass
         if isinstance(exc, SystemExit):
             raise
         if isinstance(exc, KeyboardInterrupt):

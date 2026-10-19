@@ -1,12 +1,13 @@
 # Copyright (c) 2026 Christopher Schek
 # SPDX-License-Identifier: GPL-3.0-only
-"""Executes hermetic unit and integration tests for the agent-memory CLI and stdio MCP server to validate database lifecycle, FTS5 search, and JSON-RPC 2.0 protocol compliance, preventing regressions from corrupting production memory stores."""
+"""Executes hermetic unit and integration tests for the agent-memory CLI and stdio MCP server so database lifecycle, FTS5 search, and JSON-RPC 2.0 protocol compliance are verified, preventing regressions from corrupting production memory stores."""
 
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -23,7 +24,7 @@ _ENV_KEYS = (
 
 
 def _load_agent_memory_module(db_path: str) -> Any:
-    """Loads bin/agent-memory as an isolated Python module bound to a temporary database path to verify CLI and MCP operations hermetically, preventing test mutations from touching production storage."""
+    """Loads bin/agent-memory as an isolated Python module bound to a temporary database path so CLI and MCP operations are verified hermetically, preventing test mutations from touching production storage."""
     os.environ["AGENT_MEMORY_DB"] = db_path
     os.environ["ALLOW_NON_OPTANE"] = "1"
     os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
@@ -39,10 +40,10 @@ def _load_agent_memory_module(db_path: str) -> Any:
 
 
 class TestAgentMemoryHermetic(unittest.TestCase):
-    """Verifies database initialization, observation lifecycle, entity relations, FTS5 search, and JSON-RPC 2.0 MCP dispatch against an isolated SQLite database to confirm end-to-end behavioral fidelity, preventing schema or protocol drift from breaking client sessions."""
+    """Verifies database initialization, observation lifecycle, entity relations, FTS5 search, and JSON-RPC 2.0 MCP dispatch against an isolated SQLite database so end-to-end behavioral fidelity is confirmed, preventing schema or protocol drift from breaking client sessions."""
 
     def setUp(self) -> None:
-        """Snapshots environment variables, creates an isolated temporary directory, and initializes a fresh agent-memory database before each test to prevent cross-test state contamination."""
+        """Snapshots environment variables, creates an isolated temporary directory, and initializes a fresh agent-memory database before each test so test runs start from a clean state, preventing cross-test state contamination."""
         self._saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmpdir.name, "memory.db")
@@ -50,7 +51,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.am.init_db(force=True)
 
     def tearDown(self) -> None:
-        """Cleans up the temporary database directory and restores environment variables after each test to prevent temporary file accumulation or environment leakage."""
+        """Cleans up the temporary database directory and restores environment variables after each test so host state remains unmodified, preventing temporary file accumulation or environment leakage."""
         self.tmpdir.cleanup()
         for k, val in self._saved_env.items():
             if val is None:
@@ -59,7 +60,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
                 os.environ[k] = val
 
     def test_record_search_recall_relate_and_forget(self) -> None:
-        """Verifies the complete lifecycle of recording observations, linking entities, searching via FTS5, recalling entity graphs, and forgetting records to confirm CRUD and cascade invariants, preventing orphaned records or search desynchronization."""
+        """Verifies the complete lifecycle of recording observations, linking entities, searching via FTS5, recalling entity graphs, and forgetting records so CRUD and cascade invariants are confirmed, preventing orphaned records or search desynchronization."""
         rec = self.am.record_observation(
             content="Host linux-host-01 runs RHEL 10 with Kernel 6.12.",
             entity_name="linux-host-01",
@@ -84,7 +85,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(dup.get("observation_id"), obs_id)
 
         rel = self.am.relate_entities(
-            source_name="agent-memory-mcp",
+            source_name="core-platform",
             target_name="linux-host-01",
             relation_type="deploys_to",
             weight=1.0,
@@ -110,10 +111,10 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(ent_forget.get("deleted_observations"), 0)
         self.assertEqual(ent_forget.get("deleted_relations"), 1)
         self.assertIn("error", self.am.recall_entity("linux-host-01"))
-        self.assertIn("error", self.am.recall_entity("agent-memory-mcp"))
+        self.assertIn("error", self.am.recall_entity("core-platform"))
 
     def test_mcp_jsonrpc_lifecycle(self) -> None:
-        """Verifies JSON-RPC 2.0 MCP initialize, tools/list, and tools/call dispatch across all five tools over process_single_rpc to ensure protocol compliance, preventing malformed envelopes or duplicate alias ambiguity from corrupting MCP state."""
+        """Verifies JSON-RPC 2.0 MCP initialize, tools/list, and tools/call dispatch across all five tools over process_single_rpc so protocol compliance is enforced, preventing malformed envelopes or duplicate alias ambiguity from corrupting MCP state."""
         conn = self.am.get_connection()
         try:
             init_resp = self.am.process_single_rpc(
@@ -267,7 +268,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             conn.close()
 
     def test_fast_cli_dispatch_doctor_and_search(self) -> None:
-        """Verifies that run_doctor and _fast_cli_dispatch execute health diagnostics and FTS5 search commands cleanly, preventing CLI dispatch regressions from breaking health checks."""
+        """Verifies that run_doctor and _fast_cli_dispatch execute health diagnostics and FTS5 search commands cleanly so fast-path CLI routing remains reliable, preventing CLI dispatch regressions from breaking health checks."""
         doc_buf = io.StringIO()
         orig_stdout = sys.stdout
         try:
@@ -291,7 +292,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             sys.stdout = orig_stdout
 
     def test_security_and_validation_guards(self) -> None:
-        """Verifies secret screening, 7-bit ASCII and roleplay prose enforcement, bounded integer parsing, and orphan stub entity pruning to prevent secret leaks, schema pollution, or invalid parameter coercion."""
+        """Verifies secret screening, 7-bit ASCII and clinical prose enforcement, bounded integer parsing, and orphan stub entity pruning so input validation gates hold firm, preventing secret leaks, schema pollution, or invalid parameter coercion."""
         self.assertIsNotNone(self.am._screen_for_secrets("my_api_key=" + ("a" * 16)))
         self.assertIsNotNone(self.am._screen_for_secrets("pass" + "word=" + "'example-prod-val-9999'"))
         self.assertIsNotNone(self.am._screen_for_secrets("sec" + "ret = " + '"my val with spaces"'))
@@ -328,7 +329,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertIn("error", self.am.recall_entity("stub-dst"))
 
     def test_json_merge_patch_and_post_merge_bounds(self) -> None:
-        """Verifies RFC 7396 JSON Merge Patch key deletion, empty-object no-op semantics, and post-merge 4000-character bounds on entity attributes and relation metadata, preventing unbounded JSON growth."""
+        """Verifies RFC 7396 JSON Merge Patch key deletion, empty-object no-op semantics, and post-merge 4000-character bounds on entity attributes and relation metadata so attribute updates stay bounded, preventing unbounded JSON growth."""
         r1 = self.am.record_observation(
             content="Initial entity attributes",
             entity_name="merge-ent",
@@ -364,7 +365,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertIn("exceeds 4000 characters after merge", rel_overflow["error"])
 
     def test_recall_truncation_flags_and_fts_underscores(self) -> None:
-        """Verifies recall_entity truncation flags (has_more_*) and FTS5 underscore/quote sanitization, preventing silent recall truncation or punctuation-induced zero-hit searches."""
+        """Verifies recall_entity truncation flags (has_more_*) and FTS5 underscore/quote sanitization so pagination and search tokenization remain accurate, preventing silent recall truncation or punctuation-induced zero-hit searches."""
         for idx in range(3):
             self.am.record_observation(
                 content=f"Fact number {idx} for trunc-ent",
@@ -388,7 +389,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertGreaterEqual(len(hits), 1)
 
     def test_mcp_schema_and_instructions_bundle_parity(self) -> None:
-        """Verifies that mcp/*.json and mcp/instructions.md match TOOLS and MCP_INSTRUCTIONS in bin/agent-memory, preventing schema drift between lazy MCP files and the stdio server."""
+        """Verifies that mcp/*.json and mcp/instructions.md match TOOLS and MCP_INSTRUCTIONS in bin/agent-memory so client tool definitions stay synchronized, preventing schema drift between lazy MCP files and the stdio server."""
         repo_root = Path(__file__).resolve().parent.parent
         mcp_dir = repo_root / "mcp"
         self.assertEqual((mcp_dir / "instructions.md").read_text(encoding="utf-8"), self.am.MCP_INSTRUCTIONS)
@@ -401,7 +402,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             self.assertEqual(disk_def.get("parameters", disk_def.get("inputSchema")), tool_def["inputSchema"])
 
     def test_orphan_sidecar_and_empty_ro_guards(self) -> None:
-        """Verifies that get_connection rejects pre-existing orphan sidecars when creating a new DB and refuses to initialize 0-byte empty databases on read-only opens, preventing sidecar adoption or read-only disk mutation."""
+        """Verifies that get_connection rejects pre-existing orphan sidecars when creating a new DB and refuses to initialize 0-byte empty databases on read-only opens so database open invariants hold, preventing sidecar adoption or read-only disk mutation."""
         orphan_db = os.path.join(self.tmpdir.name, "orphan.db")
         with open(orphan_db + "-wal", "wb") as f:
             f.write(b"stale wal")
@@ -423,7 +424,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(os.path.getsize(empty_db), 0)
 
     def test_cli_normalization_and_inline_category(self) -> None:
-        """Verifies CLI flag normalization for hyphen-prefixed positionals and attached short options alongside inline category extraction, preventing malformed CLI argv or FTS5 syntax errors."""
+        """Verifies CLI flag normalization for hyphen-prefixed positionals and attached short options alongside inline category extraction so CLI arguments parse predictably, preventing malformed CLI argv or FTS5 syntax errors."""
         norm = self.am._normalize_cli_argv(["agent-memory", "record", "-e", "ent1", "-n", "--flag-text"])
         self.assertEqual(norm, ["agent-memory", "record", "-e", "ent1", "-n", "--", "--flag-text"])
         norm_short = self.am._normalize_cli_argv(["agent-memory", "record", "content", "-a{\"k\":1}"])
@@ -439,10 +440,8 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(cat2, "invariant")
         self.assertEqual(q2, '"escaped "" quote"')
 
-    def test_c01_to_c05_regression_contracts(self) -> None:
-        """Verifies plain-text backslash acceptance, NUL and nested attribute secret/roleplay rejection, symlink and 0-byte DB guards, read-only non-mutation, signal handler restoration, and backup/restore MCP inode hot-swap."""
-        import signal
-
+    def test_security_and_protocol_regression_contracts(self) -> None:
+        """Verifies plain-text backslash acceptance, NUL and nested attribute secret/prose rejection, symlink and 0-byte DB guards, read-only non-mutation, signal handler restoration, and backup/restore MCP inode hot-swap so security and lifecycle contracts hold, preventing validation bypasses or stale file descriptors."""
         ok_regex = self.am.record_observation(
             content=r"Validate regex \bword\b and \Bnon-boundary in C:\repos\bin",
             entity_name="regex-ent",
@@ -462,27 +461,27 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         )
         self.assertIn("error", attr_sec)
 
-        attr_roleplay = self.am.record_observation(
+        attr_prose = self.am.record_observation(
             content="Valid content",
-            entity_name="attr-roleplay-ent",
+            entity_name="attr-prose-ent",
             attributes={"note": "*Stage direction action*"},
         )
-        self.assertIn("error", attr_roleplay)
+        self.assertIn("error", attr_prose)
 
-        tag_roleplay = self.am.record_observation(
+        tag_prose = self.am.record_observation(
             content="Valid content",
-            entity_name="tag-roleplay-ent",
+            entity_name="tag-prose-ent",
             tags=["*Stage direction action*"],
         )
-        self.assertIn("error", tag_roleplay)
+        self.assertIn("error", tag_prose)
 
-        meta_roleplay = self.am.relate_entities(
+        meta_prose = self.am.relate_entities(
             "src-ent",
             "dst-ent",
             "depends_on",
             metadata={"note": "*Stage direction action*"},
         )
-        self.assertIn("error", meta_roleplay)
+        self.assertIn("error", meta_prose)
 
         with self.assertRaises(RuntimeError):
             self.am._check_not_guarded_path(
