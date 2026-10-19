@@ -1,10 +1,10 @@
 # agent-memory-mcp
 
-Provides a per-user SQLite semantic memory and knowledge graph store (CLI and stdio MCP server) backed by Intel Optane NVMe media by default (or standard storage via `--allow-non-optane`) to persist durable technical context across sessions, preventing flat `MEMORY.md` files from causing O(N) prompt token blowup and concurrent subagent write corruption.
+Provides a per-user SQLite semantic memory and knowledge graph store (CLI and stdio MCP server) backed by Intel Optane NVMe media by default (or standard storage via `--allow-non-optane`) to persist durable technical context across sessions so operational and security invariants hold, preventing flat `MEMORY.md` files from causing O(N) prompt token blowup and concurrent subagent write corruption.
 
 ## 1. Quickstart & Benchmarks
 
-Walks through runtime prerequisite checks, installation, health verification, and empirical performance benchmarks to deploy a verified local memory server, preventing prerequisite or storage-gate failures.
+Walks through runtime prerequisite checks, installation, health verification, and empirical performance benchmarks to deploy a verified local memory server so operational and security invariants hold, preventing prerequisite or storage-gate failures.
 
 1. **Check Prerequisites**: Verify Python 3.10+ and SQLite 3.31+ with FTS5 and JSON1 (`json_patch`) extension availability before running the installer to confirm runtime compatibility, preventing missing SQLite extensions from blocking full-text index creation or JSON Merge Patch updates:
 
@@ -72,13 +72,13 @@ Walks through runtime prerequisite checks, installation, health verification, an
 
 ### Verification & Failure Recovery
 
-Confirms that preflight, self-test, and `doctor` diagnostics pass after running `./install.sh` to verify deployment readiness, preventing uninitialized or misconfigured databases from serving MCP traffic.
+Confirms that preflight, self-test, and `doctor` diagnostics pass after running `./install.sh` to verify deployment readiness so operational and security invariants hold, preventing uninitialized or misconfigured databases from serving MCP traffic.
 
 - If `./install.sh` or `doctor` exits non-zero, inspect the failing field in the JSON output and consult the Troubleshooting table below before retrying.
 
 ## 2. Configuration & Client Registration
 
-Lists environment variables, security gates, MCP client registration snippets, and CLI commands to configure `agent-memory` across host environments, preventing path fallbacks, unauthorized file access, or argument splitting.
+Lists environment variables, security gates, MCP client registration snippets, and CLI commands to configure `agent-memory` across host environments so operational and security invariants hold, preventing path fallbacks, unauthorized file access, or argument splitting.
 
 1. **Environment Variables**:
 
@@ -146,13 +146,13 @@ Lists environment variables, security gates, MCP client registration snippets, a
 
 ### Verification & Failure Recovery
 
-Validates MCP configuration JSON syntax and runs `am doctor` after updating environment variables or client registrations to confirm valid settings, preventing broken stdio launches.
+Validates MCP configuration JSON syntax and runs `am doctor` after updating environment variables or client registrations to confirm valid settings so operational and security invariants hold, preventing broken stdio launches.
 
 - If the MCP client fails to connect after a configuration update, run `./install.sh` to validate and rewrite the client registration entry.
 
 ## 3. Troubleshooting & Recovery
 
-Maps common diagnostic errors from `agent-memory doctor` to their root causes and remediation commands to restore database health, preventing unaddressed storage or index errors from blocking MCP tools.
+Maps common diagnostic errors from `agent-memory doctor` to their root causes and remediation commands to restore database health so operational and security invariants hold, preventing unaddressed storage or index errors from blocking MCP tools.
 
 1. **Diagnostic Error Reference**:
 
@@ -169,13 +169,13 @@ Maps common diagnostic errors from `agent-memory doctor` to their root causes an
 
 ### Verification & Failure Recovery
 
-Re-runs `agent-memory doctor` after executing any remediation step to confirm that `"healthy": true` is restored, preventing incomplete repairs from leaving the store offline.
+Re-runs `agent-memory doctor` after executing any remediation step to confirm that `"healthy": true` is restored so operational and security invariants hold, preventing incomplete repairs from leaving the store offline.
 
 - If `init --force` cannot repair a corrupted database file, restore the latest pre-migration or manual backup via `agent-memory restore <backup.db>`.
 
 ## 4. License & Governance
 
-Governs source distribution and modification under the GNU General Public License v3.0 (`GPL-3.0-only`) to protect author attribution and reciprocal open-source obligations, preventing unauthorized proprietary relicensing or closed-source commercial redistribution.
+Governs source distribution and modification under the GNU General Public License v3.0 (`GPL-3.0-only`) to protect author attribution and reciprocal open-source obligations so operational and security invariants hold, preventing unauthorized proprietary relicensing or closed-source commercial redistribution.
 
 1. **Copyright**: Copyright (c) 2026 Christopher Schek.
 2. **SPDX Identifier**: `GPL-3.0-only` (see [`LICENSE`](LICENSE) for full terms).
@@ -185,23 +185,36 @@ Governs source distribution and modification under the GNU General Public Licens
 
 ### Verification & Failure Recovery
 
-Verifies that `LICENSE` and `SPDX-License-Identifier: GPL-3.0-only` headers remain intact across source files and release archives before packaging or distribution, preventing unattributed or unlicensed artifacts.
+Verifies that `LICENSE` and `SPDX-License-Identifier: GPL-3.0-only` headers remain intact across source files and release archives before packaging or distribution so operational and security invariants hold, preventing unattributed or unlicensed artifacts.
 
 - If `LICENSE` is missing or modified in a local checkout or release archive, restore the canonical `GPL-3.0-only` text from the repository root before redistributing.
 
 ## 5. Hardwired Cross-Discipline Contracts
 
-Binds `agent-memory-mcp` to the companion `agent-baseline` catalog rules and skills via [`reference.md`](reference.md) so all repository updates, installers, and runtime deployments preserve host perimeter security and four-way baseline parity, preventing secret leakage, persona bleed, or deployment drift.
+Binds `agent-memory-mcp` to all seventeen canonical `agent-baseline` rules, skills, and persona isolation contracts via [`reference.md`](reference.md) so all repository updates, installers, and runtime deployments preserve host perimeter security and baseline parity, preventing secret leakage, persona bleed, or deployment drift.
 
-1. **Plain-Writing & Hard Isolation (`plain-writing`, `personas`)**: Maintain strict 7-bit ASCII, the 4-part H2 skeleton, and zero conversational persona prose across all source files, schemas, documentation, and stored observations.
-2. **Secret Hygiene & Host Perimeter Defense (`secret-hygiene`, `guard-secret-paths`)**: Enforce pre-write credential screening via `_screen_for_secrets` and deterministic quarantine path blocks via `_check_not_guarded_path` across database, backup, restore, and installer paths.
-3. **Principal Tooling & Delegated Scripting (`principal-tooling`, `delegated-execution-scripting`)**: Validate Python, Shell, JSON, TOML, and Markdown changes via `tool_manager.py diff-check` and emit Tri-Stream telemetry (`stdout`, `results.json`, `debug.log`) when `--log-dir` is supplied.
-4. **Standalone Repository Parity (`update-baseline`)**: Link `~/Git/agent-memory-mcp` to `~/Git/agent-baseline/agent-memory/reference.md` via [`reference.md`](reference.md) and deploy synchronized runtime assets to `~/.local/bin/agent-memory`, `~/.gemini/config/skills/agent-memory/`, `~/.claude/skills/agent-memory/`, and `~/.gemini/antigravity-cli/mcp/agent-memory/` via `./install.sh`.
-   - *Positive Exemplar*: `Run python3 -m unittest tests/test_agent_memory.py, tool_manager.py diff-check, and ./install.sh after updating agent-memory-mcp.`
-   - *Negative Exemplar*: `Copy standalone agent-memory source files into ~/Git/agent-baseline or leave deployed ~/.local/bin/agent-memory unsynchronized.` (STRICTLY FORBIDDEN)
+1. **`plain-writing`** (`rules/plain-writing.md`): Enforce the 4-part H2 skeleton, 3-part First-Sentence Rule, comment minimalism, and 7-bit ASCII across `README.md` and all `agent-memory` source files, schemas, and documentation.
+2. **`secret-hygiene`** (`rules/secret-hygiene.md`, `~/.gemini/config/skills/secret-hygiene/SKILL.md`): Enforce pre-write credential screening via `_screen_for_secrets` and scan staged diffs with `secret_scanner.py` before committing.
+3. **`guard-secret-paths`** (`rules/guard-secret-paths.md`, `~/.gemini/config/skills/guard-secret-paths/SKILL.md`): Enforce deterministic quarantine path blocks via `_check_not_guarded_path` across database, backup, restore, and installer paths.
+4. **`permissions-hygiene`** (`rules/permissions-hygiene.md`, `~/.gemini/config/skills/permissions-hygiene/SKILL.md`): Restrict whitelisted `agent-memory` CLI rules to explicit subcommands without unconstrained wildcards.
+5. **`git-forge-governance`** (`rules/git-forge-governance.md`): Enforce non-delegable human authority for merges, releases, and remote repository mutations across `~/Git/agent-memory-mcp` and `~/Git/agent-baseline`.
+6. **`delegated-execution-scripting`** (`rules/delegated-execution-scripting.md`): Emit structured Tri-Stream telemetry (`stdout`, `results.json`, `debug.log`) with `0700`/`0600` permissions when `--log-dir` is supplied.
+7. **`principal-tooling`** (`rules/principal-tooling.md`, `~/.gemini/config/skills/principal-tooling/SKILL.md`): Validate Python, Shell, JSON, TOML, and Markdown changes via `tool_manager.py diff-check` before handoff.
+8. **`skunkworks-scratch`** (`rules/skunkworks-scratch.md`, `~/.gemini/config/skills/skunkworks-scratch/SKILL.md`): Route transient benchmark runs, scratch scripts, and test databases to `~/Git/SkunkWorks/`.
+9. **`cleanup-skunkworks`** (`~/.gemini/config/skills/cleanup-skunkworks/SKILL.md`): Preserve active `agent-memory` Optane and user-share storage paths and never prune them as scratch workspaces.
+10. **`audit-harness`** (`rules/audit-harness.md`, `~/.gemini/config/skills/audit-harness/SKILL.md`): Route multi-agent adversarial audit artifacts for `agent-memory-mcp` into `~/Git/SkunkWorks/`.
+11. **`agent-memory`** ([`reference.md`](reference.md), `~/.gemini/config/skills/agent-memory/SKILL.md`): Link `~/Git/agent-memory-mcp` to `~/Git/agent-baseline/agent-memory/reference.md` via [`reference.md`](reference.md) and deploy synchronized runtime assets to `~/.local/bin/agent-memory`, `~/.gemini/config/skills/agent-memory/`, and `~/.gemini/antigravity-cli/mcp/agent-memory/` via `./install.sh`.
+12. **`sync-ide-conversations`** (`sync-ide-conversations/reference.md`, `~/.gemini/config/skills/sync-ide-conversations/SKILL.md`): Keep conversation trajectory databases isolated from the `agent-memory` SQLite knowledge graph.
+13. **`sync-cli-conversations`** (`sync-cli-conversations/reference.md`, `~/.gemini/config/skills/sync-cli-conversations/SKILL.md`): Coordinate macOS workstation trajectory synchronization independently of `agent-memory` graph storage.
+14. **`cleanup-conversations`** (`~/.gemini/config/skills/cleanup-conversations/SKILL.md`): Ensure conversation index pruning never touches `agent-memory` SQLite files or backups.
+15. **`update-baseline`** (`~/.gemini/config/skills/update-baseline/SKILL.md`): Track `agent-memory/reference.md` in `manifest.json` and hydrate `SKILL.md` and `references/agent-memory-mcp.md` from `~/Git/agent-memory-mcp` during `baseline_updater.py adopt`.
+16. **`personas`** (`personas/reference.md`, `~/.gemini/config/personas/`): Enforce the Hard Isolation Rule so `~/Git/agent-baseline`, `~/Git/agent-memory-mcp`, and all stored `agent-memory` records remain 100% clinical and persona-free.
+17. **`agy-customizations` & `antigravity-guide`** (`~/.gemini/antigravity-cli/builtin/skills/agy-customizations/SKILL.md`, `~/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md`): Register lazy-loaded MCP tool schemas in `~/.gemini/antigravity-cli/mcp/agent-memory/` in accordance with Antigravity platform standards.
+    - *Positive Exemplar*: `Run python3 -m unittest tests/test_agent_memory.py, tool_manager.py diff-check, and ./install.sh after updating agent-memory-mcp.`
+    - *Negative Exemplar*: `Copy standalone agent-memory source files into ~/Git/agent-baseline or leave deployed ~/.local/bin/agent-memory unsynchronized.` (STRICTLY FORBIDDEN)
 
 ### Verification & Failure Recovery
 
-Verifies unit tests, diff-scoped linter gates, and deployed runtime synchronization before completing repository changes to prevent regressions or drift.
+Verifies unit tests, diff-scoped linter gates, and deployed runtime synchronization before completing repository changes so catalog and runtime invariants hold, preventing regressions or drift.
 
 - Run `python3 -m unittest tests/test_agent_memory.py`, `./install.sh`, and `python3 ~/.gemini/config/skills/update-baseline/scripts/baseline_updater.py check` to confirm zero drift.

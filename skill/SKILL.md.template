@@ -16,7 +16,7 @@ The MCP server enforces core operational invariants: search before recording, st
 
 ## 1. Agent Cognitive Lifecycle
 
-Defines the mandatory three-phase execution lifecycle for memory lookups, untrusted data handling, and post-task consolidation to structure agent memory access, preventing duplicate records or prompt-injection exposure.
+Defines the mandatory three-phase execution lifecycle for memory lookups, untrusted data handling, and post-task consolidation to structure agent memory access so operational and security invariants hold, preventing duplicate records or prompt-injection exposure.
 
 1. **Lookup Phase (Task Initialization)**:
    - **Known Entity**: When starting work on a known repository, service, component, or host, invoke `memory_recall(entity="<name>")`.
@@ -37,13 +37,13 @@ Defines the mandatory three-phase execution lifecycle for memory lookups, untrus
 
 ### Verification & Failure Recovery
 
-Verifies that lookup and consolidation calls complete without validation or truncation errors to keep memory state consistent, preventing silent context omission.
+Verifies that lookup and consolidation calls complete without validation or truncation errors to keep memory state consistent so operational and security invariants hold, preventing silent context omission.
 
 - If `memory_recall` or `memory_search` returns an error or empty result for an expected entity, verify the database path via `__CLI__ doctor` and retry with broader keyword search terms.
 
 ## 2. What to Record
 
-Specifies which technical facts belong in persistent storage and which inputs are strictly prohibited to maintain signal quality, preventing transient noise, secrets, or persona prose from corrupting retrieval or violating security rules.
+Specifies which technical facts belong in persistent storage and which inputs are strictly prohibited to maintain signal quality so operational and security invariants hold, preventing transient noise, secrets, or persona prose from corrupting retrieval or violating security rules.
 
 1. **Durable Technical Knowledge (Allowed)**:
    - **Architectural Decisions**: Choices made and the technical rationale behind them.
@@ -61,13 +61,13 @@ Specifies which technical facts belong in persistent storage and which inputs ar
 
 ### Verification & Failure Recovery
 
-Audits candidate observation payloads against secret, 7-bit ASCII, and Hard Isolation gates prior to calling `memory_record` to prevent rejected writes or policy breaches.
+Audits candidate observation payloads against secret, 7-bit ASCII, and Hard Isolation gates prior to calling `memory_record` so catalog and runtime invariants hold, preventing rejected writes or policy breaches.
 
 - If `memory_record` rejects an observation due to secret, non-ASCII, or roleplay screening, strip the offending content and re-submit strictly clinical 7-bit ASCII technical prose.
 
 ## 3. Tools
 
-Documents the input schemas, parameter constraints, and return structures for all five MCP tools to guide valid tool invocations, preventing malformed tool arguments from triggering validation errors.
+Documents the input schemas, parameter constraints, and return structures for all five MCP tools to guide valid tool invocations so operational and security invariants hold, preventing malformed tool arguments from triggering validation errors.
 
 1. **MCP Tool Signatures & Return Contracts**:
 
@@ -87,13 +87,13 @@ Documents the input schemas, parameter constraints, and return structures for al
 
 ### Verification & Failure Recovery
 
-Checks tool call return payloads for `isError: true` or validation messages to catch schema violations immediately, preventing silent write drops.
+Checks tool call return payloads for `isError: true` or validation messages to catch schema violations immediately so operational and security invariants hold, preventing silent write drops.
 
 - If a tool call returns a parameter validation error, inspect the MCP schema under `~/.gemini/antigravity-cli/mcp/agent-memory/` and correct the argument types and bounds before retrying.
 
 ## 4. Truncation & Anti-Hallucination
 
-Prescribes recovery steps when entity recall responses hit observation or relation pagination limits to recover omitted records, preventing agents from hallucinating missing constraints or incomplete dependency graphs.
+Prescribes recovery steps when entity recall responses hit observation or relation pagination limits to recover omitted records so operational and security invariants hold, preventing agents from hallucinating missing constraints or incomplete dependency graphs.
 
 1. **Observation Truncation (`has_more_observations: true`)**:
    - Only the newest `limit` facts were returned, omitting older facts, historical decisions, or earlier constraints.
@@ -106,13 +106,13 @@ Prescribes recovery steps when entity recall responses hit observation or relati
 
 ### Verification & Failure Recovery
 
-Verifies pagination flags on every `memory_recall` payload before making architectural decisions to ensure complete constraint visibility, preventing partial-context regressions.
+Verifies pagination flags on every `memory_recall` payload before making architectural decisions to ensure complete constraint visibility so operational and security invariants hold, preventing partial-context regressions.
 
 - If `limit=100` still reports `has_more_observations: true`, run targeted `memory_search` queries scoped with `entity_name:<entity>` and `category` filters to inspect older observations.
 
 ## 5. Relation Vocabulary
 
-Standardizes directional `snake_case` verbs for knowledge graph edges to unify topology queries, preventing inconsistent or bidirectional edge naming from fragmenting graph traversal.
+Standardizes directional `snake_case` verbs for knowledge graph edges to unify topology queries so operational and security invariants hold, preventing inconsistent or bidirectional edge naming from fragmenting graph traversal.
 
 1. **Directional Edge Rule**: Store each edge in one forward direction only (`source` and `target` must be distinct entities), because `memory_recall` automatically reports both incoming and outgoing edges.
 2. **Canonical Forward Verbs**:
@@ -130,13 +130,13 @@ Standardizes directional `snake_case` verbs for knowledge graph edges to unify t
 
 ### Verification & Failure Recovery
 
-Validates relation verbs and entity distinctness prior to calling `memory_relate` to keep graph edges normalized, preventing duplicate inverse edges.
+Validates relation verbs and entity distinctness prior to calling `memory_relate` to keep graph edges normalized so operational and security invariants hold, preventing duplicate inverse edges.
 
 - If an ad-hoc or inverse relation verb was recorded, delete the edge via `memory_forget(source=..., target=..., relation_type=...)` and re-create it using the canonical forward verb.
 
 ## 6. Behavior Notes
 
-Details query parsing, entity case-folding, JSON Merge Patch semantics, and session scoping rules to align caller expectations with storage behavior, preventing unexpected query results or accidental cascade deletions.
+Details query parsing, entity case-folding, JSON Merge Patch semantics, and session scoping rules to align caller expectations with storage behavior so operational and security invariants hold, preventing unexpected query results or accidental cascade deletions.
 
 1. **Search Semantics**:
    - **All-Terms Default & Relaxed Fallback**: Plain words match facts containing all terms (ignoring common stopwords `the`, `why`, `does`, `not`) with `"match": "all_terms"`, falling back to any-term matching (`"match": "some_terms"`) when zero all-term hits exist.
@@ -152,13 +152,13 @@ Details query parsing, entity case-folding, JSON Merge Patch semantics, and sess
 
 ### Verification & Failure Recovery
 
-Verifies query match modes and entity update payloads after mutations to confirm intended state changes, preventing unintended fallback queries or metadata loss.
+Verifies query match modes and entity update payloads after mutations to confirm intended state changes so operational and security invariants hold, preventing unintended fallback queries or metadata loss.
 
 - If `memory_search` returns `"match": "phrase_fallback"`, simplify unbalanced quotes or operators in `query` and re-run the search.
 
 ## 7. Tool Interface & Client Ergonomics
 
-Maps high-level agent workflows to the five registered MCP tools to prioritize native protocol calls, preventing agents from spawning redundant CLI subprocesses when MCP tools are active.
+Maps high-level agent workflows to the five registered MCP tools to prioritize native protocol calls so operational and security invariants hold, preventing agents from spawning redundant CLI subprocesses when MCP tools are active.
 
 1. **Direct MCP Tool Dispatch**: When operating inside AI agent environments (Antigravity, Claude Code, Cursor), execute memory workflows directly via the 5 registered MCP tools:
    - **`memory_recall(entity=..., category=..., limit=..., relation_limit=...)`**: Immediate entity profile and neighborhood inspection.
@@ -172,7 +172,7 @@ Maps high-level agent workflows to the five registered MCP tools to prioritize n
 
 ### Verification & Failure Recovery
 
-Checks MCP server tool availability before falling back to the CLI wrapper to preserve stdio connection reuse, preventing unnecessary process spawn overhead.
+Checks MCP server tool availability before falling back to the CLI wrapper to preserve stdio connection reuse so operational and security invariants hold, preventing unnecessary process spawn overhead.
 
 - If `call_mcp_tool` reports that the `agent-memory` server is unreachable, use the CLI fallback below and run `__CLI__ doctor` to diagnose the server state.
 
@@ -208,13 +208,13 @@ Provides direct CLI invocation patterns via the word-splitting-safe `am()` shell
 
 ### Verification & Failure Recovery
 
-Validates CLI exit codes and JSON output payloads when running fallback commands to confirm command completion, preventing silent CLI failures.
+Validates CLI exit codes and JSON output payloads when running fallback commands to confirm command completion so operational and security invariants hold, preventing silent CLI failures.
 
 - If a CLI subcommand exits non-zero, inspect the JSON `"error"` field on `stderr`/`stdout` and run `am doctor` to verify storage health.
 
 ## 9. Troubleshooting
 
-Lists diagnostic commands and remediation steps for storage gate, FTS5 index, and MCP connection failures to restore service health, preventing unresolved storage or schema errors from blocking memory tool calls.
+Lists diagnostic commands and remediation steps for storage gate, FTS5 index, and MCP connection failures to restore service health so operational and security invariants hold, preventing unresolved storage or schema errors from blocking memory tool calls.
 
 1. **Storage Unavailable or Storage-Gate Error**: Run `__CLI__ doctor` to inspect the storage gate, writability, SQLite features, storage format, integrity, full-text index, and row counts. Fix the reported filesystem or permission issue (or configure `ALLOW_NON_OPTANE=1` if not using the per-user Optane volume) and restart the agent client.
 2. **FTS Index Out of Sync or Missing Schema Objects**: Run `__CLI__ init` (or `init --force` for a full schema and FTS5 rebuild with an automatic backup).
@@ -224,7 +224,7 @@ Lists diagnostic commands and remediation steps for storage gate, FTS5 index, an
 
 ### Verification & Failure Recovery
 
-Confirms that `doctor` reports `"healthy": true` after any repair action to verify full service recovery, preventing half-repaired databases from serving traffic.
+Confirms that `doctor` reports `"healthy": true` after any repair action to verify full service recovery so operational and security invariants hold, preventing half-repaired databases from serving traffic.
 
 - If `init --force` fails due to database corruption, restore from the most recent `.bak` file using `__CLI__ restore <backup.db>` and re-verify with `doctor`.
 
@@ -232,21 +232,30 @@ Confirms that `doctor` reports `"healthy": true` after any repair action to veri
 
 ## 10. Hardwired Cross-Discipline Contracts
 
-Binds `agent-memory` operations to all seventeen canonical rules, skills, and persona isolation contracts across `~/.gemini/config/` and `~/.claude/` so every memory transaction preserves host security and four-way repository parity, preventing secret leaks, path quarantine violations, or persona contamination.
+Binds `agent-memory` operations to all seventeen canonical rules, skills, and persona isolation contracts across `~/.gemini/config/` and `~/.claude/` so every memory transaction preserves host security and repository parity, preventing secret leaks, path quarantine violations, or persona contamination.
 
-1. **`secret-hygiene`**: Recording secrets, tokens, or credentials into memory is unconditionally prohibited. Execution adheres to [`secret-hygiene`](../secret-hygiene/SKILL.md) for pre-write credential screening and immediate hard-stop remediation if any secret is exposed.
-2. **`guard-secret-paths`**: Execution adheres to [`guard-secret-paths`](../guard-secret-paths/SKILL.md) to block database initialization, connections, backups, or restores targeting any quarantined credential path.
-3. **`plain-writing` & `personas`**: Execution adheres to `rules/plain-writing.md` and the Hard Isolation Rule (with active persona embodiment isolated in `~/Git/agent-personas` via `personas/reference.md`) so all recorded observations, entity names, summaries, attributes, and relation metadata contain clinical 7-bit ASCII technical prose with zero conversational persona names, titles, or roleplay prose.
-4. **`permissions-hygiene` & `git-forge-governance`**: Whitelisted CLI invocations, MCP configurations, and repository updates adhere to [`permissions-hygiene`](../permissions-hygiene/SKILL.md) and `rules/git-forge-governance.md` without unconstrained wildcards or autonomous remote mutations.
-5. **`principal-tooling` & `delegated-execution-scripting`**: Code, schema, installer, and benchmark changes to `agent-memory` are validated via [`principal-tooling`](../principal-tooling/SKILL.md) (`tool_manager.py`) and `rules/delegated-execution-scripting.md` (`stdout`, `results.json`, `debug.log`).
-6. **`skunkworks-scratch`, `cleanup-skunkworks` & `audit-harness`**: Transient diagnostic scripts, benchmark outputs, test databases, and adversarial audits adhere to [`skunkworks-scratch`](../skunkworks-scratch/SKILL.md), [`cleanup-skunkworks`](../cleanup-skunkworks/SKILL.md), and [`audit-harness`](../audit-harness/SKILL.md) inside `~/Git/SkunkWorks/`.
-7. **`sync-ide-conversations`, `sync-cli-conversations` & `cleanup-conversations`**: Conversation index synchronization and cleanup workflows on `sg-antigravity-pd1` and macOS workstations coordinate with [`sync-ide-conversations`](../sync-ide-conversations/SKILL.md), [`sync-cli-conversations`](../sync-cli-conversations/SKILL.md), and [`cleanup-conversations`](../cleanup-conversations/SKILL.md).
-8. **`update-baseline`, `agy-customizations` & `antigravity-guide`**: `~/Git/agent-memory-mcp` is linked from `~/Git/agent-baseline/agent-memory/reference.md` and deployed to `~/.gemini/config/skills/agent-memory/`, `~/.claude/skills/agent-memory/`, and `~/.local/bin/agent-memory` via `./install.sh` and [`update-baseline`](../update-baseline/SKILL.md) in alignment with `agy-customizations` and `antigravity-guide`.
-   - *Positive Exemplar*: `Deploy SKILL.md and references/agent-memory-mcp.md from ~/Git/agent-memory-mcp via ./install.sh and verify baseline parity with baseline_updater.py check.`
+1. **`plain-writing`** (`rules/plain-writing.md`): Enforce the 4-part H2 skeleton, 3-part First-Sentence Rule, comment minimalism, and 7-bit ASCII across all recorded observations, entity summaries, attributes, relation metadata, and documentation.
+2. **`secret-hygiene`** (`rules/secret-hygiene.md`, `../secret-hygiene/SKILL.md`): Never record secrets, tokens, or credentials into memory, and execute an immediate clinical hard-stop remediation if any secret is exposed.
+3. **`guard-secret-paths`** (`rules/guard-secret-paths.md`, `../guard-secret-paths/SKILL.md`): Block database initialization, connections, backups, or restores targeting any quarantined host credential path.
+4. **`permissions-hygiene`** (`rules/permissions-hygiene.md`, `../permissions-hygiene/SKILL.md`): Restrict whitelisted CLI and MCP invocations to explicit subcommands without unconstrained wildcards.
+5. **`git-forge-governance`** (`rules/git-forge-governance.md`): Enforce non-delegable human authority for merges, releases, and remote repository mutations.
+6. **`delegated-execution-scripting`** (`rules/delegated-execution-scripting.md`): Emit structured Tri-Stream telemetry (`stdout`, `results.json`, `debug.log`) with `0700`/`0600` permissions during `install.sh` and `benchmark.py` runs.
+7. **`principal-tooling`** (`rules/principal-tooling.md`, `../principal-tooling/SKILL.md`): Validate code, schema, installer, and benchmark changes with `tool_manager.py diff-check` before handoff.
+8. **`skunkworks-scratch`** (`rules/skunkworks-scratch.md`, `../skunkworks-scratch/SKILL.md`): Isolate transient diagnostic scripts, benchmark outputs, and test databases inside `~/Git/SkunkWorks/`.
+9. **`cleanup-skunkworks`** (`../cleanup-skunkworks/SKILL.md`): Preserve active `agent-memory` storage volumes and never prune them during scratch workspace cleanup.
+10. **`audit-harness`** (`rules/audit-harness.md`, `../audit-harness/SKILL.md`): Route multi-agent adversarial review artifacts for `agent-memory-mcp` into `~/Git/SkunkWorks/`.
+11. **`agent-memory`** (`reference.md`, `SKILL.md`): Maintain `reference.md` in byte-for-byte parity with `~/Git/agent-baseline/agent-memory/reference.md`.
+12. **`sync-ide-conversations`** (`../sync-ide-conversations/SKILL.md`): Keep Linux IDE/CLI trajectory synchronization isolated from the `agent-memory` SQLite database.
+13. **`sync-cli-conversations`** (`../sync-cli-conversations/SKILL.md`): Coordinate macOS workstation trajectory synchronization independently of `agent-memory` storage.
+14. **`cleanup-conversations`** (`../cleanup-conversations/SKILL.md`): Ensure conversation index pruning never modifies `agent-memory` database files or backups.
+15. **`update-baseline`** (`../update-baseline/SKILL.md`): Deploy `SKILL.md`, `reference.md`, and `references/agent-memory-mcp.md` to `~/.gemini/config/skills/agent-memory/` (`0700`/`0600`) and `~/.local/bin/agent-memory` via `./install.sh` and `baseline_updater.py adopt`.
+16. **`personas`** (`~/.gemini/config/personas/`): Enforce the Hard Isolation Rule so all recorded observations, entities, relations, and repository files remain 100% clinical 7-bit ASCII with zero persona prose.
+17. **`agy-customizations` & `antigravity-guide`** (`~/.gemini/antigravity-cli/builtin/skills/agy-customizations/SKILL.md`, `~/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md`): Register lazy-loaded MCP tool schemas in `~/.gemini/antigravity-cli/mcp/agent-memory/` in accordance with Antigravity platform standards.
+   - *Positive Exemplar*: `Deploy SKILL.md, reference.md, and references/agent-memory-mcp.md from ~/Git/agent-memory-mcp via ./install.sh and verify baseline parity with baseline_updater.py check.`
    - *Negative Exemplar*: `Embed full agent-memory skill files inside ~/Git/agent-baseline instead of the canonical reference.md stub.` (STRICTLY FORBIDDEN)
 
 ### Verification & Failure Recovery
 
-Verifies cross-repository deployment parity and baseline health after modifying `agent-memory` documentation or schemas to prevent configuration drift.
+Verifies cross-repository deployment parity and baseline health after modifying `agent-memory` documentation or schemas so catalog and live skill trees match, preventing configuration drift.
 
 - Run `./install.sh` from `~/Git/agent-memory-mcp` and `python3 ~/.gemini/config/skills/update-baseline/scripts/baseline_updater.py check` to confirm zero drift across `~/Git/agent-memory-mcp`, `~/Git/agent-baseline`, `~/.gemini/config/`, and `~/.claude/`.

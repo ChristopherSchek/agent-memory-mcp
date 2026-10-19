@@ -19,7 +19,7 @@ Governs recall, recording, graph linking, and secret screening across all MCP to
 
 ### Verification & Failure Recovery
 
-Verifies tool responses and storage health when MCP calls return errors to restore memory availability, preventing silent context loss.
+Verifies tool responses and storage health when MCP calls return errors to restore memory availability so operational and security invariants hold, preventing silent context loss.
 
 - If an MCP tool call returns `isError: true` or storage unavailability, run `agent-memory doctor` to inspect database health and permissions before retrying.
 
@@ -35,6 +35,6 @@ Binds `agent-memory` MCP operations to companion security, writing, and baseline
 
 ### Verification & Failure Recovery
 
-Validates schema and instruction parity between `bin/agent-memory` and the deployed MCP bundle to prevent tool-contract drift.
+Validates schema and instruction parity between `bin/agent-memory` and the deployed MCP bundle so catalog and runtime invariants hold, preventing tool-contract drift.
 
 - If `mcp/*.json` or `mcp/instructions.md` diverges from `bin/agent-memory`, re-run `./install.sh` from `~/Git/agent-memory-mcp` and run the unit test suite (`python3 -m unittest tests/test_agent_memory.py`).

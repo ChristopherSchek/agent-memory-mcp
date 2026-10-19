@@ -3108,7 +3108,7 @@ MCP_INSTRUCTIONS = (
     "\n"
     "### Verification & Failure Recovery\n"
     "\n"
-    "Verifies tool responses and storage health when MCP calls return errors to restore memory availability, preventing silent context loss.\n"
+    "Verifies tool responses and storage health when MCP calls return errors to restore memory availability so operational and security invariants hold, preventing silent context loss.\n"
     "\n"
     "- If an MCP tool call returns `isError: true` or storage unavailability, run `agent-memory doctor` to inspect database health and permissions before retrying.\n"
     "\n"
@@ -3124,7 +3124,7 @@ MCP_INSTRUCTIONS = (
     "\n"
     "### Verification & Failure Recovery\n"
     "\n"
-    "Validates schema and instruction parity between `bin/agent-memory` and the deployed MCP bundle to prevent tool-contract drift.\n"
+    "Validates schema and instruction parity between `bin/agent-memory` and the deployed MCP bundle so catalog and runtime invariants hold, preventing tool-contract drift.\n"
     "\n"
     "- If `mcp/*.json` or `mcp/instructions.md` diverges from `bin/agent-memory`, re-run `./install.sh` from `~/Git/agent-memory-mcp` and run the unit test suite (`python3 -m unittest tests/test_agent_memory.py`).\n"
 )

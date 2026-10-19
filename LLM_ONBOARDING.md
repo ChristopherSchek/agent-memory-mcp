@@ -1,6 +1,6 @@
 # agent-memory: Autonomous Agent Deployment & Operation Runbook
 
-Guides autonomous AI coding agents through sequential preflight inspection, installation, verification, client registration, and daily operation of `agent-memory` to establish a verified persistent memory store, preventing skipped verification gates or guessed paths from breaking client registrations.
+Guides autonomous AI coding agents through sequential preflight inspection, installation, verification, client registration, and daily operation of `agent-memory` to establish a verified persistent memory store so operational and security invariants hold, preventing skipped verification gates or guessed paths from breaking client registrations.
 
 > [!IMPORTANT]
 > **Directive for the Executing AI Agent:**
@@ -13,7 +13,7 @@ Guides autonomous AI coding agents through sequential preflight inspection, inst
 
 ## 1. Operating Invariants & Safety Guardrails
 
-Establishes non-negotiable safety and isolation constraints before executing any shell or MCP commands to protect user state, preventing config clobbering, stored prompt injections, or credential leaks.
+Establishes non-negotiable safety and isolation constraints before executing any shell or MCP commands to protect user state so operational and security invariants hold, preventing config clobbering, stored prompt injections, or credential leaks.
 
 1. **Never hardcode usernames or home paths**: Always resolve paths dynamically using `$HOME` or `$(id -un)`.
 2. **Never overwrite client config files directly**: When adding the MCP server to existing JSON configs, merge the `agent-memory` object under `mcpServers` and never wipe other servers.
@@ -25,7 +25,7 @@ Establishes non-negotiable safety and isolation constraints before executing any
 
 ### Verification & Failure Recovery
 
-Audits planned installation commands against the five safety guardrails before execution to prevent configuration loss or secret exposure.
+Audits planned installation commands against the five safety guardrails before execution so catalog and runtime invariants hold, preventing configuration loss or secret exposure.
 
 - If an existing client configuration file is malformed JSON, back it up with mode `0600` and halt for operator inspection before writing changes.
 
@@ -33,7 +33,7 @@ Audits planned installation commands against the five safety guardrails before e
 
 ## 2. Phase 1: Host Inspection Gate (Read-Only)
 
-Audits Python version, SQLite FTS5/JSON1 capabilities, and `/mnt/optane` mount availability prior to installation to determine the deployment mode, preventing mid-flight installer aborts.
+Audits Python version, SQLite FTS5/JSON1 capabilities, and `/mnt/optane` mount availability prior to installation to determine the deployment mode so operational and security invariants hold, preventing mid-flight installer aborts.
 
 1. **Read-Only Host Probe**: Execute the probe snippet to inspect Python, SQLite extensions, and Optane directory ownership:
 
@@ -66,7 +66,7 @@ Audits Python version, SQLite FTS5/JSON1 capabilities, and `/mnt/optane` mount a
 
 ### Verification & Failure Recovery
 
-Confirms that `PYTHON >= 3.10`, `SQLITE_OK == OK`, and `FTS5_AND_JSON1 == OK` before advancing to Phase 2 to prevent unsupported runtime execution.
+Confirms that `PYTHON >= 3.10`, `SQLITE_OK == OK`, and `FTS5_AND_JSON1 == OK` before advancing to Phase 2 so catalog and runtime invariants hold, preventing unsupported runtime execution.
 
 - If `HAS_FTS5` outputs `MISSING`, halt deployment and report that Python's `sqlite3` module was compiled without FTS5 or JSON1 (`json_patch`) support.
 
@@ -74,7 +74,7 @@ Confirms that `PYTHON >= 3.10`, `SQLITE_OK == OK`, and `FTS5_AND_JSON1 == OK` be
 
 ## 3. Phase 2: Deployment Execution Gate
 
-Executes `install.sh` using the branch selected in Phase 1 to validate storage, initialize the database, and install the binary, preventing manual file copying from bypassing preflight validation and self-testing.
+Executes `install.sh` using the branch selected in Phase 1 to validate storage, initialize the database, and install the binary so operational and security invariants hold, preventing manual file copying from bypassing preflight validation and self-testing.
 
 1. **Command A (Native Optane Mode)**: Run from the repository root (`~/Git/agent-memory-mcp`) when `/mnt/optane/$USER` is on verified Intel Optane media:
 
@@ -106,7 +106,7 @@ Executes `install.sh` using the branch selected in Phase 1 to validate storage, 
 
 ### Verification & Failure Recovery
 
-Verifies that `./install.sh` exits with code `0` and prints `Self-test passed` before proceeding to Phase 3, preventing partial installations.
+Verifies that `./install.sh` exits with code `0` and prints `Self-test passed` before proceeding to Phase 3 so operational and security invariants hold, preventing partial installations.
 
 - If `./install.sh` exits non-zero, inspect the preflight error message and consult Section 8 (Error Triage) before re-running.
 
@@ -114,7 +114,7 @@ Verifies that `./install.sh` exits with code `0` and prints `Self-test passed` b
 
 ## 4. Phase 3: Integrity & Health Verification Gate
 
-Runs read-only diagnostics against the installed binary and database to confirm operational readiness, preventing permission or schema errors from going undetected before client registration.
+Runs read-only diagnostics against the installed binary and database to confirm operational readiness so operational and security invariants hold, preventing permission or schema errors from going undetected before client registration.
 
 1. **Execute Health Check**:
 
@@ -132,7 +132,7 @@ Runs read-only diagnostics against the installed binary and database to confirm 
 
 ### Verification & Failure Recovery
 
-Parses the JSON output of `agent-memory doctor` to verify that every health check field starts with `"ok"` before client wiring, preventing broken MCP startup.
+Parses the JSON output of `agent-memory doctor` to verify that every health check field starts with `"ok"` before client wiring so operational and security invariants hold, preventing broken MCP startup.
 
 - If any field in `doctor` is not `"ok"`, remediate the specific condition using Section 8 and re-run `doctor` until `"healthy": true` is returned.
 
@@ -140,7 +140,7 @@ Parses the JSON output of `agent-memory doctor` to verify that every health chec
 
 ## 5. Phase 4: Atomic Client Configuration
 
-Registers the `agent-memory` MCP server in the active AI coding client to expose the `memory_*` tools, preventing unmerged writes from destroying other registered MCP servers.
+Registers the `agent-memory` MCP server in the active AI coding client to expose the `memory_*` tools so operational and security invariants hold, preventing unmerged writes from destroying other registered MCP servers.
 
 1. **Client Detection Rules**:
    - **Google Antigravity**: If running in Antigravity or `~/.gemini/antigravity-cli` exists, `./install.sh` has already registered the MCP server in `~/.gemini/config/mcp_config.json`. Do not edit manually.
@@ -213,7 +213,7 @@ Registers the `agent-memory` MCP server in the active AI coding client to expose
 
 ### Verification & Failure Recovery
 
-Validates that the target MCP client configuration file parses as valid JSON and contains the `agent-memory` server entry before advancing to Phase 5, preventing syntax errors from breaking client startup.
+Validates that the target MCP client configuration file parses as valid JSON and contains the `agent-memory` server entry before advancing to Phase 5 so operational and security invariants hold, preventing syntax errors from breaking client startup.
 
 - If the client configuration file fails JSON validation, restore the `.bak` backup file and re-run the atomic merge script.
 
@@ -221,7 +221,7 @@ Validates that the target MCP client configuration file parses as valid JSON and
 
 ## 6. Phase 5: End-to-End Zero-Leak Smoke Test
 
-Executes a full `record` -> `search` -> `recall` -> `forget` probe cycle and removes the test record before finishing to verify end-to-end tool health, preventing synthetic test artifacts from polluting the user's production memory database.
+Executes a full `record` -> `search` -> `recall` -> `forget` probe cycle and removes the test record before finishing to verify end-to-end tool health so operational and security invariants hold, preventing synthetic test artifacts from polluting the user's production memory database.
 
 1. **Zero-Leak Probe Sequence**: Execute the round-trip probe and verify deletion of the synthetic observation:
 
@@ -262,7 +262,7 @@ Executes a full `record` -> `search` -> `recall` -> `forget` probe cycle and rem
 
 ### Verification & Failure Recovery
 
-Confirms that `Cleanup verification passed. Zero residual test data.` is printed and that `ProbeTestEntity` is pruned after forgetting its sole observation, preventing test pollution.
+Confirms that `Cleanup verification passed. Zero residual test data.` is printed and that `ProbeTestEntity` is pruned after forgetting its sole observation so operational and security invariants hold, preventing test pollution.
 
 - If the smoke test aborts mid-way, run `"${HOME}/.local/bin/agent-memory" forget --entity "ProbeTestEntity"` to purge any leftover probe state.
 
@@ -270,7 +270,7 @@ Confirms that `Cleanup verification passed. Zero residual test data.` is printed
 
 ## 7. Agent Operational Protocol During Coding Tasks
 
-Defines the three-stage runtime workflow for task ingestion, untrusted memory firewalling, and post-task consolidation to standardize session memory usage, preventing context drift or duplicate observations.
+Defines the three-stage runtime workflow for task ingestion, untrusted memory firewalling, and post-task consolidation to standardize session memory usage so operational and security invariants hold, preventing context drift or duplicate observations.
 
 1. **Three-Stage Runtime Lifecycle**:
 
@@ -317,7 +317,7 @@ Defines the three-stage runtime workflow for task ingestion, untrusted memory fi
 
 ### Verification & Failure Recovery
 
-Checks every `memory_record` and `memory_relate` response for `status: "success"` or `status: "exists"` during task consolidation, preventing unpersisted invariants.
+Checks every `memory_record` and `memory_relate` response for `status: "success"` or `status: "exists"` during task consolidation so operational and security invariants hold, preventing unpersisted invariants.
 
 - If a tool call returns a category or relation validation error, replace the parameter with one of the canonical values listed above and retry.
 
@@ -325,7 +325,7 @@ Checks every `memory_record` and `memory_relate` response for `status: "success"
 
 ## 8. Error Triage & Self-Healing Decision Tree
 
-Maps diagnostic failure symptoms to deterministic recovery procedures to guide automated self-healing, preventing ad-hoc repairs from corrupting the SQLite WAL state.
+Maps diagnostic failure symptoms to deterministic recovery procedures to guide automated self-healing so operational and security invariants hold, preventing ad-hoc repairs from corrupting the SQLite WAL state.
 
 1. **Automated Triage Matrix**:
 
@@ -344,7 +344,7 @@ Maps diagnostic failure symptoms to deterministic recovery procedures to guide a
 
 ### Verification & Failure Recovery
 
-Executes `~/.local/bin/agent-memory doctor` after completing any recovery procedure to confirm `"healthy": true`, preventing unresolved errors from recurring.
+Executes `~/.local/bin/agent-memory doctor` after completing any recovery procedure to confirm `"healthy": true` so operational and security invariants hold, preventing unresolved errors from recurring.
 
 - If automated recovery does not restore `"healthy": true`, halt execution and report the full `doctor` JSON output to the operator.
 
@@ -352,17 +352,30 @@ Executes `~/.local/bin/agent-memory doctor` after completing any recovery proced
 
 ## 9. Hardwired Cross-Discipline Contracts
 
-Binds `LLM_ONBOARDING.md` deployment and operation workflows to the companion `agent-baseline` catalog rules and skills via [`reference.md`](reference.md) so autonomous onboarding preserves host security and four-way baseline parity, preventing secret exposure, path quarantine breaches, or configuration drift.
+Binds `LLM_ONBOARDING.md` deployment and operation workflows to all seventeen canonical `agent-baseline` rules, skills, and persona isolation contracts via [`reference.md`](reference.md) so autonomous onboarding preserves host security and baseline parity, preventing secret exposure, path quarantine breaches, or configuration drift.
 
-1. **Plain-Writing & Hard Isolation (`plain-writing`, `personas`)**: Enforce the 4-part H2 skeleton, 3-part First-Sentence Rule, strict 7-bit ASCII, and zero conversational persona prose across all onboarding steps and recorded observations.
-2. **Secret Hygiene & Host Perimeter Defense (`secret-hygiene`, `guard-secret-paths`)**: Reject any database, backup, restore, or log directory path inside quarantined credential stores and screen all recorded strings via `_screen_for_secrets`.
-3. **Delegated Execution & Principal Tooling (`delegated-execution-scripting`, `principal-tooling`)**: Support `--log-dir` Tri-Stream telemetry (`stdout`, `results.json`, `debug.log`) in `install.sh` and `benchmark/benchmark_comparison.py`, and validate repository changes via `tool_manager.py diff-check`.
-4. **Standalone Repository Parity (`update-baseline`)**: Keep `~/Git/agent-memory-mcp` linked to `~/Git/agent-baseline/agent-memory/reference.md` via [`reference.md`](reference.md) and synchronized with `~/.local/bin/agent-memory`, `~/.gemini/config/skills/agent-memory/`, and `~/.claude/skills/agent-memory/`.
-   - *Positive Exemplar*: `Execute ./install.sh and verify baseline alignment with baseline_updater.py check after any onboarding or repository update.`
-   - *Negative Exemplar*: `Bypass ./install.sh preflight gates or store persona roleplay text in memory_record.` (STRICTLY FORBIDDEN)
+1. **`plain-writing`** (`rules/plain-writing.md`): Enforce the 4-part H2 skeleton, 3-part First-Sentence Rule, comment minimalism, and 7-bit ASCII across `LLM_ONBOARDING.md` and all `agent-memory` observations.
+2. **`secret-hygiene`** (`rules/secret-hygiene.md`, `~/.gemini/config/skills/secret-hygiene/SKILL.md`): Never record raw tokens, keys, or connection strings into `agent-memory` and scan staged diffs with `secret_scanner.py` before committing.
+3. **`guard-secret-paths`** (`rules/guard-secret-paths.md`, `~/.gemini/config/skills/guard-secret-paths/SKILL.md`): Reject any database initialization, connection, backup, or restore path targeting quarantined host credential directories.
+4. **`permissions-hygiene`** (`rules/permissions-hygiene.md`, `~/.gemini/config/skills/permissions-hygiene/SKILL.md`): Restrict whitelisted `agent-memory` CLI rules to explicit subcommands without unconstrained wildcards.
+5. **`git-forge-governance`** (`rules/git-forge-governance.md`): Enforce non-delegable human authority for merges, releases, and remote repository mutations across `~/Git/agent-memory-mcp` and `~/Git/agent-baseline`.
+6. **`delegated-execution-scripting`** (`rules/delegated-execution-scripting.md`): Emit structured Tri-Stream telemetry (`stdout`, `results.json`, `debug.log`) with `0700`/`0600` permissions during `install.sh` and `benchmark_comparison.py` execution.
+7. **`principal-tooling`** (`rules/principal-tooling.md`, `~/.gemini/config/skills/principal-tooling/SKILL.md`): Validate modified source, test, and markdown files with `tool_manager.py diff-check` before handoff.
+8. **`skunkworks-scratch`** (`rules/skunkworks-scratch.md`, `~/.gemini/config/skills/skunkworks-scratch/SKILL.md`): Route transient benchmark runs, scratch scripts, and test databases to `~/Git/SkunkWorks/`.
+9. **`cleanup-skunkworks`** (`~/.gemini/config/skills/cleanup-skunkworks/SKILL.md`): Preserve active `agent-memory` Optane and user-share storage paths and never prune them as scratch workspaces.
+10. **`audit-harness`** (`rules/audit-harness.md`, `~/.gemini/config/skills/audit-harness/SKILL.md`): Route multi-agent adversarial audit artifacts for `agent-memory-mcp` into `~/Git/SkunkWorks/`.
+11. **`agent-memory`** ([`reference.md`](reference.md), `~/.gemini/config/skills/agent-memory/SKILL.md`): Keep `~/Git/agent-memory-mcp/reference.md` in byte-for-byte parity with `~/Git/agent-baseline/agent-memory/reference.md` and deploy synchronized assets to `~/.local/bin/agent-memory` and `~/.gemini/config/skills/agent-memory/`.
+12. **`sync-ide-conversations`** (`sync-ide-conversations/reference.md`, `~/.gemini/config/skills/sync-ide-conversations/SKILL.md`): Keep conversation trajectory databases isolated from the `agent-memory` SQLite knowledge graph.
+13. **`sync-cli-conversations`** (`sync-cli-conversations/reference.md`, `~/.gemini/config/skills/sync-cli-conversations/SKILL.md`): Coordinate macOS workstation trajectory synchronization independently of `agent-memory` graph storage.
+14. **`cleanup-conversations`** (`~/.gemini/config/skills/cleanup-conversations/SKILL.md`): Ensure conversation index pruning never touches `agent-memory` SQLite files or backups.
+15. **`update-baseline`** (`~/.gemini/config/skills/update-baseline/SKILL.md`): Track `agent-memory/reference.md` in `manifest.json` and hydrate `SKILL.md` and `references/agent-memory-mcp.md` from `~/Git/agent-memory-mcp` during `baseline_updater.py adopt`.
+16. **`personas`** (`personas/reference.md`, `~/.gemini/config/personas/`): Enforce the Hard Isolation Rule so `~/Git/agent-baseline`, `~/Git/agent-memory-mcp`, and all stored `agent-memory` records remain 100% clinical and persona-free.
+17. **`agy-customizations` & `antigravity-guide`** (`~/.gemini/antigravity-cli/builtin/skills/agy-customizations/SKILL.md`, `~/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md`): Register lazy-loaded MCP tool schemas in `~/.gemini/antigravity-cli/mcp/agent-memory/` in accordance with Antigravity platform standards.
+    - *Positive Exemplar*: `Execute ./install.sh and verify baseline alignment with baseline_updater.py check after any onboarding or repository update.`
+    - *Negative Exemplar*: `Bypass ./install.sh preflight gates or store persona roleplay text in memory_record.` (STRICTLY FORBIDDEN)
 
 ### Verification & Failure Recovery
 
-Verifies unit test execution and deployed baseline parity after completing onboarding or repository updates to prevent drift.
+Verifies unit test execution and deployed baseline parity after completing onboarding or repository updates so catalog and runtime invariants hold, preventing drift.
 
 - Run `python3 -m unittest tests/test_agent_memory.py` and `python3 ~/.gemini/config/skills/update-baseline/scripts/baseline_updater.py check` to confirm zero drift.
