@@ -623,7 +623,7 @@ if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
     mcp_config_edit add "${MCP_CONFIG}" "${ENTRY_JSON}"
     say "Registered MCP server 'agent-memory' in ${MCP_CONFIG}"
     mkdir -p "${MCP_DIR}"
-    chmod 755 "${MCP_DIR}" 2>/dev/null || true
+    chmod 700 "${MCP_DIR}" 2>/dev/null || true
     install_file_atomic "${SCRIPT_DIR}/mcp/instructions.md" "${MCP_DIR}/instructions.md" 644
     say "Installed MCP instructions to ${MCP_DIR}"
     for _schema in memory_record.json memory_search.json memory_recall.json memory_relate.json memory_forget.json; do
@@ -631,8 +631,8 @@ if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
     done
     say "Installed MCP tool schemas to ${MCP_DIR}"
     mkdir -p "${SKILL_DIR}/references"
-    chmod 755 "${SKILL_DIR}" "${SKILL_DIR}/references" 2>/dev/null || true
-    install_file_atomic "${SCRIPT_DIR}/skill/references/agent-memory-mcp.md" "${SKILL_DIR}/references/agent-memory-mcp.md" 644
+    chmod 700 "${SKILL_DIR}" "${SKILL_DIR}/references" 2>/dev/null || true
+    install_file_atomic "${SCRIPT_DIR}/skill/references/agent-memory-mcp.md" "${SKILL_DIR}/references/agent-memory-mcp.md" 600
     SKILL_DB_DISPLAY="/mnt/optane/\${USER}/agent_memory/memory.db"
     SKILL_CLI_DISPLAY="env ALLOW_NON_OPTANE=0 AGENT_MEMORY_DB=\"/mnt/optane/\${USER}/agent_memory/memory.db\" ${PY} -I \"\${HOME}/.local/bin/agent-memory\""
     "${PY}" -I - "${SCRIPT_DIR}/skill/SKILL.md.template" "${SKILL_DIR}/SKILL.md" "${SKILL_DB_DISPLAY}" "${SKILL_CLI_DISPLAY}" <<'PY'
@@ -646,7 +646,7 @@ fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".SKILL.md.")
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
-    os.chmod(tmp, 0o644)
+    os.chmod(tmp, 0o600)
     os.replace(tmp, dst)
 except BaseException:
     try:
