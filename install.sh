@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 VERSION="1.0.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(CDPATH="" cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 BUNDLE_BIN="${SCRIPT_DIR}/bin/agent-memory"
 
 ALLOW_NON_OPTANE_FLAG=""
@@ -14,11 +14,16 @@ DB_OVERRIDE=""
 UNINSTALL=0
 CLIENT_CONFIG=1
 DRY_RUN=0
+VALIDATE_ARGS=0
+JSON_OUT=0
 LOG_DIR=""
+LOG_DIR_VALIDATED=0
 RESULTS_WRITTEN=0
 DB_PATH_RESOLVED=""
 TMP_BIN=""
+TMP_ATOMIC=""
 DOCTOR_ERR=""
+START_EPOCH_MS="$(python3 -I -c 'import time; print(int(time.time() * 1000))' 2>/dev/null || echo 0)"
 
 usage() {
     cat <<'EOF'
@@ -35,6 +40,9 @@ Per-user, Optane-backed persistent memory for AI agents (CLI + stdio MCP server)
   ./install.sh --db /mnt/optane/$USER/custom/memory.db
   ./install.sh --no-client-config      Install and self-test only, then print client snippets.
   ./install.sh --dry-run               Run preflight checks without modifying files.
+  ./install.sh --validate-args         Validate CLI arguments and target paths, then exit.
+  ./install.sh --json                  Emit structured JSON summary to stdout.
+  ./install.sh --version               Print installer version and exit.
   ./install.sh --log-dir /abs/dir      Write Tri-Stream telemetry (results.json, debug.log).
   ./install.sh --uninstall             Remove binary, skill and MCP registration (keeps data).
 
@@ -51,21 +59,6 @@ Nothing is installed or registered until preflight, initialisation and self-test
 EOF
 }
 
-_prev_is_log_dir=0
-for _arg in "$@"; do
-    if [ "${_prev_is_log_dir}" -eq 1 ]; then
-        if [ -n "${_arg}" ] && [[ "${_arg}" != -* ]]; then
-            LOG_DIR="${_arg}"
-        fi
-        _prev_is_log_dir=0
-        continue
-    fi
-    case "${_arg}" in
-        --log-dir) _prev_is_log_dir=1 ;;
-        --log-dir=*) LOG_DIR="${_arg#--log-dir=}" ;;
-    esac
-done
-
 expand_tilde_path() {
     local p="$1"
     local h="${HOME:-}"
@@ -80,24 +73,37 @@ expand_tilde_path() {
     esac
 }
 
-if [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" != -* ]]; then
-    LOG_DIR="$(expand_tilde_path "${LOG_DIR}")"
-    case "${LOG_DIR}" in
-        /*)
-            mkdir -p "${LOG_DIR}" 2>/dev/null || true
-            chmod 700 "${LOG_DIR}" 2>/dev/null || true
-            : > "${LOG_DIR}/debug.log" 2>/dev/null || true
-            chmod 600 "${LOG_DIR}/debug.log" 2>/dev/null || true
-            ;;
-        *)
-            LOG_DIR=""
-            ;;
-    esac
-fi
+redact_line() {
+    local raw_str="$1"
+    if command -v python3 >/dev/null 2>&1 && [ -f "${BUNDLE_BIN}" ]; then
+        python3 -I - "${BUNDLE_BIN}" "${raw_str}" 2>/dev/null <<'PY' || printf '%s' "${raw_str}"
+"""Redacts secret patterns and high-entropy credentials from a single log line using bin/agent-memory patterns so debug logs stay clean-room safe, preventing credential leaks in debug.log."""
+import importlib.machinery, importlib.util, os, sys
+bundle_bin, text = sys.argv[1:3]
+os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
+os.environ["ALLOW_NON_OPTANE"] = "1"
+loader = importlib.machinery.SourceFileLoader("am_redact", bundle_bin)
+spec = importlib.util.spec_from_loader("am_redact", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+out = text
+for item in getattr(mod, "_SECRET_PATTERNS", ()):
+    pat = item[0] if isinstance(item, tuple) else item
+    out = pat.sub("[REDACTED]", out)
+if getattr(mod, "_screen_for_secrets", lambda s: None)(out) is not None:
+    out = "[REDACTED: potential secret]"
+sys.stdout.write(out)
+PY
+    else
+        printf '%s' "${raw_str}"
+    fi
+}
 
 log_debug() {
-    if [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" == /* ]] && [ -d "${LOG_DIR}" ]; then
-        printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "${LOG_DIR}/debug.log"
+    if [ "${LOG_DIR_VALIDATED}" -eq 1 ] && [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" == /* ]] && [ -d "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}/debug.log" ]; then
+        local safe_msg
+        safe_msg="$(redact_line "$*")"
+        printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${safe_msg}" >> "${LOG_DIR}/debug.log"
         chmod 600 "${LOG_DIR}/debug.log" 2>/dev/null || true
     fi
 }
@@ -105,24 +111,86 @@ log_debug() {
 write_results_json() {
     local status="$1"
     local detail="$2"
-    if [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" == /* ]] && [ -d "${LOG_DIR}" ] && command -v python3 >/dev/null 2>&1; then
-        python3 -I - "${LOG_DIR}/results.json" "${status}" "${detail}" "${DB_PATH_RESOLVED:-}" "${DRY_RUN}" "${UNINSTALL}" <<'PY'
-import json, os, sys, tempfile, time
-dst, status, detail, db_path, dry_run, uninstall = sys.argv[1:7]
+    local exit_code="${3:-0}"
+    if [ "${LOG_DIR_VALIDATED}" -eq 1 ] && [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" == /* ]] && [ -d "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -I - "${LOG_DIR}/results.json" "${status}" "${detail}" "${DB_PATH_RESOLVED:-}" "${DRY_RUN}" "${UNINSTALL}" "${exit_code}" "${VERSION}" "${START_EPOCH_MS}" "${BUNDLE_BIN}" <<'PY'
+"""Writes the canonical Tri-Stream results.json envelope atomically with secret redaction, 64 KiB cap, fsync, and 0600 permissions so installer status is recorded deterministically, preventing partial or schema-invalid telemetry files."""
+import importlib.machinery, importlib.util, json, os, socket, stat, sys, tempfile, time
+dst, raw_status, detail, db_path, dry_run, uninstall, raw_rc, ver, start_ms, bundle_bin = sys.argv[1:11]
+MAX_BYTES = 65536
+parsed_rc = int(raw_rc) if raw_rc.lstrip("-").isdigit() else (0 if raw_status in ("ok", "success") else 1)
+rc = parsed_rc if 0 <= parsed_rc <= 255 else (1 if parsed_rc else 0)
+status = "success" if rc == 0 else "error"
+if os.path.lexists(dst):
+    st = os.lstat(dst)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        sys.exit(1)
+mod = None
+if os.path.isfile(bundle_bin):
+    try:
+        os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
+        os.environ["ALLOW_NON_OPTANE"] = "1"
+        loader = importlib.machinery.SourceFileLoader("am_res_redact", bundle_bin)
+        spec = importlib.util.spec_from_loader("am_res_redact", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+    except Exception:
+        mod = None
+def _clean_str(val: str) -> str:
+    """Scrubs secret patterns and high-entropy credentials from a string value so telemetry fields remain clean-room safe, preventing credential leaks in results.json."""
+    out = val or ""
+    if mod is not None:
+        for item in getattr(mod, "_SECRET_PATTERNS", ()):
+            pat = item[0] if isinstance(item, tuple) else item
+            out = pat.sub("[REDACTED]", out)
+        if getattr(mod, "_screen_for_secrets", lambda s: None)(out) is not None:
+            return "[REDACTED: potential secret]"
+    return out
+clean_detail = _clean_str(detail).strip()
+fallback_msg = "installation completed" if status == "success" else "installation failed"
+summary_str = (clean_detail or fallback_msg)[:4000]
+clean_db = _clean_str(db_path).strip()
+errors = [] if status == "success" else [{"code": "INSTALL_ARGS_ERROR" if rc == 2 else "INSTALL_ERROR", "message": summary_str[:2000]}]
+try:
+    dur_ms = round(max(0.0, time.time() * 1000.0 - float(start_ms)), 2) if float(start_ms) > 0 else 0.0
+except ValueError:
+    dur_ms = 0.0
 payload = {
     "status": status,
-    "detail": detail,
-    "db_path": db_path,
+    "exit_code": rc,
     "dry_run": dry_run == "1",
-    "uninstall": uninstall == "1",
-    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "truncated": False,
+    "summary": summary_str,
+    "errors": errors,
+    "data": {
+        "detail": summary_str,
+        "db_path": clean_db,
+        "uninstall": uninstall == "1",
+    },
+    "metadata": {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "duration_ms": dur_ms,
+        "host": socket.gethostname() or "localhost",
+        "version": ver,
+        "pid": os.getpid(),
+        "tool_name": "install.sh",
+    },
 }
+raw_bytes = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+if len(raw_bytes) > MAX_BYTES:
+    payload["truncated"] = True
+    payload["data"] = {"uninstall": uninstall == "1", "truncated": True}
+    payload["summary"] = (summary_str[:256].strip() or fallback_msg)
+    if status == "error":
+        payload["errors"] = [{"code": errors[0]["code"], "message": (summary_str[:256].strip() or fallback_msg)}]
+    raw_bytes = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
 dst_dir = os.path.dirname(dst) or "."
 fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".results.json.")
 try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        f.write("\n")
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw_bytes)
+        f.flush()
+        os.fsync(f.fileno())
     os.chmod(tmp, 0o600)
     os.replace(tmp, dst)
 except BaseException:
@@ -138,11 +206,14 @@ PY
 
 cleanup() {
     local rc=$?
+    set +eu
+    trap '' INT TERM
     [ -n "${DOCTOR_ERR:-}" ] && rm -f "${DOCTOR_ERR}"
     [ -n "${TMP_BIN:-}" ] && rm -f "${TMP_BIN}"
+    [ -n "${TMP_ATOMIC:-}" ] && rm -f "${TMP_ATOMIC}"
     if [ "${rc}" -ne 0 ] && [ "${RESULTS_WRITTEN:-0}" -eq 0 ]; then
         log_debug "ERROR: installer aborted (exit ${rc})"
-        write_results_json "error" "aborted (exit ${rc})" || true
+        write_results_json "error" "aborted (exit ${rc})" "${rc}" || true
     fi
     exit "${rc}"
 }
@@ -150,10 +221,83 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+pre_init_log_dir() {
+    local raw_log=""
+    local prev_is_log=0
+    local arg
+    for arg in "$@"; do
+        if [ "${prev_is_log}" -eq 1 ]; then
+            if [ -n "${arg}" ] && [[ "${arg}" != -* ]]; then
+                raw_log="${arg}"
+            fi
+            prev_is_log=0
+            continue
+        fi
+        case "${arg}" in
+            --log-dir) prev_is_log=1 ;;
+            --log-dir=*) raw_log="${arg#--log-dir=}" ;;
+        esac
+    done
+    [ -n "${raw_log}" ] || return 0
+    raw_log="$(expand_tilde_path "${raw_log}")"
+    command -v python3 >/dev/null 2>&1 || return 0
+    if python3 -I - "${BUNDLE_BIN}" "${raw_log}" 2>/dev/null <<'PY'; then
+"""Validates --log-dir before CLI flag parsing so early exit code 2 argument errors still emit Tri-Stream telemetry when --log-dir is valid, preventing missing results.json on syntax errors."""
+import importlib.machinery, importlib.util, os, stat, sys
+bundle_bin, log_dir = sys.argv[1:3]
+if not os.path.isabs(log_dir) or not os.path.isfile(bundle_bin):
+    sys.exit(1)
+os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
+os.environ["ALLOW_NON_OPTANE"] = "1"
+loader = importlib.machinery.SourceFileLoader("am_pre_log", bundle_bin)
+spec = importlib.util.spec_from_loader("am_pre_log", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)}
+abs_log = os.path.abspath(log_dir)
+real_log = os.path.realpath(abs_log)
+if abs_log in unsafe_top or real_log in unsafe_top:
+    sys.exit(1)
+for p in (abs_log, real_log):
+    if ".git" in [seg for seg in p.split("/") if seg]:
+        sys.exit(1)
+mod._check_not_guarded_path(abs_log, "LOG_DIR")
+cur = abs_log
+while True:
+    if os.path.lexists(cur):
+        st_c = os.lstat(cur)
+        if stat.S_ISLNK(st_c.st_mode):
+            sys.exit(1)
+        if cur == abs_log and not stat.S_ISDIR(st_c.st_mode):
+            sys.exit(1)
+    parent = os.path.dirname(cur)
+    if parent == cur:
+        break
+    cur = parent
+for leaf in ("debug.log", "results.json"):
+    lp = os.path.join(abs_log, leaf)
+    if os.path.lexists(lp):
+        st_l = os.lstat(lp)
+        if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode):
+            sys.exit(1)
+PY
+        LOG_DIR="${raw_log}"
+        mkdir -p "${LOG_DIR}"
+        chmod 700 "${LOG_DIR}"
+        if [ ! -L "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}/debug.log" ]; then
+            [ -f "${LOG_DIR}/debug.log" ] || : > "${LOG_DIR}/debug.log"
+            chmod 600 "${LOG_DIR}/debug.log"
+            LOG_DIR_VALIDATED=1
+        fi
+    fi
+}
+
+pre_init_log_dir "$@"
+
 arg_die() {
     printf 'Error: %s\n' "$1" >&2
     log_debug "ERROR: $1"
-    write_results_json "error" "$1" || true
+    write_results_json "error" "$1" 2
     exit 2
 }
 
@@ -167,29 +311,27 @@ while [ $# -gt 0 ]; do
         --log-dir) [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || arg_die "--log-dir requires a non-empty directory path"; LOG_DIR="$2"; shift ;;
         --log-dir=*) LOG_DIR="${1#--log-dir=}"; [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" != -* ]] || arg_die "--log-dir requires a non-empty directory path" ;;
         --dry-run) DRY_RUN=1 ;;
+        --validate-args) VALIDATE_ARGS=1 ;;
+        --json) JSON_OUT=1 ;;
+        --version|-v) printf 'install.sh %s\n' "${VERSION}"; exit 0 ;;
         --uninstall) UNINSTALL=1 ;;
         --no-client-config) CLIENT_CONFIG=0 ;;
         -h|--help) usage; exit 0 ;;
-        *) printf "Error: unknown option '%s'\n" "$1" >&2; usage >&2; log_debug "ERROR: unknown option '$1'"; write_results_json "error" "unknown option '$1'" || true; exit 2 ;;
+        *) usage >&2; arg_die "unknown option '$1'" ;;
     esac
     shift
 done
 
-say()  { printf '[+] %s\n' "$*"; log_debug "INFO: $*"; }
+say() {
+    if [ "${JSON_OUT}" -eq 1 ]; then
+        printf '[+] %s\n' "$*" >&2
+    else
+        printf '[+] %s\n' "$*"
+    fi
+    log_debug "INFO: $*"
+}
 warn() { printf '[!] %s\n' "$*" >&2; log_debug "WARN: $*"; }
-die()  { printf 'Error: %s\n' "$*" >&2; log_debug "ERROR: $*"; write_results_json "error" "$*"; exit 1; }
-
-if [ -n "${LOG_DIR}" ]; then
-    LOG_DIR="$(expand_tilde_path "${LOG_DIR}")"
-    case "${LOG_DIR}" in
-        /*) ;;
-        *) die "--log-dir must be an absolute path (got '${LOG_DIR}')." ;;
-    esac
-    mkdir -p "${LOG_DIR}"
-    chmod 700 "${LOG_DIR}"
-    [ -f "${LOG_DIR}/debug.log" ] || : > "${LOG_DIR}/debug.log"
-    chmod 600 "${LOG_DIR}/debug.log"
-fi
+die()  { printf 'Error: %s\n' "$*" >&2; log_debug "ERROR: $*"; write_results_json "error" "$*" 1; exit 1; }
 
 if [ "$(id -u)" -eq 0 ]; then
     case "${ALLOW_ROOT:-0}" in
@@ -211,15 +353,16 @@ if [ -z "${HOME_DIR}" ]; then
     fi
 fi
 
+[ -n "${LOG_DIR}" ] && LOG_DIR="$(expand_tilde_path "${LOG_DIR}")"
+DEFAULT_MCP_CONFIG="${HOME_DIR}/.gemini/config/mcp_config.json"
 BIN_DIR="$(expand_tilde_path "${AGENT_MEMORY_BIN_DIR:-${BIN_DIR:-${HOME_DIR}/.local/bin}}")"
 BIN="${BIN_DIR}/agent-memory"
 GEMINI_DIR="${HOME_DIR}/.gemini"
 MCP_DIR="$(expand_tilde_path "${AGENT_MEMORY_MCP_DIR:-${MCP_DIR:-${GEMINI_DIR}/antigravity-cli/mcp/agent-memory}}")"
 SKILL_DIR="$(expand_tilde_path "${AGENT_MEMORY_SKILL_DIR:-${SKILL_DIR:-${GEMINI_DIR}/config/skills/agent-memory}}")"
-MCP_CONFIG="$(expand_tilde_path "${AGENT_MEMORY_MCP_CONFIG:-${MCP_CONFIG:-${GEMINI_DIR}/config/mcp_config.json}}")"
+MCP_CONFIG="$(expand_tilde_path "${AGENT_MEMORY_MCP_CONFIG:-${MCP_CONFIG:-${DEFAULT_MCP_CONFIG}}}")"
 [ -n "${DB_OVERRIDE}" ] && DB_OVERRIDE="$(expand_tilde_path "${DB_OVERRIDE}")"
 
-# Pin the launcher path (e.g. /usr/bin/python3) rather than its realpath so distribution Python upgrades do not break MCP registration.
 command -v python3 >/dev/null 2>&1 || die "python3 (3.10+) is required but was not found in PATH."
 python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
     || die "Python 3.10+ is required (found $(python3 -V 2>&1))."
@@ -227,9 +370,10 @@ PY="$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.executable))')"
 [ -x "${PY}" ] || die "could not resolve the python3 interpreter path."
 
 validate_install_paths() {
-    "${PY}" -I - "${BUNDLE_BIN}" "${LOG_DIR}" "${BIN_DIR}" "${MCP_DIR}" "${SKILL_DIR}" "${MCP_CONFIG}" "${DB_OVERRIDE}" <<'PY'
-import importlib.machinery, importlib.util, os, sys
-bundle_bin, log_dir, bin_dir, mcp_dir, skill_dir, mcp_cfg, db_over = sys.argv[1:8]
+    "${PY}" -I - "${BUNDLE_BIN}" "${LOG_DIR}" "${BIN_DIR}" "${MCP_DIR}" "${SKILL_DIR}" "${MCP_CONFIG}" "${DB_OVERRIDE}" "${DEFAULT_MCP_CONFIG}" <<'PY'
+"""Validates installer target paths against relative paths, unsafe top-level directories, symlinks, and host perimeter quarantine rules so installation cannot clobber sensitive stores, preventing path traversal or perimeter breaches."""
+import importlib.machinery, importlib.util, os, stat, sys
+bundle_bin, log_dir, bin_dir, mcp_dir, skill_dir, mcp_cfg, db_over, def_mcp_cfg = sys.argv[1:9]
 for label, val in (
     ("LOG_DIR", log_dir),
     ("BIN_DIR", bin_dir),
@@ -242,32 +386,86 @@ for label, val in (
         continue
     if not os.path.isabs(val):
         sys.exit(f"{label} must be an absolute path (got '{val}').")
-if os.path.isfile(bundle_bin):
-    os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
-    os.environ["ALLOW_NON_OPTANE"] = "1"
-    loader = importlib.machinery.SourceFileLoader("am_path_guard", bundle_bin)
-    spec = importlib.util.spec_from_loader("am_path_guard", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    for label, val in (
-        ("LOG_DIR", log_dir),
-        ("BIN_DIR", bin_dir),
-        ("MCP_DIR", mcp_dir),
-        ("SKILL_DIR", skill_dir),
-        ("DB_OVERRIDE", db_over),
-    ):
-        if val:
-            try:
-                mod._check_not_guarded_path(val, label)
-            except RuntimeError as exc:
-                sys.exit(str(exc))
-            for cand in (os.path.abspath(val), os.path.realpath(val)):
-                if cand in ("/", "/bin", "/usr", "/usr/bin", "/etc", "/var", mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)):
-                    if label in ("MCP_DIR", "SKILL_DIR"):
-                        sys.exit(f"Refusing unsafe top-level directory for {label}: '{val}'.")
+if not os.path.isfile(bundle_bin):
+    sys.exit(f"bundle is incomplete: bin/agent-memory not found at '{bundle_bin}'.")
+os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
+os.environ["ALLOW_NON_OPTANE"] = "1"
+loader = importlib.machinery.SourceFileLoader("am_path_guard", bundle_bin)
+spec = importlib.util.spec_from_loader("am_path_guard", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)}
+for label, val in (
+    ("LOG_DIR", log_dir),
+    ("BIN_DIR", bin_dir),
+    ("MCP_DIR", mcp_dir),
+    ("SKILL_DIR", skill_dir),
+    ("DB_OVERRIDE", db_over),
+    ("MCP_CONFIG", mcp_cfg),
+):
+    if not val:
+        continue
+    abs_v = os.path.abspath(val)
+    real_v = os.path.realpath(abs_v)
+    if abs_v in unsafe_top or real_v in unsafe_top:
+        sys.exit(f"Refusing unsafe top-level directory for {label}: '{val}'.")
+    if label == "MCP_CONFIG" and abs_v == os.path.abspath(def_mcp_cfg):
+        if os.path.lexists(abs_v):
+            st_m = os.lstat(abs_v)
+            if stat.S_ISLNK(st_m.st_mode) or not stat.S_ISREG(st_m.st_mode):
+                sys.exit(f"Refusing symlink or non-regular file for {label}: '{val}'.")
+        continue
+    try:
+        mod._check_not_guarded_path(val, label)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+if log_dir:
+    abs_log = os.path.abspath(log_dir)
+    cur = abs_log
+    while True:
+        if os.path.lexists(cur):
+            st_c = os.lstat(cur)
+            if stat.S_ISLNK(st_c.st_mode):
+                sys.exit(f"Refusing symlinked LOG_DIR component: '{cur}'.")
+            if cur == abs_log and not stat.S_ISDIR(st_c.st_mode):
+                sys.exit(f"LOG_DIR exists and is not a directory: '{abs_log}'.")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for leaf in ("debug.log", "results.json"):
+        lp = os.path.join(abs_log, leaf)
+        if os.path.lexists(lp):
+            st_l = os.lstat(lp)
+            if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode):
+                sys.exit(f"Refusing symlink or non-regular file in LOG_DIR: '{lp}'.")
 PY
 }
-VALIDATE_ERR="$(validate_install_paths 2>&1)" || die "${VALIDATE_ERR}"
+
+if ! VALIDATE_ERR="$(validate_install_paths 2>&1)"; then
+    LOG_DIR=""
+    LOG_DIR_VALIDATED=0
+    arg_die "${VALIDATE_ERR}"
+fi
+
+if [ -n "${LOG_DIR}" ] && [ "${LOG_DIR_VALIDATED}" -eq 0 ]; then
+    mkdir -p "${LOG_DIR}"
+    chmod 700 "${LOG_DIR}"
+    [ -L "${LOG_DIR}" ] && { LOG_DIR=""; die "Refusing symlinked --log-dir."; }
+    [ -L "${LOG_DIR}/debug.log" ] && { LOG_DIR=""; die "Refusing symlinked debug.log in --log-dir."; }
+    [ -f "${LOG_DIR}/debug.log" ] || : > "${LOG_DIR}/debug.log"
+    chmod 600 "${LOG_DIR}/debug.log"
+    LOG_DIR_VALIDATED=1
+fi
+
+if [ "${VALIDATE_ARGS}" -eq 1 ]; then
+    say "Validated installer arguments and target paths."
+    write_results_json "success" "Validated installer arguments and target paths." 0
+    if [ "${JSON_OUT}" -eq 1 ]; then
+        printf '{"status": "success", "dry_run": %s, "uninstall": %s}\n' "$([ "${DRY_RUN}" -eq 1 ] && echo true || echo false)" "$([ "${UNINSTALL}" -eq 1 ] && echo true || echo false)"
+    fi
+    exit 0
+fi
 
 install_file_atomic() {
     local src="$1"
@@ -276,16 +474,19 @@ install_file_atomic() {
     local dst_dir
     dst_dir="$(dirname "${dst}")"
     mkdir -p "${dst_dir}"
-    local tmp
-    tmp="$(mktemp "${dst_dir}/.$(basename "${dst}").XXXXXX")"
-    cp "${src}" "${tmp}"
-    chmod "${mode}" "${tmp}"
-    mv -f "${tmp}" "${dst}"
+    [ ! -L "${dst_dir}" ] || die "Refusing symlinked destination directory: ${dst_dir}"
+    [ ! -L "${dst}" ] || die "Refusing symlinked destination file: ${dst}"
+    TMP_ATOMIC="$(mktemp "${dst_dir}/.$(basename "${dst}").XXXXXX")"
+    cp "${src}" "${TMP_ATOMIC}"
+    chmod "${mode}" "${TMP_ATOMIC}"
+    mv -f "${TMP_ATOMIC}" "${dst}"
+    TMP_ATOMIC=""
 }
 
 mcp_config_edit() {
     "${PY}" -I - "$@" <<'PY'
-import json, os, shutil, stat, sys, tempfile
+"""Inspects or atomically updates the agent-memory server entry in mcp_config.json with mode 0600 permissions so existing client server registrations remain intact, preventing configuration loss or permission widening."""
+import json, os, stat, sys, tempfile
 action = sys.argv[1]
 orig_path = os.path.abspath(os.path.expanduser(sys.argv[2]))
 euid = os.geteuid()
@@ -293,13 +494,17 @@ if os.path.lexists(orig_path):
     st_l = os.lstat(orig_path)
     if st_l.st_uid != euid:
         sys.exit(f"Error: {orig_path} is owned by uid {st_l.st_uid}, not current user ({euid}).")
+    if stat.S_ISLNK(st_l.st_mode):
+        sys.exit(f"Error: {orig_path} is a symlink. Refusing to modify symlinked MCP configuration.")
 path = os.path.realpath(orig_path)
 data = {}
 orig_mode = 0o600
 orig_existed = os.path.exists(path)
 if orig_existed:
     try:
-        st_existing = os.stat(path)
+        st_existing = os.lstat(path)
+        if not stat.S_ISREG(st_existing.st_mode):
+            sys.exit(f"Error: {path} is not a regular file.")
         if st_existing.st_uid != euid:
             sys.exit(f"Error: {path} is owned by uid {st_existing.st_uid}, not current user ({euid}).")
         if (st_existing.st_mode & 0o022) != 0:
@@ -317,6 +522,7 @@ servers = data.setdefault("mcpServers", {})
 if action == "check":
     sys.exit(0)
 def _is_placeholder(s: str) -> bool:
+    """Checks whether a configuration value is empty or contains unexpanded template tokens so placeholder strings are ignored during config inspection, preventing literal template paths from being adopted as live database paths."""
     v = s.strip()
     return not v or "$" in v or "<user>" in v.lower() or ("__" in v and v.count("__") >= 2)
 if action == "get-db":
@@ -354,16 +560,22 @@ os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 os.makedirs(os.path.dirname(orig_path) or ".", exist_ok=True)
 bak_path = orig_path + ".agent-memory.bak"
 if action == "add" and orig_existed and not os.path.lexists(bak_path):
-    shutil.copy2(path, bak_path)
+    with open(path, "rb") as src_f:
+        raw_orig = src_f.read()
+    b_fd = os.open(bak_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        os.chmod(bak_path, 0o600)
-    except OSError:
-        pass
+        os.fchmod(b_fd, 0o600)
+        os.write(b_fd, raw_orig)
+        os.fsync(b_fd)
+    finally:
+        os.close(b_fd)
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".mcp_config.")
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.chmod(tmp, orig_mode)
     os.replace(tmp, path)
 except BaseException:
@@ -377,7 +589,7 @@ PY
 
 if [ "${UNINSTALL}" -eq 1 ]; then
     DB_HINT=""
-    if [ -f "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ]; then
+    if [ "${CLIENT_CONFIG}" -eq 1 ] && { [ -f "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ]; }; then
         MCP_CHK_ERR="$(mcp_config_edit check "${MCP_CONFIG}" 2>&1)" || die "${MCP_CHK_ERR} (nothing was removed)."
         DB_HINT="$(mcp_config_edit get-db "${MCP_CONFIG}")"
         if [ "${DRY_RUN}" -eq 0 ]; then
@@ -392,7 +604,7 @@ if [ "${UNINSTALL}" -eq 1 ]; then
         fi
     fi
     if [ -z "${DB_HINT}" ] && [ -f "${BIN}" ]; then
-        DB_HINT="$("${PY}" -I "${BIN}" doctor 2>/dev/null | "${PY}" -I -c 'import json,sys; print(json.load(sys.stdin).get("db_path",""))' 2>/dev/null || true)"
+        DB_HINT="$(env -u AGENT_MEMORY_DB -u OPTANE_BASE -u ALLOW_NON_OPTANE "${PY}" -I "${BIN}" doctor 2>/dev/null | "${PY}" -I -c 'import json,sys; print(json.load(sys.stdin).get("db_path",""))' 2>/dev/null || true)"
     fi
     DB_PATH_RESOLVED="${DB_HINT}"
     if [ "${DRY_RUN}" -eq 0 ]; then
@@ -405,13 +617,18 @@ if [ "${UNINSTALL}" -eq 1 ]; then
         say "[dry-run] Would remove ${BIN}, ${SKILL_DIR}, and ${MCP_DIR}."
     fi
     say "Your memory database was kept${DB_HINT:+ at ${DB_HINT}}. Delete it manually if you no longer need it."
-    write_results_json "ok" "uninstall completed"
+    write_results_json "success" "uninstall completed" 0
+    if [ "${JSON_OUT}" -eq 1 ]; then
+        printf '{"status": "success", "uninstall": true, "dry_run": %s}\n' "$([ "${DRY_RUN}" -eq 1 ] && echo true || echo false)"
+    fi
     exit 0
 fi
 
-echo "======================================================================"
-echo "Installing agent-memory v${VERSION} for user ${TARGET_USER}"
-echo "======================================================================"
+if [ "${JSON_OUT}" -eq 0 ]; then
+    echo "======================================================================"
+    echo "Installing agent-memory v${VERSION} for user ${TARGET_USER}"
+    echo "======================================================================"
+fi
 say "Python $("${PY}" -I -c 'import platform; print(platform.python_version())') (${PY})"
 [ -f "${BUNDLE_BIN}" ] || die "bundle is incomplete: bin/agent-memory not found next to install.sh."
 [ -f "${SCRIPT_DIR}/mcp/instructions.md" ] || die "bundle is incomplete: mcp/instructions.md not found next to install.sh."
@@ -436,7 +653,7 @@ if [ "${CLIENT_CONFIG}" -eq 1 ] && { [ -f "${MCP_CONFIG}" ] || [ -L "${MCP_CONFI
     if [ -z "${DB_OVERRIDE}" ]; then
         EXISTING_DB="$(mcp_config_edit get-db "${MCP_CONFIG}")"
         if [ -n "${EXISTING_DB}" ]; then
-            if [ "${ALLOW_NON_OPTANE_FLAG:-0}" = "0" ] && [ "${EXISTING_ALLOW}" = "1" ] && [[ "${EXISTING_DB}" != /mnt/optane/* ]]; then
+            if [ "${ALLOW_NON_OPTANE_FLAG:-0}" = "0" ] && [[ "${EXISTING_DB}" != /mnt/optane/* ]]; then
                 say "Ignoring non-Optane database path from ${MCP_CONFIG} (${EXISTING_DB}) because Optane mode is required"
             else
                 DB_OVERRIDE="${EXISTING_DB}"
@@ -498,7 +715,7 @@ To run on ordinary storage instead (slower, explicit opt-in):
     ./install.sh --allow-non-optane [--db /absolute/path/memory.db]
 EOF
     fi
-    write_results_json "error" "preflight failed"
+    write_results_json "error" "preflight failed" 1
     exit 1
 fi
 DB_PATH_RESOLVED="$(printf '%s' "${DOCTOR_OUT}" | "${PY}" -I -c 'import json,sys; print(json.load(sys.stdin).get("db_path", ""))' 2>/dev/null || true)"
@@ -508,14 +725,17 @@ say "Preflight passed (database: ${DB_PATH_RESOLVED})"
 RUN_ENV=("${ENV_BASE[@]}" "AGENT_MEMORY_DB=${DB_PATH_RESOLVED}")
 
 DO_ANTIGRAVITY=0
-if [ "${CLIENT_CONFIG}" -eq 1 ] && { [ -d "${GEMINI_DIR}/antigravity-cli" ] || [ -e "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ] || command -v agy >/dev/null 2>&1; }; then
+if [ "${CLIENT_CONFIG}" -eq 1 ] && { [ -d "${GEMINI_DIR}" ] || [ -e "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ] || [ -n "${AGENT_MEMORY_MCP_DIR:-}" ] || [ -n "${AGENT_MEMORY_SKILL_DIR:-}" ] || [ -n "${AGENT_MEMORY_MCP_CONFIG:-}" ] || command -v agy >/dev/null 2>&1; }; then
     DO_ANTIGRAVITY=1
     MCP_CHK_ERR="$(mcp_config_edit check "${MCP_CONFIG}" 2>&1)" || die "${MCP_CHK_ERR}"
 fi
 
 if [ "${DRY_RUN}" -eq 1 ]; then
     say "[dry-run] Preflight passed. Would initialize ${DB_PATH_RESOLVED} and install ${BIN}."
-    write_results_json "ok" "dry-run preflight passed"
+    write_results_json "success" "dry-run preflight passed" 0
+    if [ "${JSON_OUT}" -eq 1 ]; then
+        "${PY}" -I -c 'import json,sys; print(json.dumps({"status": "success", "dry_run": True, "db_path": sys.argv[1], "bin": sys.argv[2]}))' "${DB_PATH_RESOLVED}" "${BIN}"
+    fi
     exit 0
 fi
 
@@ -526,40 +746,51 @@ POST_DOCTOR_OUT="$("${RUN_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>&1)" || {
     die "post-init doctor check failed."
 }
 
-SELFTEST_OUT="$("${RUN_ENV[@]}" "${PY}" -I - "${PY}" "${BUNDLE_BIN}" 2>&1 <<'PY'
-import json, subprocess, sys, uuid
-cmd = [sys.argv[1], "-I", sys.argv[2]]
+SELFTEST_OUT="$("${RUN_ENV[@]}" "${PY}" -I - "${PY}" "${BUNDLE_BIN}" "${DB_PATH_RESOLVED}" 2>&1 <<'PY'
+"""Executes an isolated CLI and MCP stdio self-test against a temporary sibling database file so end-to-end record, search, forget, and JSON-RPC operations are verified before binary installation, preventing live production database mutation during installer self-tests."""
+import json, os, subprocess, sys, uuid
+py_exe, bin_path, live_db = sys.argv[1:4]
+probe_db = os.path.join(os.path.dirname(live_db), f".selftest_{os.getpid()}_{uuid.uuid4().hex[:8]}.db")
+cmd = [py_exe, "-I", bin_path]
+env = dict(os.environ, AGENT_MEMORY_DB=probe_db)
 def run(*a, inp=None):
-    p = subprocess.run([*cmd, *a], capture_output=True, text=True, input=inp, timeout=60)
+    """Invokes the candidate agent-memory binary against the isolated self-test database and returns stdout on exit code 0 so CLI and MCP round-trips are verified, preventing broken binaries from being installed."""
+    p = subprocess.run([*cmd, *a], capture_output=True, text=True, input=inp, env=env, timeout=60)
     if p.returncode != 0:
         sys.exit(f"Self-test failed: agent-memory {' '.join(a)}: {p.stdout}{p.stderr}")
     return p.stdout
-tok = "installprobe" + uuid.uuid4().hex[:12]
-oid = json.loads(run("record", f"agent-memory install self-test {tok}", "--session", "install-selftest"))["observation_id"]
-deleted = False
 try:
+    run("init")
+    tok = "installprobe" + uuid.uuid4().hex[:12]
+    oid = json.loads(run("record", f"agent-memory install self-test {tok}", "--session", "install-selftest"))["observation_id"]
     hits = json.loads(run("search", tok))
     if not any(h.get("observation_id") == oid for h in hits):
         sys.exit(f"Self-test failed: probe not found by search: {hits}")
     if json.loads(run("forget", "--observation", oid)).get("deleted_observations") != 1:
         sys.exit("Self-test failed: probe could not be deleted")
-    deleted = True
-finally:
-    if not deleted:
-        subprocess.run([*cmd, "forget", "--observation", oid], capture_output=True, text=True, timeout=30)
-msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "installer", "version": "1"}}},
+    msgs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "installer", "version": "1"}}},
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_search", "arguments": {"query": tok}}}]
-out = run("--mcp", inp="\n".join(json.dumps(m) for m in msgs) + "\n")
-resp = {r["id"]: r for r in map(json.loads, out.splitlines()) if "id" in r}
-names = [t["name"] for t in resp[2]["result"]["tools"]]
-if "memory_record" not in names or "memory_forget" not in names:
-    sys.exit(f"Self-test failed: unexpected MCP tools {names}")
-call = resp[3]["result"]
-if call.get("isError") or json.loads(call["content"][0]["text"]) != []:
-    sys.exit(f"Self-test failed: MCP tool call: {call}")
-print(f"Self-test passed: record -> search -> forget round trip, MCP handshake and tool call ({len(names)} tools), with no data left behind")
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_search", "arguments": {"query": tok}}},
+    ]
+    out = run("--mcp", inp="\n".join(json.dumps(m) for m in msgs) + "\n")
+    resp = {r["id"]: r for r in map(json.loads, out.splitlines()) if "id" in r}
+    names = [t["name"] for t in resp[2]["result"]["tools"]]
+    if "memory_record" not in names or "memory_forget" not in names:
+        sys.exit(f"Self-test failed: unexpected MCP tools {names}")
+    call = resp[3]["result"]
+    if call.get("isError") or json.loads(call["content"][0]["text"]) != []:
+        sys.exit(f"Self-test failed: MCP tool call: {call}")
+    print(f"Self-test passed: record -> search -> forget round trip, MCP handshake and tool call ({len(names)} tools), with no data left behind")
+finally:
+    for ext in ("", "-wal", "-shm", "-journal"):
+        p_ext = probe_db + ext
+        if os.path.lexists(p_ext):
+            try:
+                os.unlink(p_ext)
+            except OSError:
+                pass
 PY
 )" || die "${SELFTEST_OUT}"
 say "${SELFTEST_OUT}"
@@ -568,6 +799,8 @@ if [ ! -d "${BIN_DIR}" ]; then
     mkdir -p "${BIN_DIR}"
     chmod 755 "${BIN_DIR}" 2>/dev/null || true
 fi
+[ ! -L "${BIN_DIR}" ] || die "Refusing symlinked BIN_DIR: ${BIN_DIR}"
+[ ! -L "${BIN}" ] || die "Refusing symlinked destination binary: ${BIN}"
 TMP_BIN="$(mktemp "${BIN_DIR}/.agent-memory.XXXXXX")"
 cp "${BUNDLE_BIN}" "${TMP_BIN}"
 chmod 755 "${TMP_BIN}"
@@ -577,12 +810,14 @@ TMP_BIN=""
 say "Installed ${BIN}"
 
 ENTRY_JSON="$("${PY}" -I - "${PY}" "${BIN}" "${ALLOW_NON_OPTANE_FLAG}" "${DB_PATH_RESOLVED}" <<'PY'
+"""Serializes the MCP server registration JSON object for mcp_config.json so command, args, and environment variables are properly escaped, preventing malformed client configurations."""
 import json, sys
 py, b, allow, db = sys.argv[1:5]
 print(json.dumps({"command": py, "args": ["-I", b, "--mcp"], "env": {"ALLOW_NON_OPTANE": allow, "AGENT_MEMORY_DB": db}}))
 PY
 )"
 CLI_STR="$("${PY}" -I - "${ENTRY_JSON}" <<'PY'
+"""Formats a shell-quoted CLI invocation string from the MCP registration entry so operator health-check hints are copy-paste safe, preventing shell word-splitting errors."""
 import json, shlex, sys
 e = json.loads(sys.argv[1])
 py = e["command"]
@@ -597,10 +832,10 @@ if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
     say "Registered MCP server 'agent-memory' in ${MCP_CONFIG}"
     mkdir -p "${MCP_DIR}"
     chmod 700 "${MCP_DIR}" 2>/dev/null || true
-    install_file_atomic "${SCRIPT_DIR}/mcp/instructions.md" "${MCP_DIR}/instructions.md" 644
+    install_file_atomic "${SCRIPT_DIR}/mcp/instructions.md" "${MCP_DIR}/instructions.md" 600
     say "Installed MCP instructions to ${MCP_DIR}"
     for _schema in memory_record.json memory_search.json memory_recall.json memory_relate.json memory_forget.json; do
-        install_file_atomic "${SCRIPT_DIR}/mcp/${_schema}" "${MCP_DIR}/${_schema}" 644
+        install_file_atomic "${SCRIPT_DIR}/mcp/${_schema}" "${MCP_DIR}/${_schema}" 600
     done
     say "Installed MCP tool schemas to ${MCP_DIR}"
     mkdir -p "${SKILL_DIR}/references"
@@ -610,15 +845,19 @@ if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
     say "Installed skill files to ${SKILL_DIR}"
 fi
 
-write_results_json "ok" "installation completed"
+write_results_json "success" "installation completed" 0
 
-echo "======================================================================"
-echo "agent-memory v${VERSION} installed."
-echo "Database : ${DB_PATH_RESOLVED}"
-echo "Health   : ${CLI_STR} doctor"
-if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
-    echo "Antigravity: registered. Restart the agent client so it starts the MCP server."
+if [ "${JSON_OUT}" -eq 1 ]; then
+    "${PY}" -I -c 'import json,sys; print(json.dumps({"status": "success", "dry_run": False, "db_path": sys.argv[1], "bin": sys.argv[2]}))' "${DB_PATH_RESOLVED}" "${BIN}"
+else
+    echo "======================================================================"
+    echo "agent-memory v${VERSION} installed."
+    echo "Database : ${DB_PATH_RESOLVED}"
+    echo "Health   : ${CLI_STR} doctor"
+    if [ "${DO_ANTIGRAVITY}" -eq 1 ]; then
+        echo "Antigravity: registered. Restart the agent client so it starts the MCP server."
+    fi
+    echo "Server definition for other MCP clients (see LLM_ONBOARDING.md for each client's config file):"
+    echo "${SNIPPET}"
+    echo "======================================================================"
 fi
-echo "Server definition for other MCP clients (see LLM_ONBOARDING.md for each client's config file):"
-echo "${SNIPPET}"
-echo "======================================================================"

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 Christopher Schek
-# SPDX-License-Identifier: GPL-3.0-only
-"""Benchmarks unassisted flat-file memory patterns against the SQLite WAL + FTS5 agent-memory engine across storage media to quantify commit latency and context scaling, preventing unmeasured persistence patterns from hiding O(N) context token blowup, O(N^2) write amplification, and fsync stalls."""
+"""Benchmarks unassisted flat-file memory patterns against the SQLite WAL + FTS5 agent-memory engine across storage media so commit latency and context scaling are quantified, preventing unmeasured persistence patterns from hiding O(N) context token blowup, O(N^2) write amplification, and fsync stalls."""
 
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
 import io
@@ -11,15 +10,20 @@ import json
 import os
 import re
 import signal
+import socket
+import stat
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, NoReturn
+
+VERSION = "1.0.0"
+MAX_RESULTS_BYTES = 65536
 
 
 def detect_storage_label(target_path: str, fallback: str) -> str:
     """Resolves the underlying block device model from `/proc/mounts` and `/sys/block` for `target_path` so benchmark tables display accurate hardware labels, preventing missing sysfs metadata from crashing label detection."""
-    try:
+    with contextlib.suppress(OSError):
         real_path = os.path.realpath(target_path)
         while not os.path.exists(real_path) and real_path != "/":
             real_path = os.path.dirname(real_path)
@@ -50,8 +54,6 @@ def detect_storage_label(target_path: str, fallback: str) -> str:
                         model = sf.read().strip()
                     if model:
                         return model
-    except OSError:
-        pass
     return fallback
 
 
@@ -84,7 +86,7 @@ def benchmark_unassisted_markdown(base_dir: str, count: int, media_name: str = "
     t_search = time.perf_counter()
     hits_found = 0
     for i in range(count):
-        query = f"invariant {i % 10}"
+        query = f"invariant {i % 10}:"
         with open(md_path, "r", encoding="utf-8") as f:
             content = f.read()
             if query in content:
@@ -143,12 +145,11 @@ def benchmark_unassisted_json(base_dir: str, count: int, media_name: str = "Stan
     t_search = time.perf_counter()
     hits_found = 0
     for i in range(count):
-        query = f"invariant {i % 10}"
+        query = f"invariant {i % 10}:"
         with open(json_path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-            for rec in loaded:
-                if query in rec["content"]:
-                    hits_found += 1
+            if any(query in rec["content"] for rec in loaded):
+                hits_found += 1
     search_ms = (time.perf_counter() - t_search) * 1000
 
     file_size = os.path.getsize(json_path)
@@ -175,6 +176,31 @@ def benchmark_unassisted_json(base_dir: str, count: int, media_name: str = "Stan
         "durability": "fsync (unstructured)",
         "notes": f"Severe O(N^2) write amplification ({bytes_written_total / 1024:.1f} KB written for {file_size / 1024:.1f} KB store) and high parse CPU.",
     }
+
+
+def _load_agent_memory_mod(bin_path: str) -> Any:
+    """Loads the `bin/agent-memory` module with fallback config probing disabled so helper functions can be invoked in-process, preventing ambient host config side effects."""
+    saved_no_cfg = os.environ.get("AGENT_MEMORY_NO_CFG_FALLBACK")
+    saved_allow = os.environ.get("ALLOW_NON_OPTANE")
+    try:
+        os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
+        os.environ["ALLOW_NON_OPTANE"] = "1"
+        loader = importlib.machinery.SourceFileLoader("agent_memory_bench_mod", bin_path)
+        spec = importlib.util.spec_from_loader("agent_memory_bench_mod", loader)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load agent-memory binary from {bin_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        if saved_no_cfg is None:
+            os.environ.pop("AGENT_MEMORY_NO_CFG_FALLBACK", None)
+        else:
+            os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = saved_no_cfg
+        if saved_allow is None:
+            os.environ.pop("ALLOW_NON_OPTANE", None)
+        else:
+            os.environ["ALLOW_NON_OPTANE"] = saved_allow
 
 
 def benchmark_mcp_engine(
@@ -220,16 +246,16 @@ def benchmark_mcp_engine(
         try:
             mod.main()
         except SystemExit as se:
+            if se.code in (130, 143):
+                raise
             if se.code not in (0, None):
                 raise RuntimeError(f"agent-memory benchmark failed (exit {se.code})") from se
     finally:
         sys.stdout = saved_stdout
         sys.argv = saved_argv
-        try:
+        with contextlib.suppress(ValueError, AttributeError):
             signal.signal(signal.SIGINT, saved_sigint)
             signal.signal(signal.SIGTERM, saved_sigterm)
-        except (ValueError, AttributeError):
-            pass
         for k, val in saved_env.items():
             if val is None:
                 os.environ.pop(k, None)
@@ -251,8 +277,6 @@ def benchmark_mcp_engine(
         elif "Database Size" in line:
             file_size = int(line.split(":")[1].replace("bytes", "").strip())
 
-    if file_size == 0 and os.path.exists(db_path):
-        file_size = os.path.getsize(db_path)
     n_toks = estimate_tokens("X" * (5 * 200))
     ctx_str = "~300 to 1,200 tokens (bounded O(K))"
 
@@ -318,9 +342,9 @@ def print_markdown_comparison(
     optane_label: str = "Dedicated Optane Volume",
     flash_label: str = "Standard Local Storage",
 ) -> None:
-    """Prints Markdown comparison tables for physical storage latency and AI context scaling so operators can compare storage tiers, preventing raw timing dumps from obscuring token and durability trade-offs."""
-    optane_map = {}
-    flash_map = {}
+    """Prints 4-part H2 compliant Markdown comparison tables for physical storage latency and AI context scaling so operators compare storage tiers deterministically, preventing raw timing dumps from obscuring token and durability trade-offs."""
+    optane_map: dict[str, dict[str, Any]] = {}
+    flash_map: dict[str, dict[str, Any]] = {}
     for r in results:
         p = r["pattern"]
         if r.get("media") == optane_label or "Optane" in r.get("media", ""):
@@ -335,16 +359,14 @@ def print_markdown_comparison(
         "Unassisted JSON Rewrite (notes.json)",
     ]
 
-    print(f"\n# Memory Benchmark Results ({count} Iterations)\n")
-    print("Summarizes comparative write latency, context token consumption, and durability across storage tiers and memory architectures to guide storage selection without unbenchmarked performance assumptions.\n")
+    print(f"# Memory Benchmark Results ({count} Iterations)\n")
+    print("Summarizes comparative write latency, context token consumption, and durability across storage tiers and memory architectures so operators select verified storage configurations, preventing unbenchmarked performance assumptions.\n")
 
     print("## 1. Comparative Benchmark Tables\n")
-    print("Presents hardware commit latency and context scaling measurements across storage media and persistence patterns to quantify physical and architectural overhead, preventing unmeasured storage or context bottlenecks.\n")
-
-    print("### Table 1: Physical Storage Benchmark (Pure Hardware & Disk Latency)\n")
-    print("Compares average commit latency across dedicated low-latency media and standard local storage for each persistence pattern to quantify hardware fsync speedup, preventing storage tier misconfiguration.\n")
-    print(f"| Implementation / Pattern | {optane_label} | {flash_label} | Hardware Speedup | Durability Level |")
-    print("|---|---|---|---|---|")
+    print("Presents hardware commit latency and context scaling measurements across storage media and persistence patterns so physical and architectural overhead is quantified, preventing unmeasured storage or context bottlenecks.\n")
+    print("1. **Physical Storage Benchmark (Pure Hardware & Disk Latency)**:\n")
+    print(f"   | Implementation / Pattern | {optane_label} | {flash_label} | Hardware Speedup | Durability Level |")
+    print("   |---|---|---|---|---|")
     for p in patterns:
         opt_r = optane_map.get(p)
         fl_r = flash_map.get(p)
@@ -358,7 +380,7 @@ def print_markdown_comparison(
         else:
             speedup = "N/A"
         dur = DURABILITY_LEVELS.get(p, "N/A")
-        print(f"| **{p}** | {opt_w} | {fl_w} | {speedup} | {dur} |")
+        print(f"   | **{p}** | {opt_w} | {fl_w} | {speedup} | {dur} |")
 
     md_ref = flash_map.get("Unassisted Flat Markdown (MEMORY.md)") or optane_map.get("Unassisted Flat Markdown (MEMORY.md)") or {}
     json_ref = flash_map.get("Unassisted JSON Rewrite (notes.json)") or optane_map.get("Unassisted JSON Rewrite (notes.json)") or {}
@@ -368,102 +390,366 @@ def print_markdown_comparison(
     json_ttft = estimate_turn_latency_str(json_tokens, is_bounded=False)
     mcp_ttft = estimate_turn_latency_str(300, is_bounded=True)
 
-    print("\n### Table 2: AI Agent Scaling & Safety Benchmark (Architecture & Context Health)\n")
-    print("Evaluates prompt context token overhead, time-to-first-token prefill delay, write amplification, and concurrency safety across architectures to prevent unbounded context bloat and concurrent write corruption.\n")
-    print(f"| Architecture / Pattern | Context Tokens (at {count} notes) | Est. LLM Prefill Delay (TTFT) | Disk Write Amplification | Multi-Agent Concurrency Safety |")
-    print("|---|---|---|---|---|")
-    print(f"| **agent-memory MCP** | **~300 to 1,200 tokens** (bounded O(K)) | **{mcp_ttft}** | O(N) modified 4KB pages | **Safe** (ACID WAL, 5000 ms busy-timeout) |")
-    print(f"| **Flat Markdown (MEMORY.md)** | ~{md_tokens:,} tokens (unbounded O(N)) | {md_ttft} | O(N) raw text appends | **Unsafe** (interleaved line corruption) |")
-    print(f"| **JSON Rewrite (notes.json)** | ~{json_tokens:,} tokens (unbounded O(N)) | {json_ttft} | O(N^2) full array rewrites | **Unsafe** (full-file overwrite clobber) |")
+    print("\n2. **AI Agent Scaling & Safety Benchmark (Architecture & Context Health)**:\n")
+    print(f"   | Architecture / Pattern | Context Tokens (at {count} notes) | Est. LLM Prefill Delay (TTFT) | Disk Write Amplification | Multi-Agent Concurrency Safety |")
+    print("   |---|---|---|---|---|")
+    print(f"   | **agent-memory MCP** | **~300 to 1,200 tokens** (bounded O(K)) | **{mcp_ttft}** | O(N) modified 4KB pages | **Safe** (ACID WAL, 5000 ms busy-timeout) |")
+    print(f"   | **Flat Markdown (MEMORY.md)** | ~{md_tokens:,} tokens (unbounded O(N)) | {md_ttft} | O(N) raw text appends | **Unsafe** (interleaved line corruption) |")
+    print(f"   | **JSON Rewrite (notes.json)** | ~{json_tokens:,} tokens (unbounded O(N)) | {json_ttft} | O(N^2) full array rewrites | **Unsafe** (full-file overwrite clobber) |")
+    print("   - *Positive Exemplar*: `Use agent-memory MCP with SQLite WAL and FTS5 to bound prompt context tokens to O(K) while preserving multi-agent write safety.`")
+    print("   - *Negative Exemplar*: `Append concurrent agent observations to flat MEMORY.md or notes.json files with unbounded O(N) prompt ingestion.` (STRICTLY FORBIDDEN)\n")
+    print("### Verification & Failure Recovery\n")
+    print("Verifies that all benchmark rows record positive write and search latencies so hardware comparisons remain valid, preventing zero-byte or failed runs from skewing speedup ratios.\n")
+    print("- Re-run `python3 benchmark/benchmark_comparison.py -n 100 --json` if any row reports `0.00 ms` or missing storage labels.\n")
 
-    print("\n## 2. Architectural Analysis\n")
-    print("Examines durability barriers, kernel page-cache warm reads, and multi-agent lock contention across storage tiers so operators can interpret benchmark metrics without misreading OS cache effects.\n")
+    print("## 2. Architectural Analysis\n")
+    print("Examines durability barriers, kernel page-cache warm reads, and multi-agent lock contention across storage tiers so operators interpret benchmark metrics accurately, preventing misconfigured synchronous modes or unbounded context growth.\n")
+    print("1. **Durability Modes (`sync=FULL` vs. `sync=NORMAL`)**:")
+    print("   - `sync=FULL` (Default on Optane): Issues a physical hardware barrier (`fdatasync`) directly to the drive controller on every commit, guaranteeing zero data loss across host power loss or kernel panics.")
+    print("   - `sync=NORMAL` (Default on Flash SSDs): Commits to the OS page cache without blocking on a physical drive flush on every transaction, avoiding Flash Translation Layer block-erase stalls.")
+    print("2. **Read & Search Latency**: Read and FTS5 search latency (~0.25 to 0.26 ms) remains consistent across storage media because the active working set resides in the Linux kernel Page Cache (DRAM).")
+    print("3. **Bounded vs. Unbounded Tokens**: Flat files ingest their entire history on every turn (unbounded O(N)), whereas `agent-memory` caps context consumption to a bounded query envelope (`O(K)`, ~300 to 1,200 tokens).")
+    print("4. **Write Amplification**: Rewriting `notes.json` on every observation incurs `O(N^2)` write amplification, whereas SQLite WAL appends only modified 4KB pages (`O(N)`).")
+    print("5. **Concurrency**: SQLite WAL serializes concurrent writers via a 5000 ms busy timeout while unassisted flat files clobber concurrent writes.")
+    print("   - *Positive Exemplar*: `Configure sync=FULL on dedicated Intel Optane media and sync=NORMAL on standard NAND flash storage.`")
+    print("   - *Negative Exemplar*: `Disable WAL mode or run concurrent multi-agent writes against unindexed flat files.` (STRICTLY FORBIDDEN)\n")
+    print("### Verification & Failure Recovery\n")
+    print("Confirms SQLite WAL synchronous mode and FTS5 index health via `agent-memory doctor` so runtime durability matches benchmark expectations, preventing silent fallback to unindexed storage.\n")
+    print("- Run `~/.local/bin/agent-memory doctor` to verify `journal_mode=wal` and `fts_index: ok` after changing storage tiers.")
 
-    print("### Operational Guidance & Technical Notes\n")
-    print("Details durability trade-offs, kernel page-cache behavior, and concurrency guarantees to explain the benchmark measurements without leaving architectural assumptions implicit.\n")
-    print("1. Durability Modes: sync=FULL vs. sync=NORMAL:")
-    print("   - sync=FULL (Default on Optane): Issues a physical hardware barrier (fdatasync) directly to the drive controller on every commit. Guarantees zero data loss across sudden host power loss, UPS failure, or kernel panics. On Intel Optane (3D XPoint), byte-addressability commits hardware fsync in sub-millisecond latency with zero flash wear.")
-    print("   - sync=NORMAL (Default on Flash SSDs): Commits to the OS page cache without blocking on physical drive flush. Immune to application crashes and delivers fast writes on SATA/NVMe flash without triggering Flash Translation Layer (FTL) block-erase stalls.")
-    print("2. Read/Search Latency: Read and FTS5 search latency (~0.25 to 0.26 ms) is virtually identical across storage media because the working set resides in the Linux kernel Page Cache (DRAM), avoiding physical disk reads during warm queries.")
-    print("3. Bounded vs. Unbounded Tokens: Flat files dump their entire history into every prompt turn (unbounded O(N)). agent-memory caps context consumption to a bounded query envelope (O(K), typically ~300 to 1,200 tokens depending on query limit and observation length), keeping prompt prefill to ~45 to 90 ms regardless of whether the store has 100 or 100,000 entries.")
-    print("4. Write Amplification: Rewriting notes.json on every observation incurs severe O(N^2) write amplification. SQLite WAL appends only modified 4KB pages (O(N) write volume).")
-    print("5. Concurrency: SQLite WAL handles concurrent subagent reads and serialized writes with a 5000 ms busy handler. Unassisted flat files lack write serialization and corrupt or clobber records during parallel agent execution.")
-    print()
+
+def _pre_extract_log_dir(argv: list[str]) -> str:
+    """Extracts `--log-dir` from raw CLI arguments prior to full parsing so early parser failures still emit Tri-Stream telemetry, preventing missing `results.json` files on exit code 2."""
+    raw = ""
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            break
+        if arg == "--log-dir":
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                raw = argv[i + 1]
+                i += 2
+                continue
+        elif arg.startswith("--log-dir="):
+            raw = arg.split("=", 1)[1]
+        i += 1
+    return os.path.expanduser(raw.strip()) if raw.strip() else ""
+
+
+def _validate_and_init_log_dir(log_dir: str, am_mod: Any, home_dir: str) -> tuple[str, str]:
+    """Validates `log_dir` against host perimeter guards, symlinks, and unsafe top-level roots before initializing `debug.log` with mode 0600 so telemetry paths stay contained, preventing arbitrary file truncation or quarantined path writes."""
+    if not os.path.isabs(log_dir):
+        raise ValueError(f"--log-dir must be an absolute path (got '{log_dir}').")
+    norm_log = os.path.abspath(log_dir)
+    real_log = os.path.realpath(norm_log)
+    unsafe_roots = {
+        "/",
+        "/bin",
+        "/usr",
+        "/usr/bin",
+        "/etc",
+        "/var",
+        os.path.join("/", "tmp"),
+        os.path.join("/", "var", "tmp"),
+        os.path.abspath(home_dir),
+        os.path.realpath(home_dir),
+    }
+    if norm_log in unsafe_roots or real_log in unsafe_roots:
+        raise ValueError(f"Refusing unsafe top-level directory for --log-dir: '{log_dir}'.")
+    for p in (norm_log, real_log):
+        parts = [seg for seg in p.split("/") if seg]
+        if ".git" in parts:
+            raise ValueError(f"Refusing --log-dir inside a .git directory: '{log_dir}'.")
+    if am_mod is not None and hasattr(am_mod, "_check_not_guarded_path"):
+        am_mod._check_not_guarded_path(norm_log, "LOG_DIR")
+    cur = norm_log
+    while True:
+        if os.path.lexists(cur):
+            st_cur = os.lstat(cur)
+            if stat.S_ISLNK(st_cur.st_mode):
+                raise ValueError(f"Refusing symlinked --log-dir component: '{cur}'.")
+            if cur == norm_log and not stat.S_ISDIR(st_cur.st_mode):
+                raise ValueError(f"--log-dir exists and is not a directory: '{norm_log}'.")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    os.makedirs(norm_log, mode=0o700, exist_ok=True)
+    os.chmod(norm_log, 0o700)
+    dbg_path = os.path.join(norm_log, "debug.log")
+    res_path = os.path.join(norm_log, "results.json")
+    for fpath in (dbg_path, res_path):
+        if os.path.lexists(fpath):
+            st_f = os.lstat(fpath)
+            if stat.S_ISLNK(st_f.st_mode) or not stat.S_ISREG(st_f.st_mode) or st_f.st_nlink != 1:
+                raise ValueError(f"Refusing non-regular or symlinked telemetry target: '{fpath}'.")
+    fd = os.open(dbg_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    os.fchmod(fd, 0o600)
+    os.close(fd)
+    return dbg_path, res_path
+
+
+def _redact_secrets_obj(obj: Any, am_mod: Any, depth: int = 0) -> Any:
+    """Recursively scrubs secret patterns and high-entropy credentials from telemetry strings, lists, and dictionaries up to depth 32 so Tri-Stream artifacts stay clean-room safe, preventing credential leaks in `results.json` or `debug.log`."""
+    if depth > 32:
+        return "[TRUNCATED_DEPTH]"
+    if isinstance(obj, str):
+        out = obj
+        if am_mod is not None:
+            for item in getattr(am_mod, "_SECRET_PATTERNS", ()):
+                pat = item[0] if isinstance(item, tuple) else item
+                with contextlib.suppress(Exception):
+                    out = pat.sub("[REDACTED]", out)
+            screen_fn = getattr(am_mod, "_screen_for_secrets", None)
+            if callable(screen_fn) and screen_fn(out) is not None:
+                return "[REDACTED: potential secret]"
+        return out
+    if isinstance(obj, dict):
+        sanitized_dict: dict[str, Any] = {}
+        for k, v in obj.items():
+            k_str = str(_redact_secrets_obj(str(k), am_mod, depth + 1))
+            if any(tok in k_str.lower() for tok in ("pass" + "word", "sec" + "ret", "tok" + "en", "api_" + "key", "priv" + "ate_key")):
+                sanitized_dict[k_str] = "[REDACTED]"
+            else:
+                sanitized_dict[k_str] = _redact_secrets_obj(v, am_mod, depth + 1)
+        return sanitized_dict
+    if isinstance(obj, (list, tuple)):
+        return [_redact_secrets_obj(item, am_mod, depth + 1) for item in obj]
+    return obj
+
+
+def _write_tri_stream_results(
+    res_path: str,
+    exit_code: int,
+    dry_run: bool,
+    summary: str,
+    errors: list[dict[str, str]],
+    data: dict[str, Any],
+    start_ts: float,
+    am_mod: Any = None,
+) -> None:
+    """Serializes the canonical `schema/results.schema.json` envelope atomically with `os.fsync`, secret redaction, and 64 KiB truncation protection so Tri-Stream telemetry remains valid under signal interruption, preventing partial or oversized JSON outputs."""
+    if not res_path:
+        return
+    bounded_exit = int(exit_code) if (isinstance(exit_code, int) and 0 <= exit_code <= 255) else (1 if exit_code else 0)
+    status = "success" if bounded_exit == 0 else "error"
+    clean_summary_raw = str(_redact_secrets_obj(summary or "", am_mod)).strip()
+    clean_summary = (clean_summary_raw or ("Benchmark completed." if bounded_exit == 0 else "Benchmark failed."))[:4000]
+    raw_errs = errors if (status == "error" and errors) else ([{"code": "BENCHMARK_ERROR", "message": clean_summary}] if status == "error" else [])
+    clean_errors: list[dict[str, str]] = []
+    for err_item in raw_errs:
+        c_raw = str(_redact_secrets_obj(str(err_item.get("code") or "BENCHMARK_ERROR"), am_mod)).strip()
+        m_raw = str(_redact_secrets_obj(str(err_item.get("message") or ""), am_mod)).strip()
+        clean_errors.append(
+            {
+                "code": (c_raw or "BENCHMARK_ERROR")[:128],
+                "message": (m_raw or clean_summary or "Benchmark failed.")[:2000],
+            }
+        )
+    clean_data = _redact_secrets_obj(data, am_mod)
+    if not isinstance(clean_data, dict):
+        clean_data = {}
+
+    envelope: dict[str, Any] = {
+        "status": status,
+        "exit_code": bounded_exit,
+        "dry_run": bool(dry_run),
+        "truncated": False,
+        "summary": clean_summary,
+        "errors": clean_errors if status == "error" else [],
+        "data": clean_data,
+        "metadata": {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "duration_ms": round(max(0.0, (time.perf_counter() - start_ts) * 1000.0), 2),
+            "host": socket.gethostname() or "localhost",
+            "version": VERSION,
+            "pid": os.getpid(),
+            "tool_name": "benchmark_comparison",
+        },
+    }
+    raw_bytes = (json.dumps(envelope, indent=2) + "\n").encode("utf-8")
+    if len(raw_bytes) > MAX_RESULTS_BYTES:
+        envelope["truncated"] = True
+        envelope["data"] = {"count": clean_data.get("count", 0), "results_count": len(clean_data.get("results", [])), "truncated": True}
+        raw_bytes = (json.dumps(envelope, indent=2) + "\n").encode("utf-8")
+    if len(raw_bytes) > MAX_RESULTS_BYTES:
+        envelope["truncated"] = True
+        envelope["errors"] = [
+            {"code": e["code"][:64], "message": (e["message"][:256].strip() or "Benchmark failed.")}
+            for e in clean_errors[:10]
+        ] if status == "error" else []
+        envelope["summary"] = (clean_summary[:512].strip() or "Benchmark failed.")
+        raw_bytes = (json.dumps(envelope, indent=2) + "\n").encode("utf-8")
+    if len(raw_bytes) > MAX_RESULTS_BYTES:
+        envelope["truncated"] = True
+        envelope["data"] = {}
+        envelope["summary"] = (clean_summary[:256].strip() or "Benchmark failed.")
+        envelope["errors"] = (
+            [{"code": clean_errors[0]["code"][:64], "message": (clean_errors[0]["message"][:256].strip() or "Benchmark failed.")}]
+            if (status == "error" and clean_errors)
+            else ([{"code": "BENCHMARK_ERROR", "message": "Benchmark failed."}] if status == "error" else [])
+        )
+        raw_bytes = (json.dumps(envelope, indent=2) + "\n").encode("utf-8")
+
+    tmp_path = f"{res_path}.tmp.{os.getpid()}"
+    prev_int = signal.getsignal(signal.SIGINT)
+    prev_term = signal.getsignal(signal.SIGTERM)
+    try:
+        with contextlib.suppress(ValueError, AttributeError):
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if os.path.lexists(res_path):
+            st_dst = os.lstat(res_path)
+            if stat.S_ISLNK(st_dst.st_mode) or not stat.S_ISREG(st_dst.st_mode):
+                raise OSError(f"Refusing to overwrite non-regular results target: {res_path}")
+        if os.path.lexists(tmp_path):
+            os.unlink(tmp_path)
+        fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, raw_bytes)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, res_path)
+    finally:
+        with contextlib.suppress(OSError):
+            if os.path.lexists(tmp_path):
+                os.unlink(tmp_path)
+        with contextlib.suppress(ValueError, AttributeError):
+            signal.signal(signal.SIGINT, prev_int)
+            signal.signal(signal.SIGTERM, prev_term)
+
+
+class _TriStreamArgumentParser(argparse.ArgumentParser):
+    """Raises `ValueError` on CLI parse errors so the outer Tri-Stream handler records structured error telemetry before exiting with code 2, preventing silent unlogged argument errors."""
+
+    def error(self, message: str) -> NoReturn:
+        """Raises a `ValueError` carrying the parser error message so `main()` can emit `results.json` and exit with code 2, preventing bypassing Tri-Stream telemetry."""
+        raise ValueError(message)
 
 
 def main() -> None:
     """Parses CLI arguments and executes comparative memory benchmarks across local and dedicated storage tiers so latency and token scaling are reported deterministically, preventing unverified storage configurations from masking I/O bottlenecks."""
+    start_ts = time.perf_counter()
     os.umask(0o077)
-    try:
+    with contextlib.suppress(ValueError, AttributeError):
         signal.signal(signal.SIGTERM, lambda s, f: sys.exit(143))
         signal.signal(signal.SIGINT, lambda s, f: sys.exit(130))
-    except (ValueError, AttributeError):
-        pass
 
-    parser = argparse.ArgumentParser(description="Benchmark unassisted AI memory vs. agent-memory MCP across storage media.")
-    parser.add_argument("-n", "--count", type=int, default=100, help="Number of test iterations (default: 100)")
-    parser.add_argument("--json", action="store_true", help="Output raw JSON results")
-    parser.add_argument("--log-dir", type=str, default="", help="Optional directory for Tri-Stream telemetry (results.json and debug.log)")
-    args = parser.parse_args()
-    if args.count <= 0:
-        parser.error("--count must be a positive integer greater than 0")
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bin_path = os.path.join(repo_dir, "bin", "agent-memory")
+    if not os.path.exists(bin_path):
+        bin_path = os.path.expanduser("~/.local/bin/agent-memory")
 
-    log_dir = os.path.abspath(os.path.expanduser(args.log_dir)) if args.log_dir else ""
-    debug_log_path = os.path.join(log_dir, "debug.log") if log_dir else ""
-    results_json_path = os.path.join(log_dir, "results.json") if log_dir else ""
+    try:
+        import pwd
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        home_dir = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError):
+        import getpass
+        username = os.environ.get("USER") or getpass.getuser()
+        home_dir = os.path.expanduser("~")
 
-    def _write_results_json(payload: dict[str, Any]) -> None:
-        """Writes the Tri-Stream results.json payload with mode 0600 permissions so execution status is persisted safely, preventing world-readable telemetry files."""
-        if not results_json_path:
-            return
-        with open(results_json_path, "w", encoding="utf-8") as rf:
-            json.dump(payload, rf, indent=2)
-            rf.write("\n")
-        os.chmod(results_json_path, 0o600)
+    am_mod: Any = None
+    with contextlib.suppress(Exception):
+        if os.path.isfile(bin_path):
+            am_mod = _load_agent_memory_mod(bin_path)
 
-    if log_dir:
-        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+    pre_log_dir = _pre_extract_log_dir(sys.argv[1:])
+    debug_log_path = ""
+    results_json_path = ""
+    if pre_log_dir:
         try:
-            os.chmod(log_dir, 0o700)
-        except OSError:
-            pass
-        with open(debug_log_path, "w", encoding="utf-8"):
-            pass
-        os.chmod(debug_log_path, 0o600)
-        _write_results_json({"status": "running", "count": args.count, "results": []})
+            debug_log_path, results_json_path = _validate_and_init_log_dir(pre_log_dir, am_mod, home_dir)
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
 
     def _log_debug(msg: str) -> None:
-        """Emits timestamped diagnostic progress to stderr and debug.log so execution telemetry is preserved, preventing diagnostic output from polluting stdout."""
-        print(msg, file=sys.stderr)
+        """Emits timestamped, secret-redacted diagnostic progress to stderr and debug.log so execution telemetry is preserved safely, preventing diagnostic output from polluting stdout or leaking credentials."""
+        safe_msg = str(_redact_secrets_obj(msg, am_mod))
+        print(safe_msg, file=sys.stderr)
         if debug_log_path:
-            with open(debug_log_path, "a", encoding="utf-8") as df:
-                df.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}\n")
-            try:
-                os.chmod(debug_log_path, 0o600)
-            except OSError:
-                pass
+            with contextlib.suppress(OSError):
+                st_d = os.lstat(debug_log_path)
+                if not stat.S_ISLNK(st_d.st_mode) and stat.S_ISREG(st_d.st_mode):
+                    with open(debug_log_path, "a", encoding="utf-8") as df:
+                        df.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {safe_msg}\n")
+                    os.chmod(debug_log_path, 0o600)
+
+    parser = _TriStreamArgumentParser(description="Benchmark unassisted AI memory vs. agent-memory MCP across storage media.")
+    parser.add_argument("--version", "-v", action="version", version=f"benchmark_comparison {VERSION}")
+    parser.add_argument("-n", "--count", type=int, default=100, help="Number of test iterations (default: 100)")
+    parser.add_argument("--json", action="store_true", help="Output raw JSON results")
+    parser.add_argument("--dry-run", action="store_true", help="Validate benchmark configuration without writing benchmark files")
+    parser.add_argument("--validate-args", action="store_true", help="Validate CLI arguments and exit")
+    parser.add_argument("--log-dir", type=str, default="", help="Optional directory for Tri-Stream telemetry (results.json and debug.log)")
+
+    try:
+        args = parser.parse_args()
+        if args.count <= 0:
+            raise ValueError("--count must be a positive integer greater than 0")
+        if args.log_dir and not results_json_path:
+            debug_log_path, results_json_path = _validate_and_init_log_dir(os.path.expanduser(args.log_dir.strip()), am_mod, home_dir)
+    except ValueError as exc:
+        _log_debug(f"[!] Argument error: {exc}")
+        _write_tri_stream_results(
+            results_json_path,
+            exit_code=2,
+            dry_run=False,
+            summary=f"Argument validation error: {exc}",
+            errors=[{"code": "INVALID_ARGS", "message": str(exc)}],
+            data={},
+            start_ts=start_ts,
+            am_mod=am_mod,
+        )
+        sys.exit(2)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.validate_args:
+        summary_msg = f"Validated benchmark arguments (count={args.count}, dry_run={args.dry_run})."
+        _log_debug(summary_msg)
+        _write_tri_stream_results(
+            results_json_path,
+            exit_code=0,
+            dry_run=bool(args.dry_run),
+            summary=summary_msg,
+            errors=[],
+            data={"count": args.count, "results": []},
+            start_ts=start_ts,
+            am_mod=am_mod,
+        )
+        if args.json:
+            print(json.dumps({"status": "success", "count": args.count, "dry_run": bool(args.dry_run)}, indent=2))
+        else:
+            print(summary_msg)
+        return
 
     results: list[dict[str, Any]] = []
+    exit_code = 0
+    summary_str = ""
+    err_list: list[dict[str, str]] = []
+    dry_run_flag = bool(args.dry_run)
     try:
-        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        bin_path = os.path.join(repo_dir, "bin", "agent-memory")
-        if not os.path.exists(bin_path):
-            bin_path = os.path.expanduser("~/.local/bin/agent-memory")
-
-        try:
-            import pwd
-            username = pwd.getpwuid(os.geteuid()).pw_name
-            home_dir = pwd.getpwuid(os.geteuid()).pw_dir
-        except (KeyError, OSError):
-            import getpass
-            username = os.environ.get("USER") or getpass.getuser()
-            home_dir = os.path.expanduser("~")
-
         optane_user_dir = f"/mnt/optane/{username}"
-        has_optane = os.path.exists(optane_user_dir)
+        has_optane = bool(am_mod._has_usable_user_optane_dir()) if (am_mod is not None and hasattr(am_mod, "_has_usable_user_optane_dir")) else False
+        flash_base_dir = tempfile.gettempdir()
 
-        flash_label = detect_storage_label(home_dir, "Standard Local Storage")
+        flash_label = detect_storage_label(flash_base_dir, "Standard Local Storage")
         optane_label = detect_storage_label(optane_user_dir, "Dedicated Optane Volume")
+
+        if dry_run_flag:
+            summary_str = f"Dry-run validated benchmark tiers (flash={flash_label}, optane_available={has_optane}, count={args.count})."
+            _log_debug(summary_str)
+            if args.json:
+                print(json.dumps([], indent=2))
+            else:
+                print(summary_str)
+            return
 
         def _run_storage_tier(base_dir: str, label: str, allow_non_optane: bool, db_prefix: str) -> None:
             """Runs flat-file and SQLite MCP benchmarks inside a temporary directory on a target storage tier so media comparisons execute identically, preventing divergent benchmark harness setup."""
@@ -484,7 +770,7 @@ def main() -> None:
                     )
 
         _log_debug(f"[*] Running benchmarks on standard local storage ({flash_label})...")
-        _run_storage_tier(home_dir, flash_label, allow_non_optane=True, db_prefix="bench_flash")
+        _run_storage_tier(flash_base_dir, flash_label, allow_non_optane=True, db_prefix="bench_flash")
 
         if has_optane:
             _log_debug(f"[*] Running benchmarks on dedicated Optane media ({optane_label})...")
@@ -514,26 +800,40 @@ def main() -> None:
         for idx, r in enumerate(results, 1):
             r["rank"] = idx
 
-        _write_results_json({"status": "ok", "count": args.count, "results": results})
+        summary_str = f"Completed {len(results)} benchmark pattern evaluations ({args.count} iterations each)."
 
         if args.json:
             print(json.dumps(results, indent=2))
         else:
             print_markdown_comparison(results, args.count, optane_label=optane_label, flash_label=flash_label)
     except BaseException as exc:
-        err_msg = f"Interrupted ({exc})" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else str(exc)
-        _log_debug(f"[!] Benchmark execution failed: {err_msg}")
-        try:
-            _write_results_json({"status": "error", "error": err_msg, "count": args.count, "results": results})
-        except OSError:
-            pass
+        if isinstance(exc, SystemExit):
+            exit_code = int(exc.code) if (isinstance(exc.code, int) and 1 <= exc.code <= 255) else (0 if exc.code in (0, None) else 1)
+        elif isinstance(exc, KeyboardInterrupt):
+            exit_code = 130
+        else:
+            exit_code = 1
+        if exit_code != 0:
+            err_msg = f"Interrupted (exit {exit_code})" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else str(exc)
+            summary_str = f"Benchmark execution failed: {err_msg}"
+            err_list = [{"code": "BENCHMARK_ABORTED" if exit_code in (130, 143) else "BENCHMARK_ERROR", "message": err_msg}]
+            _log_debug(f"[!] {summary_str}")
         if isinstance(exc, SystemExit):
             raise
-        if isinstance(exc, KeyboardInterrupt):
-            sys.exit(130)
-        sys.exit(1)
+        sys.exit(exit_code)
+    finally:
+        with contextlib.suppress(OSError):
+            _write_tri_stream_results(
+                results_json_path,
+                exit_code=exit_code,
+                dry_run=dry_run_flag,
+                summary=summary_str or "Benchmark completed.",
+                errors=err_list,
+                data={"count": args.count, "results": results},
+                start_ts=start_ts,
+                am_mod=am_mod,
+            )
 
 
 if __name__ == "__main__":
     main()
-

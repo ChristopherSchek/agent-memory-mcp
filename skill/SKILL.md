@@ -1,6 +1,6 @@
 ---
 name: agent-memory
-description: Persistent per-user memory (facts, decisions, invariants, preferences, and an entity graph) shared across all of this user's agent sessions, stored on a dedicated fast volume. Use at the start of a task to recall prior context about a project, service, repo, or host, when the user says "remember", "recall", "what did we decide", or "why did we configure", and after settling a decision or root cause worth keeping.
+description: Provides persistent per-user semantic memory (facts, decisions, invariants, preferences, and an entity graph) on a dedicated fast volume so agent sessions recall prior architectural context at task kickoff and record verified decisions or root causes, preventing cross-session context loss or duplicate discovery.
 ---
 
 # Skill: agent-memory (Persistent Semantic Memory & Knowledge Graph)

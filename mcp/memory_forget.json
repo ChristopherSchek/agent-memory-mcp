@@ -1,6 +1,6 @@
 {
   "name": "memory_forget",
-  "description": "Delete stored memory. Requires exactly one mode: observation_id (single fact), entity (entity with all facts and relations), or source+target (relation edge(s)).",
+  "description": "Deletes stored memory using exactly one target mode (observation_id for a single fact, entity for an entity and all attached facts/relations, or source+target for relation edges) and scrubs deleted storage pages so obsolete or erroneous records are purged, preventing stale or sensitive data retention.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -8,31 +8,31 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
-        "description": "Delete this single fact by ID."
+        "description": "Specifies the unique observation ID to delete in single-fact mode so the targeted observation is removed from SQLite and FTS5 indexes, preventing stale fact retention."
       },
       "entity": {
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
-        "description": "Delete this entity and everything attached to it."
+        "description": "Specifies the entity name to cascade-delete along with all of its observations and relations so decommissioned nodes are purged completely, preventing orphaned graph records."
       },
       "source": {
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
-        "description": "Relation source (use with target)."
+        "description": "Specifies the source entity name when deleting directed relation edges (used together with 'target') so edge removal is scoped to the exact origin node, preventing unintended edge deletion."
       },
       "target": {
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
-        "description": "Relation target (use with source)."
+        "description": "Specifies the target entity name when deleting directed relation edges (used together with 'source') so edge removal is scoped to the exact destination node, preventing unintended edge deletion."
       },
       "relation_type": {
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
-        "description": "Only delete edges of this type (default: all types between source and target)."
+        "description": "Restricts relation edge deletion between 'source' and 'target' to a single snake_case verb (deleting all edge types between the pair when omitted) so other relationships between the same entities remain intact, preventing over-broad edge pruning."
       }
     },
     "required": [],

@@ -1,6 +1,6 @@
 {
   "name": "memory_record",
-  "description": "Store one durable fact (decision, invariant, preference, architecture note, or debug finding), optionally attached to a named entity. Returns observation_id. If that entity already has the identical fact, returns the existing one with status=exists. Record clinical 7-bit ASCII technical prose only, with zero stage directions or conversational flourishes.",
+  "description": "Stores one durable fact (decision, invariant, preference, architecture note, or debug finding) optionally attached to a named entity and returns observation_id (or status=exists if identical) in clinical 7-bit ASCII prose so cross-session knowledge is persisted deterministically, preventing duplicate facts, stage directions, or context loss.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -8,13 +8,13 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 8000,
-        "description": "The fact to remember, as one self-contained sentence or short paragraph."
+        "description": "Specifies the self-contained fact statement (1-8000 characters) in clinical 7-bit ASCII prose so historical observations remain unambiguous across sessions, preventing truncated or context-free notes."
       },
       "entity": {
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
-        "description": "Entity this fact is about (e.g. a service, repo, or host name). Created if missing, matched case-insensitively."
+        "description": "Specifies the target entity name (service, repo, pattern, concept, operator, or host) matched case-insensitively and created if missing so facts attach to the knowledge graph, preventing orphaned entity references."
       },
       "entity_type": {
         "type": "string",
@@ -26,13 +26,13 @@
           "operator",
           "host"
         ],
-        "description": "Entity type. Only applied when not 'concept', or omit to keep the existing type. (Requires 'entity' to be specified)."
+        "description": "Specifies the canonical entity classification (applied when not 'concept', or omitted to preserve the existing type when 'entity' is specified) so graph nodes retain accurate taxonomy, preventing accidental type downgrades."
       },
       "summary": {
         "type": "string",
         "minLength": 1,
         "maxLength": 2000,
-        "description": "One-line description of the entity (replaces the previous summary). (Requires 'entity' to be specified)."
+        "description": "Specifies a one-line description of the entity (1-2000 characters, replacing the previous summary when 'entity' is specified) so entity recall returns a concise overview, preventing stale or missing entity summaries."
       },
       "category": {
         "type": "string",
@@ -44,7 +44,7 @@
           "debug_finding"
         ],
         "default": "architecture",
-        "description": "Kind of fact."
+        "description": "Specifies the observation classification category so stored facts can be filtered by engineering concern, preventing unstructured observation sprawl."
       },
       "tags": {
         "type": "array",
@@ -54,25 +54,25 @@
           "maxLength": 100
         },
         "maxItems": 50,
-        "description": "Keyword tags."
+        "description": "Specifies up to 50 non-empty keyword tags (1-100 characters each) so full-text and tag-filtered searches match related facts, preventing unindexed observations."
       },
       "confidence": {
         "type": "number",
         "minimum": 0,
         "maximum": 1,
         "default": 1,
-        "description": "How certain the fact is."
+        "description": "Specifies the certainty score between 0.0 and 1.0 (default 1.0) so consumers can weight verified invariants above tentative findings, preventing uncalibrated confidence assumptions."
       },
       "session_id": {
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
         "default": "default",
-        "description": "Free-form label (e.g. task or project). A filter label only, not an isolation boundary."
+        "description": "Specifies a free-form session or task filter label (default 'default', not an isolation boundary) so observations can be scoped by workflow, preventing untraceable session provenance."
       },
       "attributes": {
         "type": "object",
-        "description": "Entity key/values (max 4000 serialized characters), merged with existing ones (JSON Merge Patch: a null value deletes that key). (Requires 'entity' to be specified)."
+        "description": "Specifies an entity key/value map (up to 4000 serialized characters, merged via RFC 7396 JSON Merge Patch where null deletes a key when 'entity' is specified) so structured entity metadata stays current, preventing full-object overwrite loss."
       }
     },
     "required": [

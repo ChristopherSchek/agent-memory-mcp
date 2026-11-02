@@ -1,6 +1,6 @@
 {
   "name": "memory_relate",
-  "description": "Create or update a directed edge 'source relation_type target' between two distinct entities (created if missing). Use clinical technical entity names, relation types, and metadata only.",
+  "description": "Creates or updates a directed graph edge ('source relation_type target') between two distinct entities (auto-creating missing entities in clinical 7-bit ASCII) so system topology is modeled explicitly, preventing undocumented service or repository dependencies.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -8,30 +8,30 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
-        "description": "Source entity name."
+        "description": "Specifies the source entity name (1-200 characters, matched case-insensitively) so the outgoing graph edge originates from a canonical node, preventing dangling edge sources."
       },
       "target": {
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
-        "description": "Target entity name (must differ from source)."
+        "description": "Specifies the target entity name (1-200 characters, distinct from 'source') so the directed graph edge terminates at a valid destination node, preventing self-referential loops."
       },
       "relation_type": {
         "type": "string",
         "minLength": 1,
         "maxLength": 200,
         "default": "references",
-        "description": "Forward verb in snake_case, e.g. depends_on, hosted_on, deploys_to, provisions, governs, references, synchronizes_with, stores_data_for, authenticates_against."
+        "description": "Specifies the forward verb in snake_case (such as depends_on, hosted_on, deploys_to, provisions, governs, references, synchronizes_with, stores_data_for, or authenticates_against) so edge semantics stay uniform, preventing inconsistent relation predicates."
       },
       "weight": {
         "type": "number",
         "minimum": 0,
         "maximum": 100,
-        "description": "Edge strength, 1.0 on create, unchanged on update if omitted."
+        "description": "Specifies the numeric edge strength between 0.0 and 100.0 (1.0 on create, preserved on update when omitted) so relation priority is quantifiable, preventing unweighted edge ambiguity."
       },
       "metadata": {
         "type": "object",
-        "description": "Edge key/values (max 4000 serialized characters), merged with existing ones (null deletes a key)."
+        "description": "Specifies an edge key/value map (up to 4000 serialized characters, merged via RFC 7396 JSON Merge Patch where null deletes a key) so relationship attributes are maintained incrementally, preventing metadata overwrite loss."
       }
     },
     "required": [
