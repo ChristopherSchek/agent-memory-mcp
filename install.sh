@@ -18,6 +18,7 @@ VALIDATE_ARGS=0
 JSON_OUT=0
 LOG_DIR=""
 LOG_DIR_VALIDATED=0
+VALIDATED_LOG_DIR=""
 RESULTS_WRITTEN=0
 DB_PATH_RESOLVED=""
 TMP_BIN=""
@@ -123,7 +124,7 @@ rc = parsed_rc if 0 <= parsed_rc <= 255 else (1 if parsed_rc else 0)
 status = "success" if rc == 0 else "error"
 if os.path.lexists(dst):
     st = os.lstat(dst)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
         sys.exit(1)
 mod = None
 if os.path.isfile(bundle_bin):
@@ -253,7 +254,7 @@ loader = importlib.machinery.SourceFileLoader("am_pre_log", bundle_bin)
 spec = importlib.util.spec_from_loader("am_pre_log", loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
-unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)}
+unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), os.path.join("/", "var", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)}
 abs_log = os.path.abspath(log_dir)
 real_log = os.path.realpath(abs_log)
 if abs_log in unsafe_top or real_log in unsafe_top:
@@ -278,7 +279,7 @@ for leaf in ("debug.log", "results.json"):
     lp = os.path.join(abs_log, leaf)
     if os.path.lexists(lp):
         st_l = os.lstat(lp)
-        if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode):
+        if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode) or st_l.st_nlink != 1:
             sys.exit(1)
 PY
         LOG_DIR="${raw_log}"
@@ -288,6 +289,7 @@ PY
             [ -f "${LOG_DIR}/debug.log" ] || : > "${LOG_DIR}/debug.log"
             chmod 600 "${LOG_DIR}/debug.log"
             LOG_DIR_VALIDATED=1
+            VALIDATED_LOG_DIR="${LOG_DIR}"
         fi
     fi
 }
@@ -394,7 +396,7 @@ loader = importlib.machinery.SourceFileLoader("am_path_guard", bundle_bin)
 spec = importlib.util.spec_from_loader("am_path_guard", loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
-unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)}
+unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), os.path.join("/", "var", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)}
 for label, val in (
     ("LOG_DIR", log_dir),
     ("BIN_DIR", bin_dir),
@@ -437,14 +439,16 @@ if log_dir:
         lp = os.path.join(abs_log, leaf)
         if os.path.lexists(lp):
             st_l = os.lstat(lp)
-            if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode):
+            if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode) or st_l.st_nlink != 1:
                 sys.exit(f"Refusing symlink or non-regular file in LOG_DIR: '{lp}'.")
 PY
 }
 
 if ! VALIDATE_ERR="$(validate_install_paths 2>&1)"; then
-    LOG_DIR=""
-    LOG_DIR_VALIDATED=0
+    if [ "${LOG_DIR_VALIDATED}" -ne 1 ] || [ "${LOG_DIR}" != "${VALIDATED_LOG_DIR:-}" ]; then
+        LOG_DIR=""
+        LOG_DIR_VALIDATED=0
+    fi
     arg_die "${VALIDATE_ERR}"
 fi
 

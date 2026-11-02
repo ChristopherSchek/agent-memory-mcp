@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Christopher Schek
+# SPDX-License-Identifier: GPL-3.0-only
 """Benchmarks unassisted flat-file memory patterns against the SQLite WAL + FTS5 agent-memory engine across storage media so commit latency and context scaling are quantified, preventing unmeasured persistence patterns from hiding O(N) context token blowup, O(N^2) write amplification, and fsync stalls."""
 
 import argparse
@@ -601,7 +603,7 @@ def _write_tri_stream_results(
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if os.path.lexists(res_path):
             st_dst = os.lstat(res_path)
-            if stat.S_ISLNK(st_dst.st_mode) or not stat.S_ISREG(st_dst.st_mode):
+            if stat.S_ISLNK(st_dst.st_mode) or not stat.S_ISREG(st_dst.st_mode) or st_dst.st_nlink != 1:
                 raise OSError(f"Refusing to overwrite non-regular results target: {res_path}")
         if os.path.lexists(tmp_path):
             os.unlink(tmp_path)
@@ -634,205 +636,225 @@ def main() -> None:
     """Parses CLI arguments and executes comparative memory benchmarks across local and dedicated storage tiers so latency and token scaling are reported deterministically, preventing unverified storage configurations from masking I/O bottlenecks."""
     start_ts = time.perf_counter()
     os.umask(0o077)
-    with contextlib.suppress(ValueError, AttributeError):
-        signal.signal(signal.SIGTERM, lambda s, f: sys.exit(143))
-        signal.signal(signal.SIGINT, lambda s, f: sys.exit(130))
-
-    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    bin_path = os.path.join(repo_dir, "bin", "agent-memory")
-    if not os.path.exists(bin_path):
-        bin_path = os.path.expanduser("~/.local/bin/agent-memory")
-
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+    prev_sigint = signal.getsignal(signal.SIGINT)
     try:
-        import pwd
-        username = pwd.getpwuid(os.geteuid()).pw_name
-        home_dir = pwd.getpwuid(os.geteuid()).pw_dir
-    except (KeyError, OSError):
-        import getpass
-        username = os.environ.get("USER") or getpass.getuser()
-        home_dir = os.path.expanduser("~")
+        with contextlib.suppress(ValueError, AttributeError):
+            signal.signal(signal.SIGTERM, lambda s, f: sys.exit(143))
+            signal.signal(signal.SIGINT, lambda s, f: sys.exit(130))
 
-    am_mod: Any = None
-    with contextlib.suppress(Exception):
-        if os.path.isfile(bin_path):
-            am_mod = _load_agent_memory_mod(bin_path)
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        bin_path = os.path.join(repo_dir, "bin", "agent-memory")
+        if not os.path.exists(bin_path):
+            bin_path = os.path.expanduser("~/.local/bin/agent-memory")
 
-    pre_log_dir = _pre_extract_log_dir(sys.argv[1:])
-    debug_log_path = ""
-    results_json_path = ""
-    if pre_log_dir:
         try:
-            debug_log_path, results_json_path = _validate_and_init_log_dir(pre_log_dir, am_mod, home_dir)
-        except (ValueError, RuntimeError, OSError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(2)
+            import pwd
+            username = pwd.getpwuid(os.geteuid()).pw_name
+            home_dir = pwd.getpwuid(os.geteuid()).pw_dir
+        except (KeyError, OSError):
+            import getpass
+            username = os.environ.get("USER") or getpass.getuser()
+            home_dir = os.path.expanduser("~")
 
-    def _log_debug(msg: str) -> None:
-        """Emits timestamped, secret-redacted diagnostic progress to stderr and debug.log so execution telemetry is preserved safely, preventing diagnostic output from polluting stdout or leaking credentials."""
-        safe_msg = str(_redact_secrets_obj(msg, am_mod))
-        print(safe_msg, file=sys.stderr)
-        if debug_log_path:
-            with contextlib.suppress(OSError):
-                st_d = os.lstat(debug_log_path)
-                if not stat.S_ISLNK(st_d.st_mode) and stat.S_ISREG(st_d.st_mode):
-                    with open(debug_log_path, "a", encoding="utf-8") as df:
-                        df.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {safe_msg}\n")
-                    os.chmod(debug_log_path, 0o600)
+        am_mod: Any = None
+        with contextlib.suppress(Exception):
+            if os.path.isfile(bin_path):
+                am_mod = _load_agent_memory_mod(bin_path)
 
-    parser = _TriStreamArgumentParser(description="Benchmark unassisted AI memory vs. agent-memory MCP across storage media.")
-    parser.add_argument("--version", "-v", action="version", version=f"benchmark_comparison {VERSION}")
-    parser.add_argument("-n", "--count", type=int, default=100, help="Number of test iterations (default: 100)")
-    parser.add_argument("--json", action="store_true", help="Output raw JSON results")
-    parser.add_argument("--dry-run", action="store_true", help="Validate benchmark configuration without writing benchmark files")
-    parser.add_argument("--validate-args", action="store_true", help="Validate CLI arguments and exit")
-    parser.add_argument("--log-dir", type=str, default="", help="Optional directory for Tri-Stream telemetry (results.json and debug.log)")
+        pre_log_dir = _pre_extract_log_dir(sys.argv[1:])
+        debug_log_path = ""
+        results_json_path = ""
+        if pre_log_dir:
+            try:
+                debug_log_path, results_json_path = _validate_and_init_log_dir(pre_log_dir, am_mod, home_dir)
+            except (ValueError, RuntimeError, OSError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(2)
 
-    try:
-        args = parser.parse_args()
-        if args.count <= 0:
-            raise ValueError("--count must be a positive integer greater than 0")
-        if args.log_dir and not results_json_path:
-            debug_log_path, results_json_path = _validate_and_init_log_dir(os.path.expanduser(args.log_dir.strip()), am_mod, home_dir)
-    except ValueError as exc:
-        _log_debug(f"[!] Argument error: {exc}")
-        _write_tri_stream_results(
-            results_json_path,
-            exit_code=2,
-            dry_run=False,
-            summary=f"Argument validation error: {exc}",
-            errors=[{"code": "INVALID_ARGS", "message": str(exc)}],
-            data={},
-            start_ts=start_ts,
-            am_mod=am_mod,
-        )
-        sys.exit(2)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(2)
-
-    if args.validate_args:
-        summary_msg = f"Validated benchmark arguments (count={args.count}, dry_run={args.dry_run})."
-        _log_debug(summary_msg)
-        _write_tri_stream_results(
-            results_json_path,
-            exit_code=0,
-            dry_run=bool(args.dry_run),
-            summary=summary_msg,
-            errors=[],
-            data={"count": args.count, "results": []},
-            start_ts=start_ts,
-            am_mod=am_mod,
-        )
-        if args.json:
-            print(json.dumps({"status": "success", "count": args.count, "dry_run": bool(args.dry_run)}, indent=2))
-        else:
-            print(summary_msg)
-        return
-
-    results: list[dict[str, Any]] = []
-    exit_code = 0
-    summary_str = ""
-    err_list: list[dict[str, str]] = []
-    dry_run_flag = bool(args.dry_run)
-    try:
-        optane_user_dir = f"/mnt/optane/{username}"
-        has_optane = bool(am_mod._has_usable_user_optane_dir()) if (am_mod is not None and hasattr(am_mod, "_has_usable_user_optane_dir")) else False
-        flash_base_dir = tempfile.gettempdir()
-
-        flash_label = detect_storage_label(flash_base_dir, "Standard Local Storage")
-        optane_label = detect_storage_label(optane_user_dir, "Dedicated Optane Volume")
-
-        if dry_run_flag:
-            summary_str = f"Dry-run validated benchmark tiers (flash={flash_label}, optane_available={has_optane}, count={args.count})."
-            _log_debug(summary_str)
-            if args.json:
-                print(json.dumps([], indent=2))
-            else:
-                print(summary_str)
-            return
-
-        def _run_storage_tier(base_dir: str, label: str, allow_non_optane: bool, db_prefix: str) -> None:
-            """Runs flat-file and SQLite MCP benchmarks inside a temporary directory on a target storage tier so media comparisons execute identically, preventing divergent benchmark harness setup."""
-            with tempfile.TemporaryDirectory(dir=base_dir, prefix=".am_bench_") as td:
-                results.append(benchmark_unassisted_markdown(td, args.count, media_name=label))
-                results.append(benchmark_unassisted_json(td, args.count, media_name=label))
-                for sync_mode, suffix in (("FULL", "full"), ("NORMAL", "norm")):
-                    db_file = os.path.join(td, f"{db_prefix}_{suffix}.db")
-                    results.append(
-                        benchmark_mcp_engine(
-                            bin_path,
-                            db_file,
-                            allow_non_optane=allow_non_optane,
-                            count=args.count,
-                            media_name=label,
-                            sync_override=sync_mode,
+        def _log_debug(msg: str) -> None:
+            """Emits timestamped, secret-redacted diagnostic progress to stderr and debug.log so execution telemetry is preserved safely, preventing diagnostic output from polluting stdout or leaking credentials."""
+            safe_msg = str(_redact_secrets_obj(msg, am_mod))
+            print(safe_msg, file=sys.stderr)
+            if debug_log_path:
+                with contextlib.suppress(OSError):
+                    st_d = os.lstat(debug_log_path)
+                    if not stat.S_ISLNK(st_d.st_mode) and stat.S_ISREG(st_d.st_mode) and st_d.st_nlink == 1:
+                        fd_d = os.open(
+                            debug_log_path,
+                            os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                            0o600,
                         )
-                    )
+                        try:
+                            st_fd = os.fstat(fd_d)
+                            if stat.S_ISREG(st_fd.st_mode) and st_fd.st_nlink == 1:
+                                os.fchmod(fd_d, 0o600)
+                                line_bytes = f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {safe_msg}\n".encode()
+                                os.write(fd_d, line_bytes)
+                        finally:
+                            os.close(fd_d)
 
-        _log_debug(f"[*] Running benchmarks on standard local storage ({flash_label})...")
-        _run_storage_tier(flash_base_dir, flash_label, allow_non_optane=True, db_prefix="bench_flash")
+        parser = _TriStreamArgumentParser(description="Benchmark unassisted AI memory vs. agent-memory MCP across storage media.")
+        parser.add_argument("--version", "-v", action="version", version=f"benchmark_comparison {VERSION}")
+        parser.add_argument("-n", "--count", type=int, default=100, help="Number of test iterations (default: 100)")
+        parser.add_argument("--json", action="store_true", help="Output raw JSON results")
+        parser.add_argument("--dry-run", action="store_true", help="Validate benchmark configuration without writing benchmark files")
+        parser.add_argument("--validate-args", action="store_true", help="Validate CLI arguments and exit")
+        parser.add_argument("--log-dir", type=str, default=None, help="Optional directory for Tri-Stream telemetry (results.json and debug.log)")
 
-        if has_optane:
-            _log_debug(f"[*] Running benchmarks on dedicated Optane media ({optane_label})...")
-            _run_storage_tier(optane_user_dir, optane_label, allow_non_optane=False, db_prefix="bench_optane")
-
-        def _rank(r: dict[str, Any]) -> int:
-            """Computes a deterministic sort rank for benchmark entries so results order from fastest to slowest, preventing nondeterministic row ordering."""
-            p = r.get("pattern", "")
-            m = r.get("media", "")
-            is_optane = m == optane_label or "Optane" in m
-            if "agent-memory" in p:
-                if "FULL" in p and is_optane:
-                    return 1
-                elif "NORMAL" in p and is_optane:
-                    return 2
-                elif "NORMAL" in p and not is_optane:
-                    return 3
-                elif "FULL" in p and not is_optane:
-                    return 4
-            elif "MEMORY.md" in p or "Markdown" in p:
-                return 5 if is_optane else 6
-            elif "notes.json" in p or "JSON" in p:
-                return 7 if is_optane else 8
-            return 9
-
-        results.sort(key=_rank)
-        for idx, r in enumerate(results, 1):
-            r["rank"] = idx
-
-        summary_str = f"Completed {len(results)} benchmark pattern evaluations ({args.count} iterations each)."
-
-        if args.json:
-            print(json.dumps(results, indent=2))
-        else:
-            print_markdown_comparison(results, args.count, optane_label=optane_label, flash_label=flash_label)
-    except BaseException as exc:
-        if isinstance(exc, SystemExit):
-            exit_code = int(exc.code) if (isinstance(exc.code, int) and 1 <= exc.code <= 255) else (0 if exc.code in (0, None) else 1)
-        elif isinstance(exc, KeyboardInterrupt):
-            exit_code = 130
-        else:
-            exit_code = 1
-        if exit_code != 0:
-            err_msg = f"Interrupted (exit {exit_code})" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else str(exc)
-            summary_str = f"Benchmark execution failed: {err_msg}"
-            err_list = [{"code": "BENCHMARK_ABORTED" if exit_code in (130, 143) else "BENCHMARK_ERROR", "message": err_msg}]
-            _log_debug(f"[!] {summary_str}")
-        if isinstance(exc, SystemExit):
-            raise
-        sys.exit(exit_code)
-    finally:
-        with contextlib.suppress(OSError):
+        try:
+            args = parser.parse_args()
+            if args.count <= 0:
+                raise ValueError("--count must be a positive integer greater than 0")
+            if args.log_dir is not None:
+                if not args.log_dir.strip():
+                    raise ValueError("--log-dir requires a non-empty directory path")
+                if not results_json_path:
+                    debug_log_path, results_json_path = _validate_and_init_log_dir(os.path.expanduser(args.log_dir.strip()), am_mod, home_dir)
+        except ValueError as exc:
+            _log_debug(f"[!] Argument error: {exc}")
             _write_tri_stream_results(
                 results_json_path,
-                exit_code=exit_code,
-                dry_run=dry_run_flag,
-                summary=summary_str or "Benchmark completed.",
-                errors=err_list,
-                data={"count": args.count, "results": results},
+                exit_code=2,
+                dry_run=False,
+                summary=f"Argument validation error: {exc}",
+                errors=[{"code": "INVALID_ARGS", "message": str(exc)}],
+                data={},
                 start_ts=start_ts,
                 am_mod=am_mod,
             )
+            sys.exit(2)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+        if args.validate_args:
+            summary_msg = f"Validated benchmark arguments (count={args.count}, dry_run={args.dry_run})."
+            _log_debug(summary_msg)
+            _write_tri_stream_results(
+                results_json_path,
+                exit_code=0,
+                dry_run=bool(args.dry_run),
+                summary=summary_msg,
+                errors=[],
+                data={"count": args.count, "results": []},
+                start_ts=start_ts,
+                am_mod=am_mod,
+            )
+            if args.json:
+                print(json.dumps({"status": "success", "count": args.count, "dry_run": bool(args.dry_run)}, indent=2))
+            else:
+                print(summary_msg)
+            return
+
+        results: list[dict[str, Any]] = []
+        exit_code = 0
+        summary_str = ""
+        err_list: list[dict[str, str]] = []
+        dry_run_flag = bool(args.dry_run)
+        try:
+            optane_user_dir = f"/mnt/optane/{username}"
+            has_optane = bool(am_mod._has_usable_user_optane_dir()) if (am_mod is not None and hasattr(am_mod, "_has_usable_user_optane_dir")) else False
+            flash_base_dir = tempfile.gettempdir()
+
+            flash_label = detect_storage_label(flash_base_dir, "Standard Local Storage")
+            optane_label = detect_storage_label(optane_user_dir, "Dedicated Optane Volume")
+
+            if dry_run_flag:
+                summary_str = f"Dry-run validated benchmark tiers (flash={flash_label}, optane_available={has_optane}, count={args.count})."
+                _log_debug(summary_str)
+                if args.json:
+                    print(json.dumps([], indent=2))
+                else:
+                    print(summary_str)
+                return
+
+            def _run_storage_tier(base_dir: str, label: str, allow_non_optane: bool, db_prefix: str) -> None:
+                """Runs flat-file and SQLite MCP benchmarks inside a temporary directory on a target storage tier so media comparisons execute identically, preventing divergent benchmark harness setup."""
+                with tempfile.TemporaryDirectory(dir=base_dir, prefix=".am_bench_") as td:
+                    results.append(benchmark_unassisted_markdown(td, args.count, media_name=label))
+                    results.append(benchmark_unassisted_json(td, args.count, media_name=label))
+                    for sync_mode, suffix in (("FULL", "full"), ("NORMAL", "norm")):
+                        db_file = os.path.join(td, f"{db_prefix}_{suffix}.db")
+                        results.append(
+                            benchmark_mcp_engine(
+                                bin_path,
+                                db_file,
+                                allow_non_optane=allow_non_optane,
+                                count=args.count,
+                                media_name=label,
+                                sync_override=sync_mode,
+                            )
+                        )
+
+            _log_debug(f"[*] Running benchmarks on standard local storage ({flash_label})...")
+            _run_storage_tier(flash_base_dir, flash_label, allow_non_optane=True, db_prefix="bench_flash")
+
+            if has_optane:
+                _log_debug(f"[*] Running benchmarks on dedicated Optane media ({optane_label})...")
+                _run_storage_tier(optane_user_dir, optane_label, allow_non_optane=False, db_prefix="bench_optane")
+
+            def _rank(r: dict[str, Any]) -> int:
+                """Computes a deterministic sort rank for benchmark entries so results order from fastest to slowest, preventing nondeterministic row ordering."""
+                p = r.get("pattern", "")
+                m = r.get("media", "")
+                is_optane = m == optane_label or "Optane" in m
+                if "agent-memory" in p:
+                    if "FULL" in p and is_optane:
+                        return 1
+                    elif "NORMAL" in p and is_optane:
+                        return 2
+                    elif "NORMAL" in p and not is_optane:
+                        return 3
+                    elif "FULL" in p and not is_optane:
+                        return 4
+                elif "MEMORY.md" in p or "Markdown" in p:
+                    return 5 if is_optane else 6
+                elif "notes.json" in p or "JSON" in p:
+                    return 7 if is_optane else 8
+                return 9
+
+            results.sort(key=_rank)
+            for idx, r in enumerate(results, 1):
+                r["rank"] = idx
+
+            summary_str = f"Completed {len(results)} benchmark pattern evaluations ({args.count} iterations each)."
+
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                print_markdown_comparison(results, args.count, optane_label=optane_label, flash_label=flash_label)
+        except BaseException as exc:
+            if isinstance(exc, SystemExit):
+                exit_code = int(exc.code) if (isinstance(exc.code, int) and 1 <= exc.code <= 255) else (0 if exc.code in (0, None) else 1)
+            elif isinstance(exc, KeyboardInterrupt):
+                exit_code = 130
+            else:
+                exit_code = 1
+            if exit_code != 0:
+                err_msg = f"Interrupted (exit {exit_code})" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else str(exc)
+                summary_str = f"Benchmark execution failed: {err_msg}"
+                err_list = [{"code": "BENCHMARK_ABORTED" if exit_code in (130, 143) else "BENCHMARK_ERROR", "message": err_msg}]
+                _log_debug(f"[!] {summary_str}")
+            if isinstance(exc, SystemExit):
+                raise
+            sys.exit(exit_code)
+        finally:
+            with contextlib.suppress(OSError):
+                _write_tri_stream_results(
+                    results_json_path,
+                    exit_code=exit_code,
+                    dry_run=dry_run_flag,
+                    summary=summary_str or "Benchmark completed.",
+                    errors=err_list,
+                    data={"count": args.count, "results": results},
+                    start_ts=start_ts,
+                    am_mod=am_mod,
+                )
+    finally:
+        with contextlib.suppress(ValueError, AttributeError):
+            signal.signal(signal.SIGTERM, prev_sigterm)
+            signal.signal(signal.SIGINT, prev_sigint)
 
 
 if __name__ == "__main__":

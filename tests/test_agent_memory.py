@@ -542,6 +542,17 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm_zo:
             self.am.get_connection()
         self.assertIn("sidecar", str(cm_zo.exception))
+        doc_buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", doc_buf), self.assertRaises(SystemExit) as cm_doc_zo:
+            self.am.run_doctor()
+        self.assertEqual(cm_doc_zo.exception.code, 1)
+        self.assertIn("orphaned sidecar", json.loads(doc_buf.getvalue())["permissions"])
+        os.unlink(zero_orphan)
+        doc_buf_missing = io.StringIO()
+        with mock.patch.object(sys, "stdout", doc_buf_missing), self.assertRaises(SystemExit) as cm_doc_miss:
+            self.am.run_doctor()
+        self.assertEqual(cm_doc_miss.exception.code, 1)
+        self.assertIn("orphaned sidecar", json.loads(doc_buf_missing.getvalue())["permissions"])
 
         sym_target = os.path.join(self.tmpdir.name, "sym_subdir", "real.db")
         sym_link = os.path.join(self.tmpdir.name, "link.db")
@@ -802,10 +813,19 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         bench_spec.loader.exec_module(bench_mod)
 
         bench_log_dir = os.path.join(self.tmpdir.name, "bench_logs")
+        sig_before = signal.getsignal(signal.SIGINT)
         with mock.patch.object(sys, "argv", [bench_script, "--validate-args"]), mock.patch.object(
             sys, "stdout", io.StringIO()
         ), mock.patch.object(sys, "stderr", io.StringIO()):
             bench_mod.main()
+        self.assertEqual(signal.getsignal(signal.SIGINT), sig_before)
+
+        with mock.patch.object(sys, "argv", [bench_script, "--log-dir", ""]), mock.patch.object(
+            sys, "stdout", io.StringIO()
+        ), mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as cm_empty_log:
+                bench_mod.main()
+            self.assertEqual(cm_empty_log.exception.code, 2)
 
         with mock.patch.object(
             sys, "argv", [bench_script, "--dry-run", "--log-dir", bench_log_dir]
@@ -832,6 +852,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         install_script = str(repo_root / "install.sh")
         inst_log_dir = os.path.join(self.tmpdir.name, "install_logs")
         inst_err_dir = os.path.join(self.tmpdir.name, "install_err_logs")
+        inst_path_err_dir = os.path.join(self.tmpdir.name, "install_path_err_logs")
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
         try:
             file_actions = [
@@ -866,6 +887,20 @@ class TestAgentMemoryHermetic(unittest.TestCase):
                 file_actions=file_actions,
             )
             _, err_status = os.waitpid(pid_err, 0)
+            pid_path_err = os.posix_spawnp(
+                "bash",
+                [
+                    "bash",
+                    install_script,
+                    "--log-dir",
+                    inst_path_err_dir,
+                    "--db",
+                    "relative/path.db",
+                ],
+                os.environ,
+                file_actions=file_actions,
+            )
+            _, path_err_status = os.waitpid(pid_path_err, 0)
         finally:
             os.close(devnull_fd)
         self.assertEqual(os.waitstatus_to_exitcode(status_code), 0)
@@ -877,6 +912,10 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         err_res = json.loads(Path(inst_err_dir, "results.json").read_text(encoding="utf-8"))
         self.assertEqual(err_res["status"], "error")
         self.assertEqual(err_res["exit_code"], 2)
+        self.assertEqual(os.waitstatus_to_exitcode(path_err_status), 2)
+        path_err_res = json.loads(Path(inst_path_err_dir, "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(path_err_res["status"], "error")
+        self.assertEqual(path_err_res["exit_code"], 2)
 
 
 if __name__ == "__main__":

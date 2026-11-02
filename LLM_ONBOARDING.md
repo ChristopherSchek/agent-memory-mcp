@@ -35,13 +35,13 @@ Audits Python version, SQLite FTS5/JSON1 capabilities, and `/mnt/optane` mount a
    TARGET_USER="$(id -un)"
    PYTHON_VER="$(python3 -I -c $'import sys\nprint(f"{sys.version_info.major}.{sys.version_info.minor}")')"
    SQLITE_VER="$(python3 -I -c $'import sqlite3\nprint(sqlite3.sqlite_version)')"
-   SQLITE_OK="$(python3 -I -c $'import sqlite3\nprint("OK" if sqlite3.sqlite_version_info >= (3, 31, 0) else "OLD")')"
+   SQLITE_OK="$(python3 -I -c $'import sqlite3\nprint("OK" if sqlite3.sqlite_version_info >= (3, 35, 0) else "OLD")')"
    HAS_FTS5="$(python3 -I -c $'import sqlite3\nc = sqlite3.connect(":memory:")\nc.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nc.execute("SELECT json_patch(\'{}\', \'{}\')")\nprint("OK")' 2>/dev/null || echo "MISSING")"
    OPTANE_DIR_CHECK="$(ls -ld /mnt/optane /mnt/optane/${TARGET_USER} 2>&1 || true)"
 
    echo "USER: ${TARGET_USER}"
    echo "PYTHON: ${PYTHON_VER} (Required: >= 3.10)"
-   echo "SQLITE: ${SQLITE_VER} (${SQLITE_OK}, Required: >= 3.31)"
+   echo "SQLITE: ${SQLITE_VER} (${SQLITE_OK}, Required: >= 3.35)"
    echo "FTS5_AND_JSON1: ${HAS_FTS5} (Required: OK)"
    echo "OPTANE_CHECK: ${OPTANE_DIR_CHECK}"
    ```

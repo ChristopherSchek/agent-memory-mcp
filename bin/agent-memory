@@ -3573,7 +3573,6 @@ for _def in _CLI_SUBCMD_OPTS.values():
     _def["all_opts"] = _def["takes_val"] | _def["no_val"]
     _def["long_opts"] = sorted(o for o in _def["all_opts"] if o.startswith("--"))
 
-# Short options whose value is numeric and may be attached (e.g. -l5, -n200, -w2.5).
 _NUMERIC_SHORT_OPTS = {"-l", "-n", "-w"}
 
 def _normalize_cli_argv(argv: list[str]) -> list[str]:
@@ -3755,6 +3754,7 @@ def run_doctor(a: Any = None) -> None:
         except OSError as e:
             perm_issues.append(f"failed to lstat database path '{_RAW_DB_PATH}': {e}")
 
+    db_size = os.path.getsize(DB_PATH) if db_exists else None
     if db_exists:
         try:
             st_file = os.lstat(DB_PATH)
@@ -3771,12 +3771,20 @@ def run_doctor(a: Any = None) -> None:
         except OSError as e:
             perm_issues.append(f"failed to stat database file: {e}")
 
+    for base_p in dict.fromkeys((_RAW_DB_PATH, DB_PATH)):
         for ext in ("-wal", "-shm", "-journal"):
-            side = DB_PATH + ext
+            side = base_p + ext
             try:
                 st_side = os.lstat(side)
+                if not db_exists or db_size == 0:
+                    perm_issues.append(f"orphaned sidecar '{side}' exists without an initialized parent database file")
+                    continue
                 if stat.S_ISLNK(st_side.st_mode):
                     perm_issues.append(f"sidecar '{side}' is a symlink")
+                elif not stat.S_ISREG(st_side.st_mode):
+                    perm_issues.append(f"sidecar '{side}' is not a regular file")
+                elif st_side.st_nlink > 1:
+                    perm_issues.append(f"sidecar '{side}' has multiple hardlinks (st_nlink={st_side.st_nlink})")
                 if st_side.st_uid != euid:
                     perm_issues.append(f"sidecar '{side}' owned by uid {st_side.st_uid}")
                 if st_side.st_mode & 0o022:
@@ -3799,7 +3807,6 @@ def run_doctor(a: Any = None) -> None:
         rep_["permissions"] = "ok"
 
     rep_["db_exists"] = db_exists
-    db_size = os.path.getsize(DB_PATH) if db_exists else None
     if db_size is not None:
         rep_["db_bytes"] = db_size
 
