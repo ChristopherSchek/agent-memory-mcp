@@ -1,8 +1,8 @@
 {
   "version": "1.0.0",
   "tier": "standard",
-  "last_synced_commit": "890e561bd3edff949de5f6441c3d1c1763f3a08e",
-  "last_synced_at": "2026-11-02T17:39:44.997070+00:00",
+  "last_synced_commit": "a7e4c5c711a3dee4d803ae8a985f7856c5563467",
+  "last_synced_at": "2026-11-02T18:52:36.994043+00:00",
   "generator": "doc_manager.py v1.0.0",
   "project_name": "AgentMemoryMCP",
   "stack_signals": [
@@ -11,103 +11,68 @@
   "tracked_docs": {
     "docs/INDEX.md": {
       "concern": "index",
-      "last_updated_at": "2026-11-02T17:34:58.142953+00:00",
-      "sha256": "fab1e3e1548f64019a886b069ace068fd56992b1aa5284a0508f091a2f4c8074",
-      "last_synced_commit": "890e561bd3edff949de5f6441c3d1c1763f3a08e"
+      "last_updated_at": "2026-11-02T18:41:32.120604+00:00",
+      "sha256": "b60bad1dda6ce7d88ab292d7c9a7886d3a075847c440e6faedf4852d659815be",
+      "last_synced_commit": "a7e4c5c711a3dee4d803ae8a985f7856c5563467"
     },
     "docs/architecture.md": {
       "concern": "architecture",
-      "last_updated_at": "2026-11-02T17:39:44.997070+00:00",
-      "sha256": "67b8cf9098c1773807fab3d070c6c0387d68fa4fc24ebdd2ef327688f3389524",
-      "last_synced_commit": "890e561bd3edff949de5f6441c3d1c1763f3a08e"
+      "last_updated_at": "2026-11-02T18:41:32.120604+00:00",
+      "sha256": "bf6d4ff42ea22216168196fa10111670b0bb9dfda83b0596f9ede9384cfb8dc0",
+      "last_synced_commit": "a7e4c5c711a3dee4d803ae8a985f7856c5563467"
     },
     "docs/technical_standards.md": {
       "concern": "standards",
-      "last_updated_at": "2026-11-02T17:39:44.997070+00:00",
-      "sha256": "3d799390524590b71fe336247b9f8976ebe3bed755b054f8ab2388fc0e981788",
-      "last_synced_commit": "890e561bd3edff949de5f6441c3d1c1763f3a08e"
+      "last_updated_at": "2026-11-02T18:41:32.120604+00:00",
+      "sha256": "594785f10e37de644352bda2d39751beea1db48d8e14ca92165fdef20ba73262",
+      "last_synced_commit": "a7e4c5c711a3dee4d803ae8a985f7856c5563467"
     }
   },
   "mapping_rules": [
     {
-      "source_pattern": "src/app/api/**",
-      "target_doc": "docs/api_reference.md",
-      "concern": "api"
+      "source_pattern": "bin/**",
+      "target_doc": "docs/architecture.md",
+      "concern": "architecture"
     },
     {
-      "source_pattern": "src/app/actions/**",
-      "target_doc": "docs/api_reference.md",
-      "concern": "api"
+      "source_pattern": "install.sh",
+      "target_doc": "docs/architecture.md",
+      "concern": "architecture"
     },
     {
-      "source_pattern": "migrations/**",
-      "target_doc": "docs/database_schema.md",
-      "concern": "database"
+      "source_pattern": "mcp/**",
+      "target_doc": "docs/architecture.md",
+      "concern": "architecture"
     },
     {
-      "source_pattern": "prisma/**",
-      "target_doc": "docs/database_schema.md",
-      "concern": "database"
+      "source_pattern": "skill/**",
+      "target_doc": "docs/architecture.md",
+      "concern": "architecture"
     },
     {
-      "source_pattern": "**/*.prisma",
-      "target_doc": "docs/database_schema.md",
-      "concern": "database"
+      "source_pattern": "benchmark/**",
+      "target_doc": "docs/technical_standards.md",
+      "concern": "standards"
     },
     {
-      "source_pattern": "**/Dockerfile",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
+      "source_pattern": "tests/**",
+      "target_doc": "docs/technical_standards.md",
+      "concern": "standards"
     },
     {
-      "source_pattern": "**/docker-compose*.yml",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
+      "source_pattern": "pyproject.toml",
+      "target_doc": "docs/technical_standards.md",
+      "concern": "standards"
     },
     {
-      "source_pattern": "**/docker-compose*.yaml",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
+      "source_pattern": "README.md",
+      "target_doc": "docs/technical_standards.md",
+      "concern": "standards"
     },
     {
-      "source_pattern": "**/compose.yml",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
-    },
-    {
-      "source_pattern": "**/compose.yaml",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
-    },
-    {
-      "source_pattern": "**/*.tf",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
-    },
-    {
-      "source_pattern": "terraform/**",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
-    },
-    {
-      "source_pattern": "playbooks/**",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
-    },
-    {
-      "source_pattern": "roles/**",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
-    },
-    {
-      "source_pattern": "inventory/**",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
-    },
-    {
-      "source_pattern": "ansible.cfg",
-      "target_doc": "docs/deployment.md",
-      "concern": "deployment"
+      "source_pattern": "LLM_ONBOARDING.md",
+      "target_doc": "docs/technical_standards.md",
+      "concern": "standards"
     }
   ]
 }

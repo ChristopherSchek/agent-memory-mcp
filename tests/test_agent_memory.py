@@ -917,8 +917,72 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(path_err_res["status"], "error")
         self.assertEqual(path_err_res["exit_code"], 2)
 
+        self.assertEqual(
+            self.am._normalize_cli_argv(["agent-memory", "record", "-e", "-my-entity", "--", "-leading-content"]),
+            ["agent-memory", "record", "-e=-my-entity", "--", "-leading-content"],
+        )
+        self.assertEqual(
+            self.am._normalize_cli_argv(["agent-memory", "record", "--ent", "foo", "bar"]),
+            ["agent-memory", "record", "--ent", "foo", "bar"],
+        )
+
+        with mock.patch.object(sys, "argv", ["agent-memory", "init", "--f"]), mock.patch.object(
+            sys, "stderr", io.StringIO()
+        ), self.assertRaises(SystemExit) as cm_abbrev:
+            self.am.main()
+        self.assertEqual(cm_abbrev.exception.code, 2)
+
+        with mock.patch.object(sys, "argv", [bench_script, "--val"]), mock.patch.object(
+            sys, "stdout", io.StringIO()
+        ), mock.patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit) as cm_b_abbrev:
+            bench_mod.main()
+        self.assertEqual(cm_b_abbrev.exception.code, 2)
+
+        self.assertEqual(bench_mod._pre_extract_log_dir(["--log-dir", "/tmp/valid", "--log-dir", "--dry-run"]), "")
+
+        am = self.am
+        with mock.patch.object(am, "_backing_block_devices", return_value=["/sys/block/nvme0n1"]), mock.patch.object(
+            am, "_leaf_block_devices", return_value=["/sys/block/nvme0n1"]
+        ), mock.patch.object(
+            am,
+            "_read_sysfs",
+            side_effect=lambda p: ("INTEL " + "HBRPE" + " OPTANE") if p.endswith("model") else "0",
+        ):
+            am._VALIDATED_STORAGE_DEVS.clear()
+            with self.assertRaises(RuntimeError) as cm_hybrid:
+                am.validate_storage_hardware(self.tmpdir.name, dev_id=999991)
+            self.assertIn("not Intel Optane NVMe", str(cm_hybrid.exception))
+
+        hl_db_target = os.path.join(self.tmpdir.name, "hl_target.db")
+        with sqlite3.connect(hl_db_target) as hl_conn:
+            hl_conn.execute("CREATE TABLE t (x INT)")
+        os.chmod(hl_db_target, 0o600)
+        hl_db_alias = os.path.join(self.tmpdir.name, "hl_alias.db")
+        os.link(hl_db_target, hl_db_alias)
+        self.am.DB_PATH = hl_db_target
+        self.am._RAW_DB_PATH = hl_db_target
+        doc_hl_buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", doc_hl_buf), self.assertRaises(SystemExit) as cm_doc_hl:
+            self.am.run_doctor()
+        self.assertEqual(cm_doc_hl.exception.code, 1)
+        self.assertIn("multiple hardlinks", json.loads(doc_hl_buf.getvalue())["permissions"])
+
+        guarded_db = os.path.join(self.tmpdir.name, ".git", "memory.db")
+        self.am.DB_PATH = guarded_db
+        self.am._RAW_DB_PATH = guarded_db
+        doc_guard_buf = io.StringIO()
+        with mock.patch.object(os.path, "exists", side_effect=AssertionError("os.path.exists should not be called on guarded path")), mock.patch.object(
+            sys, "stdout", doc_guard_buf
+        ), self.assertRaises(SystemExit) as cm_doc_guard:
+            self.am.run_doctor()
+        self.assertEqual(cm_doc_guard.exception.code, 1)
+        guard_rep = json.loads(doc_guard_buf.getvalue())
+        self.assertFalse(guard_rep["healthy"])
+        self.assertEqual(guard_rep["writable"], "blocked (guarded or invalid environment path)")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
