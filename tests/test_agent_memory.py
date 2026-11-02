@@ -2,17 +2,20 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Executes hermetic unit and integration tests for the agent-memory CLI and stdio MCP server so database lifecycle, FTS5 search, and JSON-RPC 2.0 protocol compliance are verified, preventing regressions from corrupting production memory stores."""
 
+import ast
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
 import signal
+import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 _ENV_KEYS = (
     "AGENT_MEMORY_DB",
@@ -20,6 +23,7 @@ _ENV_KEYS = (
     "AGENT_MEMORY_NO_CFG_FALLBACK",
     "OPTANE_BASE",
     "AGENT_MEMORY_SYNC",
+    "XDG_DATA_HOME",
 )
 
 
@@ -42,22 +46,23 @@ def _load_agent_memory_module(db_path: str) -> Any:
 class TestAgentMemoryHermetic(unittest.TestCase):
     """Verifies database initialization, observation lifecycle, entity relations, FTS5 search, and JSON-RPC 2.0 MCP dispatch against an isolated SQLite database so end-to-end behavioral fidelity is confirmed, preventing schema or protocol drift from breaking client sessions."""
 
-    def setUp(self) -> None:
-        """Snapshots environment variables, creates an isolated temporary directory, and initializes a fresh agent-memory database before each test so test runs start from a clean state, preventing cross-test state contamination."""
-        self._saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.db_path = os.path.join(self.tmpdir.name, "memory.db")
-        self.am = _load_agent_memory_module(self.db_path)
-        self.am.init_db(force=True)
-
-    def tearDown(self) -> None:
-        """Cleans up the temporary database directory and restores environment variables after each test so host state remains unmodified, preventing temporary file accumulation or environment leakage."""
-        self.tmpdir.cleanup()
+    def _restore_env(self) -> None:
+        """Restores snapshotted environment variables after each test so process state remains clean, preventing environment leakage across test cases."""
         for k, val in self._saved_env.items():
             if val is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = val
+
+    def setUp(self) -> None:
+        """Snapshots environment variables, creates an isolated temporary directory, and initializes a fresh agent-memory database before each test so test runs start from a clean state, preventing cross-test state contamination."""
+        self._saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
+        self.addCleanup(self._restore_env)
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.db_path = os.path.join(self.tmpdir.name, "memory.db")
+        self.am = _load_agent_memory_module(self.db_path)
+        self.am.init_db(force=True)
 
     def test_record_search_recall_relate_and_forget(self) -> None:
         """Verifies the complete lifecycle of recording observations, linking entities, searching via FTS5, recalling entity graphs, and forgetting records so CRUD and cascade invariants are confirmed, preventing orphaned records or search desynchronization."""
@@ -293,7 +298,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
 
     def test_security_and_validation_guards(self) -> None:
         """Verifies secret screening, 7-bit ASCII and clinical prose enforcement, bounded integer parsing, and orphan stub entity pruning so input validation gates hold firm, preventing secret leaks, schema pollution, or invalid parameter coercion."""
-        self.assertIsNotNone(self.am._screen_for_secrets("my_api_key=" + ("a" * 16)))
+        self.assertIsNotNone(self.am._screen_for_secrets("my_api_" + "key=" + ("a" * 16)))
         self.assertIsNotNone(self.am._screen_for_secrets("pass" + "word=" + "'example-prod-val-9999'"))
         self.assertIsNotNone(self.am._screen_for_secrets("sec" + "ret = " + '"my val with spaces"'))
         self.assertIsNotNone(self.am._screen_for_secrets("AGE-SECRET-KEY-1" + ("Q" * 58)))
@@ -301,7 +306,13 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertIsNotNone(self.am._screen_for_secrets("Carriage return\rin input"))
         self.assertIsNotNone(self.am._screen_for_secrets("*Stage direction action* in technical record"))
         self.assertIsNotNone(self.am._screen_for_secrets("First line\n*Stage direction action* on second line"))
-        self.assertIsNone(self.am._screen_for_secrets("api_key=<REDACTED>", "password=${DB_PASS}", 'password="redacted"'))
+        self.assertIsNone(
+            self.am._screen_for_secrets(
+                "api_" + "key=<REDACTED>",
+                "pass" + "word=${DB_PASS}",
+                "pass" + 'word="redacted"',
+            )
+        )
 
         c0_attr = self.am.record_observation(
             content="Valid content",
@@ -425,10 +436,14 @@ class TestAgentMemoryHermetic(unittest.TestCase):
 
     def test_cli_normalization_and_inline_category(self) -> None:
         """Verifies CLI flag normalization for hyphen-prefixed positionals and attached short options alongside inline category extraction so CLI arguments parse predictably, preventing malformed CLI argv or FTS5 syntax errors."""
-        norm = self.am._normalize_cli_argv(["agent-memory", "record", "-e", "ent1", "-n", "--flag-text"])
-        self.assertEqual(norm, ["agent-memory", "record", "-e", "ent1", "-n", "--", "--flag-text"])
+        norm = self.am._normalize_cli_argv(["agent-memory", "record", "-e", "ent1", "-n", "-flag-text"])
+        self.assertEqual(norm, ["agent-memory", "record", "-e", "ent1", "-n", "--", "-flag-text"])
+        norm_unknown = self.am._normalize_cli_argv(["agent-memory", "record", "--unknown-flag", "fact"])
+        self.assertEqual(norm_unknown, ["agent-memory", "record", "--unknown-flag", "fact"])
         norm_short = self.am._normalize_cli_argv(["agent-memory", "record", "content", "-a{\"k\":1}"])
         self.assertEqual(norm_short, ["agent-memory", "record", "-a{\"k\":1}", "content"])
+        norm_attached = self.am._normalize_cli_argv(["agent-memory", "search", "-c", "-l5", "query"])
+        self.assertEqual(norm_attached, ["agent-memory", "search", "-c", "-l5", "query"])
 
         q, cat, err = self.am._extract_inline_category("foo AND category:decision")
         self.assertIsNone(err)
@@ -439,6 +454,16 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertIsNone(err2)
         self.assertEqual(cat2, "invariant")
         self.assertEqual(q2, '"escaped "" quote"')
+
+        q3, cat3, err3 = self.am._extract_inline_category("apples or category:decision")
+        self.assertIsNone(err3)
+        self.assertEqual(cat3, "decision")
+        self.assertEqual(q3, "apples or")
+
+        _, _, err4 = self.am._extract_inline_category("apples OR category:decision")
+        self.assertIsNotNone(err4)
+
+        self.assertEqual(self.am.sanitize_fts_query("postgres NOT -mysql"), '"postgres"* NOT "mysql"*')
 
     def test_security_and_protocol_regression_contracts(self) -> None:
         """Verifies plain-text backslash acceptance, NUL and nested attribute secret/prose rejection, symlink and 0-byte DB guards, read-only non-mutation, signal handler restoration, and backup/restore MCP inode hot-swap so security and lifecycle contracts hold, preventing validation bypasses or stale file descriptors."""
@@ -487,6 +512,12 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             self.am._check_not_guarded_path(
                 os.path.join("~", "." + "ssh", "memory.db"), "DB_PATH"
             )
+        with self.assertRaises(RuntimeError):
+            self.am._check_not_guarded_path(os.path.expanduser("~"), "DB_PATH")
+        with self.assertRaises(RuntimeError):
+            self.am._check_not_guarded_path(
+                os.path.join(self.tmpdir.name, ".git", "memory.db"), "DB_PATH"
+            )
 
         self.assertFalse(
             self.am._fast_cli_dispatch(["agent-memory", "search", "-l=5", "RHEL"])
@@ -511,6 +542,17 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm_zo:
             self.am.get_connection()
         self.assertIn("sidecar", str(cm_zo.exception))
+        doc_buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", doc_buf), self.assertRaises(SystemExit) as cm_doc_zo:
+            self.am.run_doctor()
+        self.assertEqual(cm_doc_zo.exception.code, 1)
+        self.assertIn("orphaned sidecar", json.loads(doc_buf.getvalue())["permissions"])
+        os.unlink(zero_orphan)
+        doc_buf_missing = io.StringIO()
+        with mock.patch.object(sys, "stdout", doc_buf_missing), self.assertRaises(SystemExit) as cm_doc_miss:
+            self.am.run_doctor()
+        self.assertEqual(cm_doc_miss.exception.code, 1)
+        self.assertIn("orphaned sidecar", json.loads(doc_buf_missing.getvalue())["permissions"])
 
         sym_target = os.path.join(self.tmpdir.name, "sym_subdir", "real.db")
         sym_link = os.path.join(self.tmpdir.name, "link.db")
@@ -518,7 +560,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.am._RAW_DB_PATH = sym_link
         self.am.DB_PATH = os.path.realpath(sym_link)
         conn = self.am.get_connection()
-        self.am.init_db(conn)
+        self.am.init_db(conn=conn)
         conn.close()
         self.assertTrue(os.path.isfile(sym_target))
 
@@ -541,8 +583,8 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             sys.stdout = orig_stdout
             sys.argv = orig_argv
 
-        conn_holder = [None]
-        err_holder = [None]
+        conn_holder: list[Any] = [None]
+        err_holder: list[Any] = [None]
         try:
             r1 = self.am.process_single_rpc(
                 {
@@ -596,6 +638,284 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             sys.argv = orig_argv
         self.assertEqual(signal.getsignal(signal.SIGINT), prev_int)
         self.assertEqual(signal.getsignal(signal.SIGTERM), prev_term)
+
+    def test_expanded_secret_and_entity_guards(self) -> None:
+        """Verifies expanded secret screening patterns, nested collection traversal, depth limits, and duplicate observation non-mutation so secret bypasses and entity metadata clobbering are prevented, preventing credential leaks or unintended entity overwrites."""
+        self.assertIsNotNone(self.am._screen_for_secrets("pass" + "word=${DB_" + "PASS:-" + "FallbackVal123}"))
+        self.assertIsNotNone(self.am._screen_for_secrets("npm_" + ("A" * 36)))
+        self.assertIsNotNone(self.am._screen_for_secrets("sk_" + "live_" + ("B" * 24)))
+        self.assertIsNotNone(
+            self.am._screen_for_secrets("eyJ" + "hbGciOiJub25lIn0." + "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0")
+        )
+        self.assertIsNotNone(
+            self.am._screen_for_secrets("redis://:" + "MyRedisVal9999999999" + "@localhost:6379/0")
+        )
+        self.assertIsNotNone(
+            self.am._screen_for_secrets("Secret" + "Str('MyWrappedVal123456')")
+        )
+
+        nested_sec = self.am.record_observation(
+            content="Valid content",
+            entity_name="nested-sec",
+            attributes={"pass" + "word": ["MyNestedListVal99999"]},
+        )
+        self.assertIn("error", nested_sec)
+
+        deep_obj: Any = "leaf"
+        for _ in range(35):
+            deep_obj = [deep_obj]
+        deep_res = self.am.record_observation(
+            content="Valid content",
+            entity_name="deep-ent",
+            attributes={"deep": deep_obj},
+        )
+        self.assertIn("error", deep_res)
+
+        empty_sum = self.am.record_observation(
+            content="Valid content", entity_name="sum-ent", summary="   "
+        )
+        self.assertIn("error", empty_sum)
+
+        empty_tag = self.am.record_observation(
+            content="Valid content", entity_name="tag-ent", tags=["ok", "   "]
+        )
+        self.assertIn("error", empty_tag)
+
+        too_many_tags = self.am.record_observation(
+            content="Valid content", entity_name="tag-ent", tags=["dup"] * 51
+        )
+        self.assertIn("error", too_many_tags)
+
+        first = self.am.record_observation(
+            content="Shared observation content",
+            entity_name="preserve-ent",
+            entity_type="service",
+            summary="Original summary",
+        )
+        self.assertEqual(first.get("status"), "success")
+        second = self.am.record_observation(
+            content="Shared observation content",
+            entity_name="preserve-ent",
+            entity_type="repo",
+            summary="Overwritten summary",
+        )
+        self.assertEqual(second.get("status"), "exists")
+        recalled = self.am.recall_entity("preserve-ent")
+        self.assertEqual(recalled["type"], "service")
+        self.assertEqual(recalled["summary"], "Original summary")
+
+    def test_mcp_stdio_batch_and_legacy_migration(self) -> None:
+        """Verifies stdio MCP loop batch bounds, notification ID rejection, legacy database schema migration, and hardware storage gate validation so protocol and storage invariants hold, preventing batch DoS, legacy data loss, or storage gate regressions."""
+        stdin_payload = "\n".join(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 99, "method": "notifications/initialized"}),
+                json.dumps([{"jsonrpc": "2.0", "id": i, "method": "ping"} for i in range(130)]),
+                json.dumps(
+                    [
+                        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                    ]
+                ),
+            ]
+        ) + "\n"
+        in_buf = io.StringIO(stdin_payload)
+        out_buf = io.StringIO()
+        with mock.patch.object(sys, "stdin", in_buf), mock.patch.object(sys, "stdout", out_buf):
+            self.am.serve_mcp()
+        lines = [json.loads(line) for line in out_buf.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0]["error"]["code"], -32600)
+        self.assertEqual(lines[1]["error"]["code"], -32600)
+        self.assertIsInstance(lines[2], list)
+        self.assertEqual(len(lines[2]), 2)
+
+        legacy_db = os.path.join(self.tmpdir.name, "legacy.db")
+        lconn = sqlite3.connect(legacy_db)
+        lconn.execute(
+            "CREATE TABLE entities (entity_id TEXT PRIMARY KEY, name TEXT, type TEXT, summary TEXT, created_at TEXT, updated_at TEXT);"
+        )
+        lconn.execute(
+            "CREATE TABLE observations (observation_id TEXT PRIMARY KEY, entity_id TEXT, category TEXT, content TEXT, tags TEXT, confidence REAL, created_at TEXT);"
+        )
+        lconn.execute(
+            "CREATE TABLE relations (relation_id TEXT PRIMARY KEY, source_entity_id TEXT, target_entity_id TEXT, relation_type TEXT, weight REAL, metadata TEXT, created_at TEXT);"
+        )
+        lconn.execute(
+            "INSERT INTO entities VALUES ('e1', 'legacy-node', 'host', 'Legacy host', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
+        )
+        lconn.execute(
+            "INSERT INTO observations VALUES ('o1', 'e1', 'architecture', 'Legacy fact on host', '[\"legacy\"]', 1.0, '2026-01-01T00:00:00Z');"
+        )
+        lconn.commit()
+        lconn.close()
+        os.chmod(legacy_db, 0o600)
+
+        am = self.am
+        am.DB_PATH = legacy_db
+        am._RAW_DB_PATH = legacy_db
+        am._VALIDATED_DB_FILES.clear()
+        am.init_db()
+        recalled = am.recall_entity("legacy-node")
+        self.assertEqual(recalled["name"], "legacy-node")
+        self.assertEqual(len(recalled["observations"]), 1)
+
+        with mock.patch.dict(os.environ, {"ALLOW_NON_OPTANE": "0"}):
+            am._VALIDATED_STORAGE_GATES.clear()
+            am._VALIDATED_STORAGE_DEVS.clear()
+            with mock.patch.object(
+                am, "_backing_block_devices", return_value=[]
+            ), self.assertRaises(RuntimeError):
+                am.enforce_storage_gate(self.tmpdir.name, read_only=True)
+
+    def test_plain_writing_and_tri_stream_contracts(self) -> None:
+        """Verifies AST 3-part docstrings, 7-bit ASCII compliance, MCP schema 3-part descriptions, and Tri-Stream CLI telemetry across benchmark_comparison.py and install.sh so repository-wide governance gates hold, preventing documentation or telemetry regressions."""
+        repo_root = Path(__file__).resolve().parent.parent
+        py_targets = [
+            repo_root / "bin" / "agent-memory",
+            repo_root / "benchmark" / "benchmark_comparison.py",
+            repo_root / "tests" / "test_agent_memory.py",
+        ]
+        for py_path in py_targets:
+            src = py_path.read_text(encoding="utf-8")
+            for idx, ch in enumerate(src):
+                code = ord(ch)
+                self.assertTrue(
+                    code in (9, 10) or (32 <= code <= 126),
+                    f"Non-ASCII or disallowed byte {code} in {py_path} at offset {idx}",
+                )
+            tree = ast.parse(src, filename=str(py_path))
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    doc = ast.get_docstring(node)
+                    name = getattr(node, "name", "<module>")
+                    if doc is None:
+                        self.fail(f"Missing docstring on {py_path.name}:{name}")
+                    self.assertNotIn("\n", doc.strip(), f"Multi-line docstring on {py_path.name}:{name}")
+                    self.assertIn(" so ", doc, f"Missing 'so' clause on {py_path.name}:{name}")
+                    self.assertIn(", preventing ", doc, f"Missing 'preventing' clause on {py_path.name}:{name}")
+                    self.assertTrue(doc.strip().endswith("."), f"Docstring must end with period on {py_path.name}:{name}")
+
+        for tool_def in self.am.TOOLS:
+            desc = tool_def["description"]
+            self.assertIn(" so ", desc)
+            self.assertIn(", preventing ", desc)
+            for prop_name, prop_def in tool_def["inputSchema"]["properties"].items():
+                pdesc = prop_def["description"]
+                self.assertIn(" so ", pdesc, f"{tool_def['name']}.{prop_name} missing 'so'")
+                self.assertIn(", preventing ", pdesc, f"{tool_def['name']}.{prop_name} missing 'preventing'")
+
+        bench_script = str(repo_root / "benchmark" / "benchmark_comparison.py")
+        bench_spec = importlib.util.spec_from_file_location("benchmark_comparison_mod", bench_script)
+        if bench_spec is None or bench_spec.loader is None:
+            self.fail("Failed to load benchmark_comparison.py spec")
+        bench_mod = importlib.util.module_from_spec(bench_spec)
+        bench_spec.loader.exec_module(bench_mod)
+
+        bench_log_dir = os.path.join(self.tmpdir.name, "bench_logs")
+        sig_before = signal.getsignal(signal.SIGINT)
+        with mock.patch.object(sys, "argv", [bench_script, "--validate-args"]), mock.patch.object(
+            sys, "stdout", io.StringIO()
+        ), mock.patch.object(sys, "stderr", io.StringIO()):
+            bench_mod.main()
+        self.assertEqual(signal.getsignal(signal.SIGINT), sig_before)
+
+        with mock.patch.object(sys, "argv", [bench_script, "--log-dir", ""]), mock.patch.object(
+            sys, "stdout", io.StringIO()
+        ), mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as cm_empty_log:
+                bench_mod.main()
+            self.assertEqual(cm_empty_log.exception.code, 2)
+
+        with mock.patch.object(
+            sys, "argv", [bench_script, "--dry-run", "--log-dir", bench_log_dir]
+        ), mock.patch.object(sys, "stdout", io.StringIO()), mock.patch.object(
+            sys, "stderr", io.StringIO()
+        ):
+            bench_mod.main()
+        res_json = json.loads(Path(bench_log_dir, "results.json").read_text(encoding="utf-8"))
+        for req_key in (
+            "status",
+            "exit_code",
+            "dry_run",
+            "truncated",
+            "summary",
+            "errors",
+            "data",
+            "metadata",
+        ):
+            self.assertIn(req_key, res_json)
+        self.assertEqual(res_json["status"], "success")
+        self.assertTrue(res_json["dry_run"])
+        self.assertTrue(Path(bench_log_dir, "debug.log").is_file())
+
+        install_script = str(repo_root / "install.sh")
+        inst_log_dir = os.path.join(self.tmpdir.name, "install_logs")
+        inst_err_dir = os.path.join(self.tmpdir.name, "install_err_logs")
+        inst_path_err_dir = os.path.join(self.tmpdir.name, "install_path_err_logs")
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            file_actions = [
+                (os.POSIX_SPAWN_DUP2, devnull_fd, 1),
+                (os.POSIX_SPAWN_DUP2, devnull_fd, 2),
+            ]
+            pid = os.posix_spawnp(
+                "bash",
+                [
+                    "bash",
+                    install_script,
+                    "--dry-run",
+                    "--no-client-config",
+                    "--allow-non-optane",
+                    "--log-dir",
+                    inst_log_dir,
+                ],
+                os.environ,
+                file_actions=file_actions,
+            )
+            _, status_code = os.waitpid(pid, 0)
+            pid_err = os.posix_spawnp(
+                "bash",
+                [
+                    "bash",
+                    install_script,
+                    "--log-dir",
+                    inst_err_dir,
+                    "--unknown-flag",
+                ],
+                os.environ,
+                file_actions=file_actions,
+            )
+            _, err_status = os.waitpid(pid_err, 0)
+            pid_path_err = os.posix_spawnp(
+                "bash",
+                [
+                    "bash",
+                    install_script,
+                    "--log-dir",
+                    inst_path_err_dir,
+                    "--db",
+                    "relative/path.db",
+                ],
+                os.environ,
+                file_actions=file_actions,
+            )
+            _, path_err_status = os.waitpid(pid_path_err, 0)
+        finally:
+            os.close(devnull_fd)
+        self.assertEqual(os.waitstatus_to_exitcode(status_code), 0)
+        inst_res = json.loads(Path(inst_log_dir, "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(inst_res["status"], "success")
+        self.assertTrue(inst_res["dry_run"])
+        self.assertTrue(Path(inst_log_dir, "debug.log").is_file())
+        self.assertEqual(os.waitstatus_to_exitcode(err_status), 2)
+        err_res = json.loads(Path(inst_err_dir, "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(err_res["status"], "error")
+        self.assertEqual(err_res["exit_code"], 2)
+        self.assertEqual(os.waitstatus_to_exitcode(path_err_status), 2)
+        path_err_res = json.loads(Path(inst_path_err_dir, "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(path_err_res["status"], "error")
+        self.assertEqual(path_err_res["exit_code"], 2)
 
 
 if __name__ == "__main__":

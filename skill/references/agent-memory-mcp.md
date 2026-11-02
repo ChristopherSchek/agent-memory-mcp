@@ -78,13 +78,8 @@ Defines the client registration and shell wrapper patterns required to connect A
      env ALLOW_NON_OPTANE=0 AGENT_MEMORY_DB="/mnt/optane/${USER}/agent_memory/memory.db" /usr/bin/python3 -I "${HOME}/.local/bin/agent-memory" "$@"
    }
 
-   # Verify database integrity, permissions, and FTS index status
    am doctor
-
-   # Perform manual full-text search
    am search "ansible vault"
-
-   # Ingest a new durable invariant
    am record "All production commits must use 7-bit ASCII" --entity "core-platform" --category "invariant"
    ```
 

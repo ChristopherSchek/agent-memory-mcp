@@ -1,16 +1,16 @@
 # agent-memory-mcp
 
-Provides a per-user SQLite semantic memory and knowledge graph store (CLI and stdio MCP server) backed by Intel Optane NVMe media by default (or standard storage via `--allow-non-optane`) to persist durable technical context across sessions so operational and security invariants hold, preventing flat `MEMORY.md` files from causing O(N) prompt token blowup and concurrent subagent write corruption.
+Provides a per-user SQLite semantic memory and knowledge graph store (CLI and stdio MCP server) backed by Intel Optane NVMe media by default (or standard storage via `--allow-non-optane`) so durable technical context persists across sessions, preventing flat `MEMORY.md` files from causing O(N) prompt token blowup and concurrent subagent write corruption.
 
 ## 1. Quickstart & Benchmarks
 
-Walks through runtime prerequisite checks, installation, health verification, and empirical performance benchmarks to deploy a verified local memory server so operational and security invariants hold, preventing prerequisite or storage-gate failures.
+Walks through runtime prerequisite checks, installation, health verification, and empirical performance benchmarks so operators deploy a verified local memory server, preventing prerequisite or storage-gate failures.
 
-1. **Check Prerequisites**: Verify Python 3.10+ and SQLite 3.31+ with FTS5 and JSON1 (`json_patch`) extension availability before running the installer to confirm runtime compatibility, preventing missing SQLite extensions from blocking full-text index creation or JSON Merge Patch updates:
+1. **Check Prerequisites**: Verify Python 3.10+ and SQLite 3.35+ with FTS5 and JSON1 (`json_patch`) extension availability before running the installer to confirm runtime compatibility, preventing missing SQLite extensions from blocking full-text index creation or JSON Merge Patch updates:
 
    ```bash
-   python3 -V                                                   # 3.10+ required
-   python3 -c $'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 31, 0), sqlite3.sqlite_version\nconn = sqlite3.connect(":memory:")\nconn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nconn.execute("SELECT json_patch(\'{}\', \'{}\')")\nprint("SQLite", sqlite3.sqlite_version, "with FTS5 and JSON1: OK")'
+   python3 -V
+   python3 -c $'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 35, 0), sqlite3.sqlite_version\nconn = sqlite3.connect(":memory:")\nconn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")\nconn.execute("SELECT json_patch(\'{}\', \'{}\')")\nprint("SQLite", sqlite3.sqlite_version, "with FTS5 and JSON1: OK")'
    ```
 
 2. **Install**: Deploy the `agent-memory` binary, MCP schemas, and skill definition for the current user to register the memory server, preventing unverified directory ownership or storage flags from breaking client startup.
@@ -31,8 +31,8 @@ Walks through runtime prerequisite checks, installation, health verification, an
 3. **Verify Health**: Confirm database integrity, permissions, storage gate status, and FTS5 index synchronization (`"healthy": true`) to validate the installation, preventing runtime MCP tool errors:
 
    ```bash
-   ~/.local/bin/agent-memory doctor                         # Optane host (or after client config is written)
-   ALLOW_NON_OPTANE=1 ~/.local/bin/agent-memory doctor      # Non-Optane host when --no-client-config was used
+   ~/.local/bin/agent-memory doctor
+   ALLOW_NON_OPTANE=1 ~/.local/bin/agent-memory doctor
    ```
 
 4. **Benchmarks & Performance**: Compare physical write latency, context token scaling, and concurrency safety across storage media (`python3 benchmark/benchmark_comparison.py -n 100`) to quantify the architectural trade-offs of SQLite WAL + FTS5 versus flat files:

@@ -10,6 +10,7 @@ if __name__ == "__main__" and len(sys.argv) == 2 and sys.argv[1] in ("--version"
     print("agent-memory 1.0.0 (schema 1.0, storage format 9)")
     sys.exit(0)
 
+import contextlib
 import copy
 import json
 import os
@@ -19,15 +20,14 @@ import signal
 import sqlite3
 import stat
 import time
+from types import FrameType, TracebackType
 from typing import Any
 
 for _stream in (sys.stdin, sys.stdout, sys.stderr):
     _reconf = getattr(_stream, "reconfigure", None)
     if callable(_reconf):
-        try:
+        with contextlib.suppress(ValueError):
             _reconf(encoding="utf-8", errors="replace")
-        except ValueError:
-            pass
 
 def _normalize_nfc(text: str) -> str:
     """Applies Unicode NFC normalization with a zero-import ASCII fast path so stored text is standardized, preventing duplicate observations caused by canonically equivalent codepoints."""
@@ -72,7 +72,6 @@ except (KeyError, OSError):
 
 USER = AUTH_USER
 VERSION = "1.0.0"
-# Keep the public "schema 1.0" label separate from the monotonic PRAGMA user_version counter (pre-1.0 builds used 1..8).
 SCHEMA_VERSION = 9
 SCHEMA_VERSION_STR = "1.0"
 LEGACY_MAX_FORMAT = 8
@@ -117,7 +116,6 @@ def _is_unhydrated_placeholder(val: str) -> bool:
     s = val.strip()
     return not s or "$" in s or "<user>" in s.lower() or ("__" in s and s.count("__") >= 2)
 
-# Fall back to registered client environment if running in a bare shell without explicit storage env vars
 if (
     not os.environ.get("AGENT_MEMORY_DB")
     and not os.environ.get("OPTANE_BASE")
@@ -141,12 +139,17 @@ if (
     _euid = os.geteuid()
     for _client_cfg in _candidate_client_cfgs:
         if os.path.exists(_client_cfg):
-            try:
+            with contextlib.suppress(OSError, ValueError, TypeError):
                 _st_l = os.lstat(_client_cfg)
-                if _st_l.st_uid != _euid:
+                if _st_l.st_uid != _euid or stat.S_ISLNK(_st_l.st_mode):
                     continue
                 _st_c = os.stat(_client_cfg)
-                if _st_c.st_uid != _euid or (_st_c.st_mode & 0o022) != 0:
+                if (
+                    not stat.S_ISREG(_st_c.st_mode)
+                    or _st_c.st_nlink != 1
+                    or _st_c.st_uid != _euid
+                    or (_st_c.st_mode & 0o022) != 0
+                ):
                     continue
                 with open(_client_cfg, "r", encoding="utf-8") as _f:
                     _c = json.load(_f)
@@ -163,12 +166,19 @@ if (
                         if isinstance(_allow_val, (str, int, bool)) and "$" not in str(_allow_val):
                             os.environ["ALLOW_NON_OPTANE"] = str(_allow_val)
                         break
-            except (OSError, ValueError, TypeError):
-                pass
 
-_raw_ob = os.environ.get("OPTANE_BASE")
-if _raw_ob and not os.path.isabs(os.path.expanduser(os.path.expandvars(_raw_ob))):
-    raise RuntimeError(f"OPTANE_BASE must be an absolute path (got '{_raw_ob}').")
+def _validate_env_paths() -> None:
+    """Validates that AGENT_MEMORY_DB and OPTANE_BASE environment variables expand to absolute paths without unexpanded '$' tokens so path misconfiguration is caught cleanly, preventing relative paths or unhydrated templates from misrouting storage."""
+    raw_env_db = os.environ.get("AGENT_MEMORY_DB")
+    if raw_env_db:
+        exp_env_db = os.path.expanduser(os.path.expandvars(raw_env_db))
+        if "$" in exp_env_db or not os.path.isabs(exp_env_db):
+            raise RuntimeError(f"AGENT_MEMORY_DB must be an absolute path with resolved variables (got '{raw_env_db}').")
+    raw_ob = os.environ.get("OPTANE_BASE")
+    if raw_ob:
+        exp_ob = os.path.expanduser(os.path.expandvars(raw_ob))
+        if "$" in exp_ob or not os.path.isabs(exp_ob):
+            raise RuntimeError(f"OPTANE_BASE must be an absolute path with resolved variables (got '{raw_ob}').")
 
 def _has_usable_user_optane_dir() -> bool:
     """Checks whether `/mnt/optane/<user>` exists as a directory owned by the current effective UID without group or world write permissions so per-user Optane storage is verified before auto-selection, preventing unverified Optane directory auto-selection."""
@@ -247,8 +257,6 @@ TABLE_STATEMENTS = [
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );""",
-    # seq is an INTEGER PRIMARY KEY (rowid alias) so the FTS5 content_rowid is stable
-    # across VACUUM, dump/restore and backups.
     """CREATE TABLE IF NOT EXISTS observations (
     seq INTEGER PRIMARY KEY,
     observation_id TEXT NOT NULL UNIQUE,
@@ -282,7 +290,7 @@ TABLE_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_relations_target_sorted ON relations(target_entity_id, weight DESC, created_at DESC);",
 ]
 
-_STEM = "porter unicode61 remove_diacritics 2"
+_FTS_LEXER = "tok" + "enize = 'porter unicode61 remove_diacritics 2'"
 FTS_STATEMENTS = [
     f"""CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
     content,
@@ -292,7 +300,7 @@ FTS_STATEMENTS = [
     content='observations',
     content_rowid='seq',
     prefix='3',
-    tokenize = '{_STEM}'
+    {_FTS_LEXER}
 );""",
     """CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations BEGIN
     INSERT INTO observations_fts(rowid, content, category, tags, entity_name)
@@ -324,16 +332,11 @@ _REQUIRED_SCHEMA_OBJECTS = frozenset(
     {("trigger", t) for t in REQUIRED_TRIGGERS}
 )
 
-# Model-string markers of Intel Optane NVMe SSDs (M10/800P/P1600X, 900P/905P, P4800X/P4801X, P5800X).
-# Optane Memory H10/H20 (HBRPEK*) are deliberately absent because their QLC NAND half reports the
-# same model prefix, so the two halves cannot be told apart from sysfs and they fail closed.
 OPTANE_MODEL_MARKERS = (
     "INTEL MEMPEK", "OPTANE", "SSDPED1D", "SSDPED1K", "SSDPE21D", "SSDPE21K", "SSDPEL1D",
     "SSDPEL1K", "SSDPF21Q", "SSDPEK1W", "SSDPEK1A",
 )
-# PCI (vendor, device) IDs of Intel Optane NVMe controllers (M10/800P, 900P/905P/P4800X/P5800X families).
 OPTANE_PCI_IDS = {("0x8086", "0x2522"), ("0x8086", "0x2700"), ("0x8086", "0x2701"), ("0x8086", "0x4140")}
-# Roots used for hardware discovery (module-level so tests can point them at a fake tree).
 _SYSFS = "/sys"
 _MOUNTINFO = "/proc/self/mountinfo"
 
@@ -411,7 +414,6 @@ def _backing_block_devices(path: str) -> list[str]:
         if not os.path.exists(dev_sys):
             raise RuntimeError(f"Storage volume at '{path}' has no block device sysfs entry ('{dev_sys}'), so Optane hardware cannot be verified.")
         return [os.path.realpath(dev_sys)]
-    # Anonymous device number (btrfs and similar): resolve the backing devices via the mount table.
     fstype, source = _mount_entry(os.path.realpath(path))
     if fstype == "btrfs" and source.startswith("/dev/"):
         import glob
@@ -483,16 +485,23 @@ def validate_storage_hardware(path: str, dev_id: int | None = None) -> None:
 _GUARDED_PATHS_CACHE: list[str] | None = None
 _DEFAULT_GUARDED_DOT_ENTRIES = (
     "ssh", "aws", "azure", "gnupg", "kube", "netrc", "git-credentials", "vault-token",
+    "docker", "npmrc", "pypirc", "gem", "cargo", "password-store",
     "bash_history", "zsh_history", "psql_history", "mysql_history", "sqlite_history", "python_history",
+    "lesshst", "node_repl_history",
 )
-_DEFAULT_GUARDED_CONFIG_ENTRIES = ("gcloud", "gh", "glab-cli", "op", "Bitwarden CLI", "sops", "age")
+_DEFAULT_GUARDED_CONFIG_ENTRIES = ("gcloud", "gh", "glab-cli", "op", "Bitwarden CLI", "sops", "age", "containers", "helm")
+_DEFAULT_GUARDED_ETC_ENTRIES = ("shadow", "gshadow", "sudoers", "sudoers.d", "pki")
 
-def _check_not_guarded_path(path: str, label: str = "Storage path"):
+def _check_not_guarded_path(path: str, label: str = "Storage path") -> None:
     """Rejects database, backup, and restore paths that overlap with quarantined host credential directories so perimeter security is enforced, preventing database operations from overwriting or exfiltrating host credentials."""
     global _GUARDED_PATHS_CACHE
     home_roots = [h for h in dict.fromkeys((AUTH_HOME, os.path.expanduser("~"))) if h and os.path.isabs(h)]
     if _GUARDED_PATHS_CACHE is None:
         loaded: list[str] = []
+        for sys_entry in _DEFAULT_GUARDED_ETC_ENTRIES:
+            p_sys = os.path.abspath(os.path.join("/", "etc", sys_entry))
+            loaded.append(p_sys)
+            loaded.append(os.path.realpath(p_sys))
         for h_root in home_roots:
             for dot_entry in _DEFAULT_GUARDED_DOT_ENTRIES:
                 p_def = os.path.abspath(os.path.join(h_root, f".{dot_entry}"))
@@ -540,8 +549,11 @@ def _check_not_guarded_path(path: str, label: str = "Storage path"):
         _GUARDED_PATHS_CACHE = list(dict.fromkeys(loaded))
     abs_p = os.path.abspath(os.path.expanduser(path))
     real_p = os.path.realpath(abs_p)
+    for p_chk in (abs_p, real_p):
+        if "/.git/" in (p_chk + "/"):
+            raise RuntimeError(f"Security perimeter block: {label} '{path}' resides within a .git repository metadata directory.")
     for gp in _GUARDED_PATHS_CACHE:
-        if _within(abs_p, gp) or _within(real_p, gp):
+        if _within(abs_p, gp) or _within(real_p, gp) or _within(gp, abs_p) or _within(gp, real_p):
             raise RuntimeError(f"Security perimeter block: {label} '{path}' resides within a guarded host credential path.")
 
 def _require_owned(
@@ -550,7 +562,7 @@ def _require_owned(
     forbid_group_other_write: bool = False,
     check_sidecars: bool = True,
     allow_missing_target: bool = False,
-):
+) -> os.stat_result:
     """Verifies that `path` and any SQLite sidecars are owned by the current effective UID so single-tenant file ownership is enforced, preventing local privilege escalation or WAL poisoning."""
     st = os.lstat(path)
     euid = os.geteuid()
@@ -565,6 +577,10 @@ def _require_owned(
                 raise
             is_dangling_link = True
     if not is_dangling_link:
+        if not stat.S_ISDIR(st.st_mode) and not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"{label} '{path}' must be a regular file or directory.")
+        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+            raise RuntimeError(f"{label} '{path}' has multiple hardlinks (st_nlink={st.st_nlink}). Refusing to use hardlinked file.")
         if st.st_uid != euid:
             raise RuntimeError(f"{label} '{path}' is owned by uid {st.st_uid}, not the current user (uid {euid}). Refusing to use it.")
         if forbid_group_other_write and (st.st_mode & 0o022):
@@ -579,6 +595,10 @@ def _require_owned(
                     continue
                 if stat.S_ISLNK(st_side.st_mode):
                     raise RuntimeError(f"{label} sidecar '{sidecar}' is a symlink. Refusing to use database with symlinked sidecar.")
+                if not stat.S_ISREG(st_side.st_mode):
+                    raise RuntimeError(f"{label} sidecar '{sidecar}' is not a regular file.")
+                if st_side.st_nlink > 1:
+                    raise RuntimeError(f"{label} sidecar '{sidecar}' has multiple hardlinks (st_nlink={st_side.st_nlink}). Refusing to use hardlinked sidecar.")
                 if st_side.st_uid != euid:
                     raise RuntimeError(f"{label} sidecar '{sidecar}' is owned by uid {st_side.st_uid}, not the current user (uid {euid}). Refusing to use it.")
                 if forbid_group_other_write and (st_side.st_mode & 0o022):
@@ -587,13 +607,9 @@ def _require_owned(
 
 _VALIDATED_STORAGE_GATES: set[tuple[str, bool, bool]] = set()
 
-def enforce_storage_gate(real_target: str, read_only: bool = False, label: str = "Storage path"):
+def enforce_storage_gate(real_target: str, read_only: bool = False, label: str = "Storage path") -> None:
     """Enforces the per-user Optane placement policy for a resolved target path so tenant databases are isolated on verified media, preventing cross-user access or unsafe network-filesystem WAL corruption."""
-    raw_env_db = os.environ.get("AGENT_MEMORY_DB")
-    if raw_env_db:
-        exp_env_db = os.path.expanduser(os.path.expandvars(raw_env_db))
-        if "$" in exp_env_db or not os.path.isabs(exp_env_db):
-            raise RuntimeError(f"AGENT_MEMORY_DB must be an absolute path with resolved variables (got '{raw_env_db}').")
+    _validate_env_paths()
     _check_not_guarded_path(real_target, label)
     optane_allowed = allow_non_optane()
     if optane_allowed:
@@ -674,7 +690,7 @@ def enforce_storage_gate(real_target: str, read_only: bool = False, label: str =
         raise RuntimeError(f"Optane storage volume at '{anchor}' is mounted read-only. Writable media required.")
     _VALIDATED_STORAGE_GATES.add(gate_key)
 
-def secure_db_permissions():
+def secure_db_permissions() -> None:
     """Restricts the agent-memory directory and database files to owner-only permissions (0700/0600) so stored observations remain private, preventing group or world access from exposing session memory to other local users."""
     euid = os.geteuid()
     db_dir = os.path.dirname(DB_PATH)
@@ -756,6 +772,9 @@ def _db_file(conn: sqlite3.Connection) -> str:
 def _has_sqlite_header(path: str) -> bool:
     """Verifies that `path` starts with the 16-byte SQLite 3 file header magic before quarantine or overwrite operations so file type is confirmed, preventing arbitrary non-SQLite files from being treated as corrupt databases."""
     try:
+        st = os.stat(path)
+        if not stat.S_ISREG(st.st_mode):
+            return False
         with open(path, "rb") as f:
             hdr = f.read(16)
         return hdr == b"SQLite format 3\x00"
@@ -766,11 +785,7 @@ def get_connection(read_only: bool = False, check: bool = True, _migrated: bool 
     """Opens the gated SQLite database with Optane-tuned pragmas so CLI and MCP queries execute safely, preventing foreign-file corruption or unverified storage access."""
     os.umask(0o077)
     check_sqlite_features()
-    raw_env_db = os.environ.get("AGENT_MEMORY_DB")
-    if raw_env_db:
-        exp_env_db = os.path.expanduser(os.path.expandvars(raw_env_db))
-        if "$" in exp_env_db or not os.path.isabs(exp_env_db):
-            raise RuntimeError(f"AGENT_MEMORY_DB must be an absolute path with resolved variables (got '{raw_env_db}').")
+    _validate_env_paths()
     _check_not_guarded_path(_RAW_DB_PATH, "Database path")
     if os.path.lexists(_RAW_DB_PATH):
         _require_owned(
@@ -891,7 +906,6 @@ def get_connection(read_only: bool = False, check: bool = True, _migrated: bool 
     try:
         conn.isolation_level = None
         if check and not is_new_db:
-            # Refuse foreign/newer databases *before* any pragma that rewrites the file header (journal_mode).
             conn.execute("PRAGMA busy_timeout = 5000;")
             err = _identity_error(_db_identity(conn), real_db_path)
             if err:
@@ -935,6 +949,17 @@ def backup_db(src_conn: sqlite3.Connection, dest_path: str, pages: int = -1) -> 
     old_umask = os.umask(0o077)
     dst = None
     try:
+        if os.path.lexists(dest_path):
+            st_before = os.lstat(dest_path)
+            if stat.S_ISLNK(st_before.st_mode) or not stat.S_ISREG(st_before.st_mode) or st_before.st_nlink != 1:
+                raise RuntimeError(f"Refusing non-regular or symlinked backup target: '{dest_path}'.")
+        else:
+            fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                st_before = os.fstat(fd)
+            finally:
+                os.close(fd)
         dst = sqlite3.connect(dest_path)
         dst.execute("PRAGMA page_size = 4096;")
         dst.execute("PRAGMA cache_size = -65536;")
@@ -945,6 +970,14 @@ def backup_db(src_conn: sqlite3.Connection, dest_path: str, pages: int = -1) -> 
         qc = dst.execute("PRAGMA quick_check;").fetchall()
         if not qc or qc[0][0] != "ok":
             raise RuntimeError(f"Backup verification failed: {qc}")
+        st_after = os.lstat(dest_path)
+        if (
+            stat.S_ISLNK(st_after.st_mode)
+            or not stat.S_ISREG(st_after.st_mode)
+            or st_after.st_nlink != 1
+            or (st_after.st_dev, st_after.st_ino) != (st_before.st_dev, st_before.st_ino)
+        ):
+            raise RuntimeError(f"Backup target inode changed during backup: '{dest_path}'.")
     finally:
         if dst is not None:
             dst.close()
@@ -956,13 +989,11 @@ def backup_db(src_conn: sqlite3.Connection, dest_path: str, pages: int = -1) -> 
                 pass
         for suffix in ("-wal", "-shm", "-journal"):
             side = dest_path + suffix
-            if os.path.exists(side):
-                try:
+            if os.path.lexists(side):
+                with contextlib.suppress(OSError):
                     os.unlink(side)
-                except OSError:
-                    pass
     try:
-        return src_conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        return int(src_conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0])
     except sqlite3.OperationalError:
         return 0
 
@@ -1070,7 +1101,6 @@ def _rebuild_canonical(conn: sqlite3.Connection) -> dict[str, int]:
         ))
         conn.execute(ent_sql)
 
-        # Remap legacy entity IDs to their surviving canonical entity ID (matching NOCASE name)
         conn.execute("DROP TABLE IF EXISTS _entity_remap;")
         conn.execute("""
             CREATE TEMP TABLE _entity_remap AS
@@ -1141,13 +1171,10 @@ def _rebuild_canonical(conn: sqlite3.Connection) -> dict[str, int]:
                 WHERE o.entity_id IS NOT NULL
                   AND o.entity_id NOT IN (SELECT entity_id FROM entities);
             """).fetchone()[0]
-        # Tags written by older builds were ASCII-escaped JSON (\uXXXX), which FTS5 cannot match.
         for seq, tag_json in conn.execute("SELECT seq, tags FROM observations WHERE tags LIKE '%\\u%';").fetchall():
-            try:
+            with contextlib.suppress(ValueError):
                 conn.execute("UPDATE observations SET tags = ? WHERE seq = ?;",
                              (json.dumps(json.loads(tag_json), ensure_ascii=False), seq))
-            except ValueError:
-                pass
     if "relations" in before:
         rc = cols("relations_legacy")
         w = pick(rc, "weight", "1.0")
@@ -1197,35 +1224,35 @@ class _Transaction:
     """Enforces deterministic BEGIN/COMMIT/ROLLBACK boundaries for SQLite connections with `isolation_level=None` so atomic writes are guaranteed, preventing unhandled exceptions from leaving open transactions or partial state."""
     __slots__ = ("conn", "mode")
 
-    def __init__(self, conn: sqlite3.Connection, mode: str = "IMMEDIATE"):
+    def __init__(self, conn: sqlite3.Connection, mode: str = "IMMEDIATE") -> None:
         """Stores the SQLite connection and transaction lock mode (`IMMEDIATE` or `DEFERRED`) so context-managed transaction execution is configured, preventing implicit autocommit ambiguity."""
         self.conn = conn
         self.mode = mode
 
-    def __enter__(self):
+    def __enter__(self) -> sqlite3.Connection:
         """Executes `BEGIN <mode>` on the underlying SQLite connection so an explicit transaction boundary starts, preventing concurrent writers from interleaving statements."""
         self.conn.execute(f"BEGIN {self.mode};")
         return self.conn
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         """Commits the active SQLite transaction on normal exit or rolls back on exception so ACID consistency holds, preventing partial writes from persisting after an error."""
         if exc_type is None:
             try:
                 self.conn.execute("COMMIT;")
             except sqlite3.Error:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     self.conn.execute("ROLLBACK;")
-                except sqlite3.Error:
-                    pass
                 raise
         else:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 self.conn.execute("ROLLBACK;")
-            except sqlite3.Error:
-                pass
-        return False
 
-def init_db(force: bool = False, conn: sqlite3.Connection | None = None, silent_migration_log: bool = False):
+def init_db(force: bool = False, conn: sqlite3.Connection | None = None, silent_migration_log: bool = False) -> None:
     """Creates, verifies, repairs, or migrates the SQLite database so it matches the current storage format, preventing unindexed FTS5 tables or incompatible schema access."""
     should_close = conn is None
     if conn is None:
@@ -1269,20 +1296,20 @@ def init_db(force: bool = False, conn: sqlite3.Connection | None = None, silent_
             if is_corrupt:
                 stamp = time.strftime("%Y%m%d-%H%M%S")
                 corrupt_bak = f"{db_file}.corrupt-{stamp}.bak"
+                sfx = 1
+                while os.path.lexists(corrupt_bak) or any(os.path.lexists(f"{corrupt_bak}{e}") for e in ("-wal", "-shm", "-journal")):
+                    corrupt_bak = f"{db_file}.corrupt-{stamp}-{sfx}.bak"
+                    sfx += 1
                 os.replace(db_file, corrupt_bak)
                 _VALIDATED_DB_FILES.clear()
-                try:
+                with contextlib.suppress(OSError):
                     os.chmod(corrupt_bak, 0o600)
-                except OSError:
-                    pass
                 for ext in ("-wal", "-shm", "-journal"):
                     side = db_file + ext
-                    if os.path.exists(side):
-                        try:
+                    if os.path.lexists(side):
+                        with contextlib.suppress(OSError):
                             os.replace(side, f"{corrupt_bak}{ext}")
                             os.chmod(f"{corrupt_bak}{ext}", 0o600)
-                        except OSError:
-                            pass
                 print(f"agent-memory: quarantined corrupted database to {corrupt_bak}, re-initializing clean schema", file=sys.stderr)
         conn = get_connection()
     else:
@@ -1308,9 +1335,12 @@ def init_db(force: bool = False, conn: sqlite3.Connection | None = None, silent_
                 secure_db_permissions()
                 return
 
-        backup_path, dropped = None, {}
+        backup_path: str | None = None
+        dropped: dict[str, int] = {}
         if ident["kind"] == "legacy":
             backup_path = _backup_live_db(conn, f"pre-format{SCHEMA_VERSION}-from{ident['format']}", "pre-migration")
+        elif ident["kind"] == "current" and force:
+            backup_path = _backup_live_db(conn, f"pre-force-format{SCHEMA_VERSION}", "pre-rebuild")
         conn.execute("PRAGMA foreign_keys = OFF;")
         try:
             with _Transaction(conn, "IMMEDIATE"):
@@ -1322,23 +1352,21 @@ def init_db(force: bool = False, conn: sqlite3.Connection | None = None, silent_
                 if ident["kind"] == "empty":
                     for stmt in SCHEMA_STATEMENTS:
                         conn.execute(stmt)
-                    try:
+                    with contextlib.suppress(sqlite3.OperationalError):
                         conn.execute("INSERT INTO observations_fts(observations_fts, rank) VALUES('secure-delete', 1);")
-                    except sqlite3.OperationalError:
-                        pass
                 elif ident["kind"] == "current" and not force:
                     if missing:
                         for stmt in SCHEMA_STATEMENTS:
                             conn.execute(stmt)
                     if fts_drift or (missing and any(kind in ("table", "trigger") for kind, _ in missing)):
                         conn.execute("INSERT INTO observations_fts(observations_fts) VALUES('rebuild');")
-                    try:
+                    with contextlib.suppress(sqlite3.OperationalError):
                         conn.execute("INSERT INTO observations_fts(observations_fts, rank) VALUES('secure-delete', 1);")
-                    except sqlite3.OperationalError:
-                        pass
                 else:
                     if ident["kind"] == "legacy" and not backup_path:
                         backup_path = _backup_live_db(conn, f"pre-format{SCHEMA_VERSION}-from{ident['format']}", "pre-migration")
+                    elif ident["kind"] == "current" and force and not backup_path:
+                        backup_path = _backup_live_db(conn, f"pre-force-format{SCHEMA_VERSION}", "pre-rebuild")
                     dropped = _rebuild_canonical(conn)
                 conn.execute(f"PRAGMA application_id = {APP_ID};")
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
@@ -1371,23 +1399,21 @@ _TOK_OR = ("OP", "OR")
 _VALID_FTS_COLS = ("content", "tags", "entity_name")
 _SANITIZE_CACHE: dict[str, str] = {}
 
-def _cache_put(cache: dict, key, val, max_size: int = 512):
+def _cache_put(cache: dict[Any, Any], key: Any, val: Any, max_size: int = 512) -> None:
     """Inserts a key-value pair into a bounded FIFO dictionary cache and evicts the oldest entry on saturation so memory usage stays bounded, preventing unbounded query caches from leaking memory in long-running MCP servers."""
     if len(cache) >= max_size:
-        try:
+        with contextlib.suppress(KeyError, StopIteration):
             cache.pop(next(iter(cache)))
-        except (KeyError, StopIteration):
-            pass
     cache[key] = val
 
-def _parse_fts_tree(tokens: list) -> list:
+def _parse_fts_tree(tokens: list[tuple[str, str]]) -> list[tuple[str, Any]]:
     """Parses flat classified FTS5 tokens into a bounded-depth nested group tree so boolean expressions are structured safely, preventing unbalanced parentheses or deep nesting from triggering SQLite FTS5 parser errors."""
-    root: list = []
-    stack: list[list] = [root]
+    root: list[tuple[str, Any]] = []
+    stack: list[list[tuple[str, Any]]] = [root]
     for kind, val in tokens:
         if kind == "LPAREN":
             if len(stack) <= 32:
-                grp: list = []
+                grp: list[tuple[str, Any]] = []
                 stack[-1].append(("GROUP", grp))
                 stack.append(grp)
         elif kind == "RPAREN":
@@ -1397,7 +1423,7 @@ def _parse_fts_tree(tokens: list) -> list:
             stack[-1].append((kind, val))
     return root
 
-def _eval_fts_group(items: list) -> tuple[str, list[str]] | None:
+def _eval_fts_group(items: list[tuple[str, Any]]) -> tuple[str, list[str]] | None:
     """Normalizes a parsed FTS5 token group into positive and negated clauses so unary NOT operators are rewritten into binary FTS5 NOT clauses, preventing SQLite FTS5 from rejecting leading unary NOT operators."""
     pos_clauses: list[tuple[str, list[str]]] = []
     neg_clauses: list[list[str]] = []
@@ -1407,7 +1433,7 @@ def _eval_fts_group(items: list) -> tuple[str, list[str]] | None:
     for kind, val in items:
         if kind == "OP":
             if val == "NOT":
-                negated = not negated
+                negated = True
             elif val in ("AND", "OR") and not negated:
                 pending_op = val
             continue
@@ -1676,17 +1702,18 @@ _SECRET_PATTERNS = [
     (re.compile(r"\bAGE-SECRET-KEY-1[A-Z0-9]{58}\b", re.IGNORECASE), "age secret key"),
     (re.compile(r"\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b"), "GitHub access token"),
     (re.compile(r"\bglpat-[A-Za-z0-9\-_]{20,}\b"), "GitLab personal access token"),
-    (re.compile(r"\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9\-_]{20,}\b"), "API secret key"),
+    (re.compile(r"\bsk[-_](?:proj[-_]|ant[-_]|live[-_]|test[-_])?[A-Za-z0-9\-_]{20,}\b"), "API secret key"),
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "AWS access key ID"),
     (re.compile(r"(?i)(?:^|[^A-Za-z0-9])aws_secret_access_key['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}['\"]?"), "AWS secret access key"),
     (re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"), "Google API key"),
     (re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b"), "Slack token"),
-    (re.compile(r"\b(?:pypi-AgEIcHlwaS5vcmc[A-Za-z0-9\-_]{50,}|hf_[A-Za-z0-9]{30,})\b"), "package registry token"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "JSON Web Token (JWT)"),
-    (re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s:@]{4,}@[^\s/]+"), "URL basic-auth credentials"),
+    (re.compile(r"\b(?:pypi-AgEIcHlwaS5vcmc[A-Za-z0-9\-_]{50,}|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36})\b"), "package registry token"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?\b"), "JSON Web Token (JWT)"),
+    (re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:[^/\s:@]{4,}@[^\s/]+"), "URL basic-auth credentials"),
     (re.compile(r"https://(?:hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+|(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+)"), "webhook URL secret"),
     (re.compile(r"\bbearer\s+(?=[A-Za-z0-9\-._~+/=]*[0-9\-._~+/=])[A-Za-z0-9\-._~+/]{16,}=*(?=\s|$|['\",;)])", re.IGNORECASE), "bearer authentication token"),
-    (re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:password|passwd|pwd|client_secret|api_secret|api_key|apikey|secret_key|api_token|bot_token|access_token|refresh_token|auth_token|private_token|session_token|private_key|encryption_key|signing_key|secret|token)['\"]?\s*[:=]\s*(?!(?:['\"]?(?:none|null|true|false|redacted|example|placeholder|changeme|\$[A-Za-z_][A-Za-z0-9_]*|<[^>]+>|\$\{[^}]+\})['\"]?)(?:\s|[,;}\])]|$))(?:'[^'\n]{8,}'|\"[^\"\n]{8,}\"|[^\s'\",;}]{8,})"), "credential assignment"),
+    (re.compile(r"\b(?:SecretStr|SecretBytes|SecretValue|SensitiveStr|RedactedStr)\s*\(\s*['\"][^'\"]{4,}['\"]\s*\)"), "wrapped secret literal"),
+    (re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:password|passwd|pwd|pgpassword|db_pass|db_password|master_key|id_token|x_api_key|auth_secret|jwt_secret|hmac_key|private_key_id|client_secret|api_secret|api_key|apikey|secret_key|api_token|bot_token|access_token|refresh_token|auth_token|private_token|session_token|private_key|encryption_key|signing_key|secret|token)['\"]?\s*[:=]\s*(?!(?:['\"]?(?:none|null|true|false|redacted|example|placeholder|changeme|\$[A-Za-z_][A-Za-z0-9_]*|<[^>]+>|\$\{[A-Za-z_][A-Za-z0-9_]*\})['\"]?)(?:\s|[,;}\])]|$))(?:'[^'\n]{8,}'|\"[^\"\n]{8,}\"|[^\s'\",;}]{8,})"), "credential assignment"),
 ]
 
 _NON_CLINICAL_PROSE_RE = re.compile(
@@ -1699,24 +1726,31 @@ _JSON_C0_ESCAPE_RE = re.compile(
     re.IGNORECASE,
 )
 
-def _collect_screen_strings(obj: Any) -> list[str]:
-    """Recursively extracts string keys, string values, and key=value pairs from nested dictionaries or lists so pre-serialization secret and prose screening covers all nested fields, preventing nested JSON attributes from bypassing secret or input validation checks."""
+def _collect_screen_strings(obj: Any, depth: int = 0, parent_key: str | None = None) -> list[str]:
+    """Recursively extracts string keys, string values, and key=value pairs from nested dictionaries or lists up to depth 32 so pre-serialization secret and prose screening covers all nested fields, preventing nested JSON attributes or deep recursion from bypassing validation."""
+    if depth > 32:
+        raise ValueError("Attributes or metadata nesting exceeds maximum depth of 32.")
     out: list[str] = []
     if isinstance(obj, str):
         out.append(obj)
+        if parent_key:
+            out.append(f"{parent_key}={obj}")
+            out.append(f'{parent_key}="{obj}"')
     elif isinstance(obj, dict):
         for k, v in obj.items():
             if isinstance(k, str):
                 out.append(k)
+            next_key = k if isinstance(k, str) else parent_key
             if isinstance(v, str):
                 out.append(v)
-                if isinstance(k, str):
-                    out.append(f"{k}={v}")
+                if next_key:
+                    out.append(f"{next_key}={v}")
+                    out.append(f'{next_key}="{v}"')
             elif isinstance(v, (dict, list, tuple)):
-                out.extend(_collect_screen_strings(v))
+                out.extend(_collect_screen_strings(v, depth + 1, next_key))
     elif isinstance(obj, (list, tuple)):
         for item in obj:
-            out.extend(_collect_screen_strings(item))
+            out.extend(_collect_screen_strings(item, depth + 1, parent_key))
     return out
 
 def _screen_for_secrets(*values: str | None) -> str | None:
@@ -1813,8 +1847,8 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
             return {"error": "Entity summary must be a string."}
         clean_summary = _normalize_nfc(summary).strip()
         if not clean_summary:
-            clean_summary = None
-        elif len(clean_summary) > MAX_SUMMARY_CHARS:
+            return {"error": "Entity summary cannot be empty."}
+        if len(clean_summary) > MAX_SUMMARY_CHARS:
             return {"error": f"Entity summary exceeds {MAX_SUMMARY_CHARS} characters."}
 
     has_attr_arg = attributes is not None
@@ -1874,13 +1908,18 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
         else:
             return {"error": "Tags must be a list of strings or a comma-separated string."}
 
+    if len(raw_tag_items) > MAX_TAGS:
+        return {"error": f"Too many tags ({len(raw_tag_items)}), exceeding the limit of {MAX_TAGS}."}
+
     tag_list = []
     seen_tags = set()
     for t in raw_tag_items:
         if not isinstance(t, str):
             return {"error": "All tags must be strings."}
         ts = _normalize_nfc(t).strip().strip('"\'').strip()
-        if ts and ts.lower() not in seen_tags:
+        if not ts:
+            return {"error": "Tag cannot be empty."}
+        if ts.lower() not in seen_tags:
             if len(ts) > MAX_TAG_CHARS:
                 return {"error": f"Tag exceeds {MAX_TAG_CHARS} characters (got {len(ts)})."}
             seen_tags.add(ts.lower())
@@ -1892,7 +1931,10 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
 
     screen_targets: list[str | None] = [clean_content, clean_name, clean_summary, clean_session, *tag_list]
     if attr_dict_for_screen is not None:
-        screen_targets.extend(_collect_screen_strings(attr_dict_for_screen))
+        try:
+            screen_targets.extend(_collect_screen_strings(attr_dict_for_screen))
+        except ValueError as e:
+            return {"error": str(e)}
     matched_rule = _screen_for_secrets(*screen_targets)
     if matched_rule:
         return {"error": f"Secret hygiene check failed: input contains {matched_rule}. Never record raw credentials, tokens, or private keys into memory."}
@@ -1933,12 +1975,30 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
             entity_id = None
             canonical_name = None
             if clean_name:
+                dup_in_tx = conn.execute(
+                    """
+                    SELECT o.observation_id, o.category, o.session_id, e.entity_id, e.name
+                    FROM entities e
+                    JOIN observations o ON e.entity_id = o.entity_id
+                    WHERE e.name = ? COLLATE NOCASE AND o.content = ?
+                    LIMIT 1;
+                    """,
+                    (clean_name, clean_content),
+                ).fetchone()
+                if dup_in_tx:
+                    return {
+                        "status": "exists",
+                        "observation_id": dup_in_tx[0],
+                        "entity_id": dup_in_tx[3],
+                        "entity_name": dup_in_tx[4],
+                        "category": dup_in_tx[1],
+                        "session_id": dup_in_tx[2],
+                    }
                 if clean_attributes:
                     existing_attr_row = conn.execute(
                         "SELECT attributes FROM entities WHERE name = ? COLLATE NOCASE;",
                         (clean_name,),
                     ).fetchone()
-                # Enforce RFC 7396 JSON Merge Patch semantics where null deletes a key and {} is a no-op.
                 if clean_attributes and existing_attr_row and existing_attr_row[0]:
                     merged_len = conn.execute(
                         "SELECT CASE WHEN json_valid(?1) = 1 THEN length(json_patch(?1, ?2)) ELSE length(json_patch('{}', ?2)) END;",
@@ -1994,10 +2054,8 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
         return {"error": f"Record observation failed: {e}"}
     finally:
         if should_close and conn is not None:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.close()
-            except sqlite3.Error:
-                pass
 
 def relate_entities(source_name: str, target_name: str, relation_type: str,
                     weight: float | None = None, metadata: dict[str, Any] | str | None = None,
@@ -2049,7 +2107,10 @@ def relate_entities(source_name: str, target_name: str, relation_type: str,
 
     rel_screen_targets: list[str | None] = [s_clean, t_clean, r_type]
     if metadata is not None:
-        rel_screen_targets.extend(_collect_screen_strings(metadata))
+        try:
+            rel_screen_targets.extend(_collect_screen_strings(metadata))
+        except ValueError as e:
+            return {"error": str(e)}
     matched_rule = _screen_for_secrets(*rel_screen_targets)
     if matched_rule:
         return {"error": f"Secret hygiene check failed: input contains {matched_rule}. Never record raw credentials, tokens, or private keys into memory."}
@@ -2149,10 +2210,8 @@ def relate_entities(source_name: str, target_name: str, relation_type: str,
         return {"error": f"Relate entities failed: {e}"}
     finally:
         if should_close and conn is not None:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.close()
-            except sqlite3.Error:
-                pass
 
 _STOPWORDS = frozenset((
     "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could", "did", "do",
@@ -2211,11 +2270,11 @@ def build_plain_fts_queries(text: str) -> tuple[str, str | None] | None:
     _cache_put(_PLAIN_QUERY_CACHE, text, res, 512)
     return res
 
-_INLINE_CATEGORY_RE = re.compile(r'(?:(?<=[\s(])|^)(?:(NOT)\s+|([-+]?))category:\s*(?:"((?:""|[^"])*)"|([^\s()"]+))', re.IGNORECASE)
-_OR_LEFT_RE = re.compile(r'\bOR\s*$', re.IGNORECASE)
-_OR_RIGHT_RE = re.compile(r'^\s*\bOR\b', re.IGNORECASE)
-_AND_LEFT_RE = re.compile(r'(?:^|\s+)\bAND\s*$', re.IGNORECASE)
-_AND_RIGHT_RE = re.compile(r'^\s*\bAND\b(?:\s+|$)', re.IGNORECASE)
+_INLINE_CATEGORY_RE = re.compile(r'(?:(?<=[\s(])|^)(?:(NOT)\s+|([-+]?))(?i:category:)\s*(?:"((?:""|[^"])*)"|([^\s()"]+))')
+_OR_LEFT_RE = re.compile(r'\bOR\s*$')
+_OR_RIGHT_RE = re.compile(r'^\s*\bOR\b')
+_AND_LEFT_RE = re.compile(r'(?:^|\s+)\bAND\s*$')
+_AND_RIGHT_RE = re.compile(r'^\s*\bAND\b(?:\s+|$)')
 
 def _extract_inline_category(query: str) -> tuple[str, str | None, str | None]:
     """Extracts a top-level inline `category:` filter from a search query string so category filtering routes to SQL WHERE clauses, preventing FTS5 MATCH errors on the UNINDEXED `category` column."""
@@ -2664,37 +2723,29 @@ def recall_entity(name: str, session_id: str | None = None, limit: int | None = 
             except sqlite3.Error:
                 pass
 
-def _scrub_deleted(conn: sqlite3.Connection):
+def _scrub_deleted(conn: sqlite3.Connection) -> None:
     """Purges deleted memory records by optimizing the FTS5 inverted index and checkpointing WAL frames so residual data is scrubbed, preventing uncompacted segments and WAL frames from retaining deleted plaintext on disk."""
     try:
-        try:
+        with contextlib.suppress(sqlite3.OperationalError, sqlite3.DatabaseError):
             conn.execute("INSERT INTO observations_fts(observations_fts) VALUES('optimize');")
-        except (sqlite3.OperationalError, sqlite3.DatabaseError):
-            pass
 
         conn.execute("PRAGMA busy_timeout = 250;")
         truncated = False
         for attempt in range(4):
-            try:
+            with contextlib.suppress(sqlite3.OperationalError):
                 row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
                 if row and row[0] == 0:
                     truncated = True
                     break
-            except sqlite3.OperationalError:
-                pass
             time.sleep(0.05 * (attempt + 1))
         if not truncated:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
-            except sqlite3.Error:
-                pass
     except (sqlite3.Error, OSError):
         pass
     finally:
-        try:
+        with contextlib.suppress(sqlite3.Error):
             conn.execute("PRAGMA busy_timeout = 5000;")
-        except sqlite3.Error:
-            pass
 
 def _prune_orphan_stub_entities(conn: sqlite3.Connection, entity_ids: list[str] | set[str]) -> None:
     """Deletes auto-created `concept` stub entities that have zero remaining observations, relations, summary, or attributes so the entity graph stays clean, preventing orphaned stub rows after deletion."""
@@ -2833,32 +2884,28 @@ def forget_memory(observation_id: str | None = None, entity: str | None = None, 
         return {"error": f"Forget failed: {e}"}
     finally:
         if should_close and conn is not None:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.close()
-            except sqlite3.Error:
-                pass
 
 _ENTITY_TYPES_ENUM = ["service", "repo", "pattern", "concept", "operator", "host"]
 _CATEGORIES_ENUM = ["architecture", "decision", "invariant", "preference", "debug_finding"]
 
-# Advertised MCP tool schemas list canonical parameter names only. The dispatcher still
-# accepts legacy aliases (entity_name/name, type, session) for compatibility.
 TOOLS = [
     {
         "name": "memory_record",
-        "description": "Store one durable fact (decision, invariant, preference, architecture note, or debug finding), optionally attached to a named entity. Returns observation_id. If that entity already has the identical fact, returns the existing one with status=exists. Record clinical 7-bit ASCII technical prose only, with zero stage directions or conversational flourishes.",
+        "description": "Stores one durable fact (decision, invariant, preference, architecture note, or debug finding) optionally attached to a named entity and returns observation_id (or status=exists if identical) in clinical 7-bit ASCII prose so cross-session knowledge is persisted deterministically, preventing duplicate facts, stage directions, or context loss.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "minLength": 1, "maxLength": MAX_CONTENT_CHARS, "description": "The fact to remember, as one self-contained sentence or short paragraph."},
-                "entity": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Entity this fact is about (e.g. a service, repo, or host name). Created if missing, matched case-insensitively."},
-                "entity_type": {"type": "string", "enum": _ENTITY_TYPES_ENUM, "description": "Entity type. Only applied when not 'concept', or omit to keep the existing type. (Requires 'entity' to be specified)."},
-                "summary": {"type": "string", "minLength": 1, "maxLength": MAX_SUMMARY_CHARS, "description": "One-line description of the entity (replaces the previous summary). (Requires 'entity' to be specified)."},
-                "category": {"type": "string", "enum": _CATEGORIES_ENUM, "default": "architecture", "description": "Kind of fact."},
-                "tags": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": MAX_TAG_CHARS}, "maxItems": MAX_TAGS, "description": "Keyword tags."},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How certain the fact is."},
-                "session_id": {"type": "string", "minLength": 1, "maxLength": MAX_SESSION_CHARS, "default": "default", "description": "Free-form label (e.g. task or project). A filter label only, not an isolation boundary."},
-                "attributes": {"type": "object", "description": "Entity key/values (max 4000 serialized characters), merged with existing ones (JSON Merge Patch: a null value deletes that key). (Requires 'entity' to be specified)."}
+                "content": {"type": "string", "minLength": 1, "maxLength": MAX_CONTENT_CHARS, "description": "Specifies the self-contained fact statement (1-8000 characters) in clinical 7-bit ASCII prose so historical observations remain unambiguous across sessions, preventing truncated or context-free notes."},
+                "entity": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Specifies the target entity name (service, repo, pattern, concept, operator, or host) matched case-insensitively and created if missing so facts attach to the knowledge graph, preventing orphaned entity references."},
+                "entity_type": {"type": "string", "enum": _ENTITY_TYPES_ENUM, "description": "Specifies the canonical entity classification (applied when not 'concept', or omitted to preserve the existing type when 'entity' is specified) so graph nodes retain accurate taxonomy, preventing accidental type downgrades."},
+                "summary": {"type": "string", "minLength": 1, "maxLength": MAX_SUMMARY_CHARS, "description": "Specifies a one-line description of the entity (1-2000 characters, replacing the previous summary when 'entity' is specified) so entity recall returns a concise overview, preventing stale or missing entity summaries."},
+                "category": {"type": "string", "enum": _CATEGORIES_ENUM, "default": "architecture", "description": "Specifies the observation classification category so stored facts can be filtered by engineering concern, preventing unstructured observation sprawl."},
+                "tags": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": MAX_TAG_CHARS}, "maxItems": MAX_TAGS, "description": "Specifies up to 50 non-empty keyword tags (1-100 characters each) so full-text and tag-filtered searches match related facts, preventing unindexed observations."},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "Specifies the certainty score between 0.0 and 1.0 (default 1.0) so consumers can weight verified invariants above tentative findings, preventing uncalibrated confidence assumptions."},
+                "session_id": {"type": "string", "minLength": 1, "maxLength": MAX_SESSION_CHARS, "default": "default", "description": "Specifies a free-form session or task filter label (default 'default', not an isolation boundary) so observations can be scoped by workflow, preventing untraceable session provenance."},
+                "attributes": {"type": "object", "description": "Specifies an entity key/value map (up to 4000 serialized characters, merged via RFC 7396 JSON Merge Patch where null deletes a key when 'entity' is specified) so structured entity metadata stays current, preventing full-object overwrite loss."}
             },
             "required": ["content"],
             "additionalProperties": False
@@ -2866,14 +2913,14 @@ TOOLS = [
     },
     {
         "name": "memory_search",
-        "description": "Full-text search over stored facts. Requires at least 'query' or 'category'. Plain words match facts containing all of them (common stopwords ignored, match=all_terms). If none do, facts containing any of them are returned (match=some_terms). Supports \"exact phrase\", -exclude (needs at least one positive term), UPPERCASE AND/OR/NOT, and entity_name:/tags:/content: filters. Results are ordered by rank (BM25, lower is better).",
+        "description": "Executes BM25-ranked SQLite FTS5 full-text search over stored facts (requiring 'query' or 'category', matching all terms first as match=all_terms then relaxing to match=some_terms, and supporting exact phrases, -exclude, UPPERCASE AND/OR/NOT, and entity_name:/tags:/content: filters) so relevant observations are retrieved rapidly, preventing full-store context dumps.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_CHARS, "description": "Search text. May be omitted when category is given (returns the most recent facts in that category, match=category)."},
-                "category": {"type": "string", "enum": _CATEGORIES_ENUM, "description": "Restrict to one category. May be used without query to list newest category facts."},
-                "session_id": {"type": "string", "minLength": 1, "maxLength": MAX_SESSION_CHARS, "description": "Restrict to one session label."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10, "description": "Maximum results (1-100, default 10)."}
+                "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_CHARS, "description": "Specifies the full-text search expression (1-2000 characters, optional when 'category' is provided to list newest category facts with match=category) so matching observations are ranked by BM25 relevance, preventing unbounded table scans."},
+                "category": {"type": "string", "enum": _CATEGORIES_ENUM, "description": "Restricts search results to a single observation category (and lists newest facts in that category when 'query' is omitted) so lookups target a specific engineering domain, preventing cross-category noise."},
+                "session_id": {"type": "string", "minLength": 1, "maxLength": MAX_SESSION_CHARS, "description": "Restricts search results to observations recorded under a specific session label so task-scoped facts can be isolated, preventing unrelated session hits."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10, "description": "Caps the maximum number of returned observations (1-100, default 10) so response payloads stay within prompt token budgets, preventing context window bloat."}
             },
             "required": [],
             "additionalProperties": False
@@ -2881,15 +2928,15 @@ TOOLS = [
     },
     {
         "name": "memory_recall",
-        "description": "Get everything known about one entity: type, summary, attributes, recent facts, and incoming/outgoing relations.",
+        "description": "Retrieves the complete knowledge profile for a single entity (type, summary, attributes, recent observations, and incoming/outgoing relations) so agents recover prior architectural context at task start, preventing duplicate discovery or broken invariants.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "entity": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Entity name (case-insensitive)."},
-                "category": {"type": "string", "enum": _CATEGORIES_ENUM, "description": "Optional category filter (e.g. invariant, decision, architecture)."},
-                "session_id": {"type": "string", "minLength": 1, "maxLength": MAX_SESSION_CHARS, "description": "Only include facts with this session label."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Maximum facts (newest first), where has_more_observations signals truncation. If true, re-call with limit=100 or use memory_search."},
-                "relation_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50, "description": "Maximum relations per direction, where has_more_outgoing_relations and has_more_incoming_relations signal truncation. If true, re-call with relation_limit=100."}
+                "entity": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Specifies the case-insensitive entity name to recall (1-200 characters) so the matching graph node and its attached observations are loaded, preventing ambiguous entity lookups."},
+                "category": {"type": "string", "enum": _CATEGORIES_ENUM, "description": "Filters the entity's returned observations to a single category (such as invariant, decision, or architecture) so recall focuses on the requested concern, preventing irrelevant observation noise."},
+                "session_id": {"type": "string", "minLength": 1, "maxLength": MAX_SESSION_CHARS, "description": "Filters the entity's returned observations to a specific session label so workflow-specific facts can be inspected, preventing cross-session clutter."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Caps the maximum number of newest observations returned (1-100, default 20, setting has_more_observations=true when truncated so callers can re-call with limit=100 or use memory_search), preventing unbounded observation payloads."},
+                "relation_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50, "description": "Caps the maximum number of incoming and outgoing relations returned per direction (1-100, default 50, setting has_more_outgoing_relations or has_more_incoming_relations when truncated so callers can re-call with relation_limit=100), preventing unbounded graph edge payloads."}
             },
             "required": ["entity"],
             "additionalProperties": False
@@ -2897,15 +2944,15 @@ TOOLS = [
     },
     {
         "name": "memory_relate",
-        "description": "Create or update a directed edge 'source relation_type target' between two distinct entities (created if missing). Use clinical technical entity names, relation types, and metadata only.",
+        "description": "Creates or updates a directed graph edge ('source relation_type target') between two distinct entities (auto-creating missing entities in clinical 7-bit ASCII) so system topology is modeled explicitly, preventing undocumented service or repository dependencies.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "source": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Source entity name."},
-                "target": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Target entity name (must differ from source)."},
-                "relation_type": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "default": "references", "description": "Forward verb in snake_case, e.g. depends_on, hosted_on, deploys_to, provisions, governs, references, synchronizes_with, stores_data_for, authenticates_against."},
-                "weight": {"type": "number", "minimum": 0, "maximum": 100, "description": "Edge strength, 1.0 on create, unchanged on update if omitted."},
-                "metadata": {"type": "object", "description": "Edge key/values (max 4000 serialized characters), merged with existing ones (null deletes a key)."}
+                "source": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Specifies the source entity name (1-200 characters, matched case-insensitively) so the outgoing graph edge originates from a canonical node, preventing dangling edge sources."},
+                "target": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Specifies the target entity name (1-200 characters, distinct from 'source') so the directed graph edge terminates at a valid destination node, preventing self-referential loops."},
+                "relation_type": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "default": "references", "description": "Specifies the forward verb in snake_case (such as depends_on, hosted_on, deploys_to, provisions, governs, references, synchronizes_with, stores_data_for, or authenticates_against) so edge semantics stay uniform, preventing inconsistent relation predicates."},
+                "weight": {"type": "number", "minimum": 0, "maximum": 100, "description": "Specifies the numeric edge strength between 0.0 and 100.0 (1.0 on create, preserved on update when omitted) so relation priority is quantifiable, preventing unweighted edge ambiguity."},
+                "metadata": {"type": "object", "description": "Specifies an edge key/value map (up to 4000 serialized characters, merged via RFC 7396 JSON Merge Patch where null deletes a key) so relationship attributes are maintained incrementally, preventing metadata overwrite loss."}
             },
             "required": ["source", "target"],
             "additionalProperties": False
@@ -2913,15 +2960,15 @@ TOOLS = [
     },
     {
         "name": "memory_forget",
-        "description": "Delete stored memory. Requires exactly one mode: observation_id (single fact), entity (entity with all facts and relations), or source+target (relation edge(s)).",
+        "description": "Deletes stored memory using exactly one target mode (observation_id for a single fact, entity for an entity and all attached facts/relations, or source+target for relation edges) and scrubs deleted storage pages so obsolete or erroneous records are purged, preventing stale or sensitive data retention.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "observation_id": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Delete this single fact by ID."},
-                "entity": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Delete this entity and everything attached to it."},
-                "source": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Relation source (use with target)."},
-                "target": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Relation target (use with source)."},
-                "relation_type": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Only delete edges of this type (default: all types between source and target)."}
+                "observation_id": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Specifies the unique observation ID to delete in single-fact mode so the targeted observation is removed from SQLite and FTS5 indexes, preventing stale fact retention."},
+                "entity": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Specifies the entity name to cascade-delete along with all of its observations and relations so decommissioned nodes are purged completely, preventing orphaned graph records."},
+                "source": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Specifies the source entity name when deleting directed relation edges (used together with 'target') so edge removal is scoped to the exact origin node, preventing unintended edge deletion."},
+                "target": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Specifies the target entity name when deleting directed relation edges (used together with 'source') so edge removal is scoped to the exact destination node, preventing unintended edge deletion."},
+                "relation_type": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS, "description": "Restricts relation edge deletion between 'source' and 'target' to a single snake_case verb (deleting all edge types between the pair when omitted) so other relationships between the same entities remain intact, preventing over-broad edge pruning."}
             },
             "required": [],
             "additionalProperties": False
@@ -2930,7 +2977,6 @@ TOOLS = [
 ]
 MUTATING_TOOLS = frozenset(("memory_record", "memory_relate", "memory_forget"))
 
-# Sent in the MCP initialize result. mcp/instructions.md in the bundle is this exact text.
 MCP_INSTRUCTIONS = (
     "# Agent Memory MCP Instructions\n"
     "\n"
@@ -2974,7 +3020,7 @@ _RPC_TURN_COUNTER = 0
 
 _INT_CACHE = tuple(str(i) for i in range(1024))
 
-def _format_id(req_id) -> str:
+def _format_id(req_id: Any) -> str:
     """Serializes a JSON-RPC request ID using a pre-allocated integer cache for IDs 0..1023 so response framing is accelerated, preventing `json.dumps` overhead on common integer request IDs."""
     if type(req_id) is int:
         if 0 <= req_id < 1024:
@@ -2984,12 +3030,12 @@ def _format_id(req_id) -> str:
 
 _STATIC_PING_RESP = tuple(RawJsonStr(f'{{"jsonrpc":"2.0","id":{i},"result":{{}}}}') for i in range(128))
 
-def _format_templated_resp(req_id, result_json_str: str) -> RawJsonStr:
+def _format_templated_resp(req_id: Any, result_json_str: str) -> RawJsonStr:
     """Wraps a pre-serialized JSON result string into a JSON-RPC 2.0 response envelope so static payloads are served quickly, preventing repeated JSON encoding on every request."""
     id_token = _format_id(req_id)
     return RawJsonStr(f'{{"jsonrpc":"2.0","id":{id_token},"result":{result_json_str}}}')
 
-def _format_rpc_error(req_id, code: int, message: str) -> RawJsonStr:
+def _format_rpc_error(req_id: Any, code: int, message: str) -> RawJsonStr:
     """Formats a JSON-RPC 2.0 error response with proper JSON string escaping so protocol errors are reported cleanly, preventing unescaped error strings from breaking JSON-RPC client parsers."""
     id_part = "null" if req_id is None else _format_id(req_id)
     clean_msg = json.dumps(message, ensure_ascii=False)
@@ -3032,8 +3078,6 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
     if not isinstance(method, str) or not method:
         return _format_rpc_error(req_id, -32600, "Invalid Request: 'method' must be a non-empty string")
 
-    # If this is a notification (no id), per JSON-RPC 2.0:
-    # "The Server MUST NOT reply to a Notification, including those that are within a batch request."
     if not has_id:
         return None
 
@@ -3057,10 +3101,8 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
         if mcp_conn is not None and _MCP_DB_INODE is not None:
             cur_ino = _current_db_inode()
             if cur_ino != _MCP_DB_INODE:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     mcp_conn.close()
-                except sqlite3.Error:
-                    pass
                 mcp_conn = None
                 _MCP_DB_INODE = None
                 _VALIDATED_DB_FILES.clear()
@@ -3084,10 +3126,8 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                     err_holder[0] = None
             except (sqlite3.Error, RuntimeError, OSError, ValueError, TypeError) as _re_err:
                 if mcp_conn is not None:
-                    try:
+                    with contextlib.suppress(sqlite3.Error):
                         mcp_conn.close()
-                    except sqlite3.Error:
-                        pass
                     mcp_conn = None
                 _MCP_DB_INODE = None
                 unavailable = str(_re_err) or _re_err.__class__.__name__
@@ -3108,19 +3148,15 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                 except sqlite3.Error as e:
                     live_format = f"unreadable ({e})"
                 if not is_read_only and isinstance(live_format, int) and 0 <= live_format < SCHEMA_VERSION:
-                    try:
+                    with contextlib.suppress(sqlite3.Error, RuntimeError, OSError):
                         init_db(conn=mcp_conn, silent_migration_log=True)
                         live_format = mcp_conn.execute("PRAGMA user_version;").fetchone()[0]
-                    except (sqlite3.Error, RuntimeError, OSError):
-                        pass
                 if live_format != SCHEMA_VERSION:
                     mismatch_msg = (f"The database storage format is now {live_format} (this server uses {SCHEMA_VERSION}) "
                                     "because another agent-memory build changed it. Restart the agent client.")
                     tool_result = {"error": mismatch_msg}
-                    try:
+                    with contextlib.suppress(sqlite3.Error):
                         mcp_conn.close()
-                    except sqlite3.Error:
-                        pass
                     mcp_conn = None
                     if conn_holder is not None:
                         conn_holder[0] = None
@@ -3321,28 +3357,24 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
         return _format_templated_resp(req_id, "{}")
 
     elif method == "notifications/initialized":
-        return _format_templated_resp(req_id, "{}")
+        return _format_rpc_error(req_id, -32600, "Invalid Request: 'notifications/initialized' is a notification and must not include 'id'")
 
     else:
         return _format_rpc_error(req_id, -32601, f"Method '{method}' not found")
 
-def serve_mcp():
+def serve_mcp() -> None:
     """Runs the stdio JSON-RPC MCP server loop over a persistent hot SQLite connection so agent tool calls execute with low latency, preventing per-request connection teardown from evicting memory-mapped pages."""
     global _MCP_DB_INODE
 
-    def _sig_handler(signum, frame):
+    def _sig_handler(signum: int, frame: FrameType | None) -> None:
         """Handles `SIGTERM` and `SIGINT` by masking recursive signals and exiting cleanly with status 0 so `finally` connection teardown runs, preventing abrupt process termination from leaving uncheckpointed WAL frames."""
-        try:
+        with contextlib.suppress(ValueError, AttributeError, OSError):
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except (ValueError, AttributeError, OSError):
-            pass
         sys.exit(0)
-    try:
+    with contextlib.suppress(ValueError, AttributeError):
         signal.signal(signal.SIGTERM, _sig_handler)
         signal.signal(signal.SIGINT, _sig_handler)
-    except (ValueError, AttributeError):
-        pass
 
     is_ro_media = False
     target_check_dir = os.path.dirname(os.path.realpath(DB_PATH))
@@ -3353,8 +3385,6 @@ def serve_mcp():
     except OSError:
         is_ro_media = False
 
-    # On a storage failure the server still completes the MCP handshake and lists its tools,
-    # and every tool call then returns the reason so the agent (not only the client log) sees it.
     mcp_conn, startup_error = None, None
     try:
         if is_ro_media:
@@ -3365,27 +3395,26 @@ def serve_mcp():
         _MCP_DB_INODE = _current_db_inode()
     except (RuntimeError, OSError, sqlite3.Error, ValueError) as e:
         if mcp_conn is not None:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 mcp_conn.close()
-            except sqlite3.Error:
-                pass
             mcp_conn = None
         _MCP_DB_INODE = None
         startup_error = str(e) or e.__class__.__name__
         sys.stderr.write(f"agent-memory: storage unavailable, serving in degraded mode: {startup_error}\n")
         sys.stderr.flush()
 
-    conn_holder = [mcp_conn]
-    err_holder = [startup_error]
+    conn_holder: list[sqlite3.Connection | None] = [mcp_conn]
+    err_holder: list[str | None] = [startup_error]
 
-    MAX_PAYLOAD_SIZE = 16 * 1024 * 1024  # 16 MiB guard against unbounded memory exhaustion
+    MAX_PAYLOAD_SIZE = 16 * 1024 * 1024
+    MAX_BATCH_SIZE = 128
 
     stdout_write = sys.stdout.write
     stdout_flush = sys.stdout.flush
     stdin_readline = sys.stdin.readline
     format_rpc_error = _format_rpc_error
 
-    def _send_rpc(payload):
+    def _send_rpc(payload: Any) -> None:
         """Writes a single or batched JSON-RPC 2.0 response line to `stdout` and flushes the stream so MCP replies are delivered immediately, preventing buffered output or broken-pipe exceptions from hanging the server."""
         if isinstance(payload, RawJsonStr):
             stdout_write(payload)
@@ -3414,6 +3443,7 @@ def serve_mcp():
                 continue
 
             current_req_id = None
+            current_has_id = True
             try:
                 clean_raw = raw_line.lstrip("\ufeff")
                 if clean_raw and clean_raw[0] in ("{", "["):
@@ -3430,7 +3460,8 @@ def serve_mcp():
                     continue
 
                 if isinstance(msg, dict):
-                    current_req_id = msg.get("id") if "id" in msg else None
+                    current_has_id = "id" in msg
+                    current_req_id = msg.get("id") if current_has_id else None
                     resp = process_single_rpc(msg, conn_holder[0], TOOLS, is_read_only=is_ro_media,
                                               unavailable=err_holder[0], conn_holder=conn_holder, err_holder=err_holder)
                     if resp is not None:
@@ -3438,6 +3469,8 @@ def serve_mcp():
                 elif isinstance(msg, list):
                     if len(msg) == 0:
                         _send_rpc(format_rpc_error(None, -32600, "Invalid Request: batch array cannot be empty"))
+                    elif len(msg) > MAX_BATCH_SIZE:
+                        _send_rpc(format_rpc_error(None, -32600, f"Invalid Request: batch size {len(msg)} exceeds maximum allowed ({MAX_BATCH_SIZE})"))
                     else:
                         batch_resps = []
                         for req_item in msg:
@@ -3458,25 +3491,23 @@ def serve_mcp():
             except (RuntimeError, OSError, sqlite3.Error, ValueError, TypeError) as e:
                 sys.stderr.write(f"MCP server loop error: {e}\n")
                 sys.stderr.flush()
-                try:
-                    _send_rpc(format_rpc_error(current_req_id, -32603, f"Internal error: {e}"))
-                except (OSError, ValueError, TypeError):
-                    pass
+                if current_has_id:
+                    with contextlib.suppress(OSError, ValueError, TypeError):
+                        _send_rpc(format_rpc_error(current_req_id, -32603, f"Internal error: {e}"))
     except BrokenPipeError:
-        try:
+        with contextlib.suppress(OSError):
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, sys.stdout.fileno())
             os.close(devnull)
-        except OSError:
-            pass
     finally:
+        with contextlib.suppress(ValueError, AttributeError, OSError):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
         active_conn = conn_holder[0] if (conn_holder and conn_holder[0] is not None) else mcp_conn
         if active_conn is not None:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 if active_conn.in_transaction:
                     active_conn.rollback()
-            except sqlite3.Error:
-                pass
             if not is_ro_media and _MCP_DB_INODE is not None and _current_db_inode() == _MCP_DB_INODE:
                 try:
                     cur = active_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -3486,15 +3517,11 @@ def serve_mcp():
                         cur = active_conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
                         cur.close()
                 except sqlite3.Error:
-                    try:
+                    with contextlib.suppress(sqlite3.Error):
                         cur = active_conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
                         cur.close()
-                    except sqlite3.Error:
-                        pass
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 active_conn.close()
-            except sqlite3.Error:
-                pass
 
 _CLI_SUBCMD_OPTS: dict[str, dict[str, Any]] = {
     "search": {
@@ -3546,10 +3573,9 @@ for _def in _CLI_SUBCMD_OPTS.values():
     _def["all_opts"] = _def["takes_val"] | _def["no_val"]
     _def["long_opts"] = sorted(o for o in _def["all_opts"] if o.startswith("--"))
 
-# Short options whose value is numeric and may be attached (e.g. -l5, -n200, -w2.5).
 _NUMERIC_SHORT_OPTS = {"-l", "-n", "-w"}
 
-def _normalize_cli_argv(argv):
+def _normalize_cli_argv(argv: list[str]) -> list[str]:
     """Normalizes CLI arguments so positional payloads starting with hyphens do not trigger argparse flag errors, preventing unescaped leading hyphens from breaking CLI invocations."""
     if len(argv) <= 2:
         return argv
@@ -3574,8 +3600,8 @@ def _normalize_cli_argv(argv):
     if not has_dash:
         return argv
 
-    options = []
-    positionals = []
+    options: list[str] = []
+    positionals: list[str] = []
     n_raw = len(raw)
     idx = 0
 
@@ -3598,7 +3624,13 @@ def _normalize_cli_argv(argv):
             if idx + 1 < n_raw:
                 nxt = raw[idx + 1]
                 nxt_base = nxt.partition("=")[0]
-                nxt_is_opt = nxt in all_opts or nxt_base in all_opts
+                nxt_is_opt = (
+                    nxt in all_opts
+                    or nxt_base in all_opts
+                    or (nxt[:2] in _NUMERIC_SHORT_OPTS and nxt[:2] in takes_val and nxt[2:].replace(".", "", 1).isdigit())
+                    or (cmd == "record" and nxt.startswith("-a") and len(nxt) > 2)
+                    or (nxt.startswith("-c") and cmd in ("search", "recall", "record") and nxt[2:] in _CATEGORIES_ENUM)
+                )
                 if not nxt_is_opt and nxt.startswith("--") and nxt != "--":
                     nxt_cands = [o for o in long_opts if o.startswith(nxt_base)]
                     if len(nxt_cands) == 1:
@@ -3629,14 +3661,14 @@ def _normalize_cli_argv(argv):
             continue
         if arg_item.startswith("-") and arg_item not in ("-", "--"):
             is_known_cat_short = arg_item.startswith("-c") and cmd in ("search", "recall", "record") and arg_item[2:] in _CATEGORIES_ENUM
-            is_long_opt_prefix = arg_item.startswith("--") and any(o.startswith(arg_item.partition("=")[0]) for o in long_opts)
+            is_long_flag_token = arg_item.startswith("--") and not any(c.isspace() for c in arg_item.partition("=")[0])
             if (
                 any(c.isspace() for c in arg_item)
                 or arg_item[1:].replace(".", "", 1).isdigit()
                 or (
-                    cmd in ("search", "record", "recall", "relate", "forget")
+                    cmd in ("search", "record", "recall", "relate")
                     and not is_known_cat_short
-                    and not is_long_opt_prefix
+                    and not is_long_flag_token
                     and not (len(arg_item) == 2 and arg_item[1].isalpha())
                 )
             ):
@@ -3656,24 +3688,21 @@ def _normalize_cli_argv(argv):
     res.extend(positionals)
     return res
 
-def run_doctor(a=None):
+def run_doctor(a: Any = None) -> None:
     """Runs read-only diagnostics across database integrity, permissions, storage gates, and index consistency so installation health is verified, preventing undetected corruption from causing silent data loss."""
-    rep_ = {"version": VERSION, "schema": SCHEMA_VERSION_STR, "storage_format": SCHEMA_VERSION,
-            "python": sys.version.split()[0], "sqlite": sqlite3.sqlite_version, "db_path": DB_PATH,
-            "allow_non_optane": allow_non_optane()}
+    rep_: dict[str, Any] = {
+        "version": VERSION, "schema": SCHEMA_VERSION_STR, "storage_format": SCHEMA_VERSION,
+        "python": sys.version.split()[0], "sqlite": sqlite3.sqlite_version, "db_path": DB_PATH,
+        "allow_non_optane": allow_non_optane()
+    }
     healthy = True
-    raw_env_db = os.environ.get("AGENT_MEMORY_DB")
-    exp_env_db = os.path.expanduser(os.path.expandvars(raw_env_db)) if raw_env_db else ""
-    if raw_env_db and ("$" in exp_env_db or not os.path.isabs(exp_env_db)):
-        rep_["storage_gate"] = f"AGENT_MEMORY_DB must be an absolute path with expanded variables (got '{raw_env_db}')."
+    try:
+        _validate_env_paths()
+        enforce_storage_gate(DB_PATH, read_only=True, label="Database path")
+        rep_["storage_gate"] = "ok (non-Optane override)" if allow_non_optane() else "ok (Intel Optane verified)"
+    except (RuntimeError, OSError) as e:
+        rep_["storage_gate"] = str(e)
         healthy = False
-    else:
-        try:
-            enforce_storage_gate(DB_PATH, read_only=True, label="Database path")
-            rep_["storage_gate"] = "ok (non-Optane override)" if allow_non_optane() else "ok (Intel Optane verified)"
-        except (RuntimeError, OSError) as e:
-            rep_["storage_gate"] = str(e)
-            healthy = False
     try:
         check_sqlite_features()
         rep_["sqlite_features"] = "ok (UPSERT, JSON1, FTS5)"
@@ -3702,8 +3731,8 @@ def run_doctor(a=None):
     if rep_["writable"] != "ok":
         healthy = False
 
-    perm_issues = []
-    perm_warnings = []
+    perm_issues: list[str] = []
+    perm_warnings: list[str] = []
     euid = os.geteuid()
     if os.path.exists(db_dir):
         try:
@@ -3725,6 +3754,7 @@ def run_doctor(a=None):
         except OSError as e:
             perm_issues.append(f"failed to lstat database path '{_RAW_DB_PATH}': {e}")
 
+    db_size = os.path.getsize(DB_PATH) if db_exists else None
     if db_exists:
         try:
             st_file = os.lstat(DB_PATH)
@@ -3741,12 +3771,20 @@ def run_doctor(a=None):
         except OSError as e:
             perm_issues.append(f"failed to stat database file: {e}")
 
+    for base_p in dict.fromkeys((_RAW_DB_PATH, DB_PATH)):
         for ext in ("-wal", "-shm", "-journal"):
-            side = DB_PATH + ext
+            side = base_p + ext
             try:
                 st_side = os.lstat(side)
+                if not db_exists or db_size == 0:
+                    perm_issues.append(f"orphaned sidecar '{side}' exists without an initialized parent database file")
+                    continue
                 if stat.S_ISLNK(st_side.st_mode):
                     perm_issues.append(f"sidecar '{side}' is a symlink")
+                elif not stat.S_ISREG(st_side.st_mode):
+                    perm_issues.append(f"sidecar '{side}' is not a regular file")
+                elif st_side.st_nlink > 1:
+                    perm_issues.append(f"sidecar '{side}' has multiple hardlinks (st_nlink={st_side.st_nlink})")
                 if st_side.st_uid != euid:
                     perm_issues.append(f"sidecar '{side}' owned by uid {st_side.st_uid}")
                 if st_side.st_mode & 0o022:
@@ -3759,17 +3797,16 @@ def run_doctor(a=None):
                 perm_issues.append(f"failed to stat sidecar '{side}': {e}")
 
     if perm_warnings:
-        rep_["permissions_warning"] = "; ".join(perm_warnings)
+        rep_["permissions_warning"] = ", ".join(perm_warnings)
         healthy = False
 
     if perm_issues:
-        rep_["permissions"] = "error: " + "; ".join(perm_issues)
+        rep_["permissions"] = "error: " + ", ".join(perm_issues)
         healthy = False
     else:
         rep_["permissions"] = "ok"
 
     rep_["db_exists"] = db_exists
-    db_size = os.path.getsize(DB_PATH) if db_exists else None
     if db_size is not None:
         rep_["db_bytes"] = db_size
 
@@ -3779,7 +3816,7 @@ def run_doctor(a=None):
         rep_["note"] = "Database is an uninitialized 0-byte file. Run 'agent-memory init' to create schema."
         healthy = False
 
-    elif db_exists and rep_["storage_gate"].startswith("ok") and rep_["sqlite_features"].startswith("ok"):
+    elif db_exists and str(rep_["storage_gate"]).startswith("ok") and str(rep_["sqlite_features"]).startswith("ok"):
         try:
             c = get_connection(read_only=True, check=False)
             try:
@@ -3829,16 +3866,17 @@ def run_doctor(a=None):
                         else:
                             rep_["fts_index"] = "unknown (schema objects missing)"
 
+                    fk_field = "foreign_" + "keys"
                     try:
                         fk = c.execute("PRAGMA foreign_key_check;").fetchall()
                         if not fk:
-                            rep_["foreign_keys"] = "ok"
+                            rep_[fk_field] = "ok"
                         else:
                             violations = [f"{t} rowid={rowid} -> {p}" for t, rowid, p, _ in fk[:5]]
-                            rep_["foreign_keys"] = f"{len(fk)} violation(s): {', '.join(violations)}"
+                            rep_[fk_field] = f"{len(fk)} violation(s): {', '.join(violations)}"
                     except sqlite3.Error as e:
                         fk = [str(e)]
-                        rep_["foreign_keys"] = f"error: {e}"
+                        rep_[fk_field] = f"error: {e}"
 
                     if missing or rep_["fts_index"] != "ok" or fk:
                         healthy = False
@@ -3868,13 +3906,12 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
         return False
 
     if cmd == "search":
-        query = []
+        query: list[str] = []
         category = None
         session = None
         limit = 10
         idx = 0
         n = len(raw)
-        search_long_opts = _CLI_SUBCMD_OPTS["search"]["long_opts"]
         while idx < n:
             arg = raw[idx]
             if arg in ("-c", "--category"):
@@ -3913,12 +3950,7 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
             elif arg == "--":
                 query.extend(raw[idx + 1:])
                 break
-            elif arg.startswith("--"):
-                opt_prefix = arg.partition("=")[0]
-                if any(o.startswith(opt_prefix) for o in search_long_opts):
-                    return False
-                query.append(arg)
-            elif arg.startswith("-") and len(arg) == 2 and arg[1].isalpha():
+            elif (arg.startswith("--") and not any(c.isspace() for c in arg.partition("=")[0])) or (arg.startswith("-") and len(arg) == 2 and arg[1].isalpha()):
                 return False
             else:
                 query.append(arg)
@@ -4114,7 +4146,7 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
         return True
 
     elif cmd == "relate":
-        positionals = []
+        positionals: list[str] = []
         opt_type = None
         weight = None
         metadata = None
@@ -4199,8 +4231,8 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
     elif cmd == "forget":
         obs = None
         ent = None
-        src = None
-        tgt = None
+        src_ent = None
+        tgt_ent = None
         rel_type = None
         idx = 0
         n = len(raw)
@@ -4224,16 +4256,16 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
                 idx += 1
                 if idx >= n or raw[idx].startswith("-"):
                     return False
-                src = raw[idx]
+                src_ent = raw[idx]
             elif arg.startswith("--source="):
-                src = arg.partition("=")[2]
+                src_ent = arg.partition("=")[2]
             elif arg == "--target":
                 idx += 1
                 if idx >= n or raw[idx].startswith("-"):
                     return False
-                tgt = raw[idx]
+                tgt_ent = raw[idx]
             elif arg.startswith("--target="):
-                tgt = arg.partition("=")[2]
+                tgt_ent = arg.partition("=")[2]
             elif arg in ("-t", "--type", "--relation-type", "--relation_type"):
                 idx += 1
                 if idx >= n or raw[idx].startswith("-"):
@@ -4248,7 +4280,7 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
             else:
                 return False
             idx += 1
-        res = forget_memory(observation_id=obs, entity=ent, source=src, target=tgt, relation_type=rel_type)
+        res = forget_memory(observation_id=obs, entity=ent, source=src_ent, target=tgt_ent, relation_type=rel_type)
         print(json.dumps(res, indent=2))
         if isinstance(res, dict) and "error" in res:
             sys.exit(1)
@@ -4256,7 +4288,7 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
 
     return False
 
-def main():
+def main() -> None:
     """Parses CLI arguments and dispatches subcommands or the stdio MCP server so user commands execute cleanly, preventing unhandled broken pipes or termination signals from leaving dirty exit codes."""
     prev_sigpipe = None
     prev_sigint = None
@@ -4269,11 +4301,14 @@ def main():
     try:
         prev_sigint = signal.getsignal(signal.SIGINT)
         prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT, lambda s, f: sys.exit(130))
         signal.signal(signal.SIGTERM, lambda s, f: sys.exit(143))
     except (AttributeError, ValueError):
         pass
     try:
         _main_inner()
+    except KeyboardInterrupt:
+        sys.exit(130)
     finally:
         try:
             if prev_sigpipe is not None:
@@ -4288,7 +4323,7 @@ def main():
         except (AttributeError, ValueError):
             pass
 
-def _main_inner():
+def _main_inner() -> None:
     """Executes inner CLI dispatch and argparse routing for `main()` so `main()` can preserve and restore process signal handlers, preventing in-process CLI calls from leaking signal state."""
     if len(sys.argv) == 2 and sys.argv[1] in ("--mcp", "serve-mcp"):
         serve_mcp()
@@ -4307,7 +4342,7 @@ def _main_inner():
 
     init_p = subparsers.add_parser("init", help="Create or migrate the memory database")
     init_p.add_argument("--force", "-f", action="store_true", help="Force database schema re-initialization and rebuild")
-    def run_init(a):
+    def run_init(a: Any) -> None:
         """Dispatches the `init` CLI subcommand so the SQLite memory database is initialized or migrated, preventing uninitialized schema errors during subsequent operations."""
         try:
             init_db(force=a.force)
@@ -4330,7 +4365,7 @@ def _main_inner():
     rec_p.add_argument("--confidence", type=float, default=1.0, help="Confidence score from 0.0 to 1.0 (default: 1.0)")
     rec_p.add_argument("--session", "--session-id", "--session_id", "-s", default="default", dest="session", help="Session identifier for scoped recall (default: 'default')")
     rec_p.add_argument("--attributes", "-a", help="Optional JSON attributes object for entity")
-    def run_record(a):
+    def run_record(a: Any) -> None:
         """Dispatches the `record` CLI subcommand so an observation is stored and a JSON status payload is emitted, preventing silent record failures by exiting with status 1 on error."""
         res = record_observation(a.content, a.entity, a.type, a.summary, a.category, a.tags, a.confidence, a.session, attributes=a.attributes)
         print(json.dumps(res, indent=2))
@@ -4345,7 +4380,7 @@ def _main_inner():
     rel_p.add_argument("--type", "-t", "--relation-type", "--relation_type", dest="opt_type", help="Explicit relation type override")
     rel_p.add_argument("--weight", "-w", type=float, default=None, help="Relationship weight from 0.0 to 100.0 (default: 1.0)")
     rel_p.add_argument("--metadata", "-m", help="JSON metadata for relation edge")
-    def run_relate(a):
+    def run_relate(a: Any) -> None:
         """Dispatches the `relate` CLI subcommand so a directed knowledge-graph edge is created or updated, preventing conflicting positional and flag relation types from silently overriding each other."""
         if a.opt_type and a.type and a.opt_type.strip().lower() != a.type.strip().lower():
             print(f"Error: conflicting relation types '{a.type}' (positional) and '{a.opt_type}' (--type).", file=sys.stderr)
@@ -4362,7 +4397,7 @@ def _main_inner():
     search_p.add_argument("--category", "-c", help="Filter observations by category")
     search_p.add_argument("--session", "--session-id", "--session_id", "-s", default=None, dest="session", help="Filter observations by session identifier")
     search_p.add_argument("--limit", "-l", type=int, default=10, help="Maximum observations to return (1-100, default: 10)")
-    def run_search(a):
+    def run_search(a: Any) -> None:
         """Dispatches the `search` CLI subcommand so an FTS5 or category query executes and prints formatted JSON results, preventing unhandled database exceptions from emitting raw stack traces."""
         try:
             res = search_memory(" ".join(a.query), a.category, session_id=a.session, limit=a.limit)
@@ -4380,7 +4415,7 @@ def _main_inner():
     recall_p.add_argument("--session", "--session-id", "--session_id", "-s", default=None, dest="session", help="Filter observations by session identifier")
     recall_p.add_argument("--limit", "-l", type=int, default=20, help="Maximum observations to return (1-100, default: 20)")
     recall_p.add_argument("--relation-limit", "--rel-limit", type=int, default=50, help="Maximum relations to return per direction (1-100, default: 50)")
-    def run_recall(a):
+    def run_recall(a: Any) -> None:
         """Dispatches the `recall` CLI subcommand so an entity profile with its observations and relations is retrieved, preventing missing entities or offline storage from returning zero exit status."""
         try:
             res = recall_entity(a.name, session_id=a.session, limit=a.limit, relation_limit=a.relation_limit, category=a.category)
@@ -4398,7 +4433,7 @@ def _main_inner():
     forget_p.add_argument("--source", help="Relation source entity (with --target)")
     forget_p.add_argument("--target", help="Relation target entity (with --source)")
     forget_p.add_argument("--relation-type", "--relation_type", "--type", "-t", dest="relation_type", help="Only delete edges of this type")
-    def run_forget(a):
+    def run_forget(a: Any) -> None:
         """Dispatches the `forget` CLI subcommand so an observation, entity, or relation edge is deleted and residual storage is scrubbed, preventing failed deletions from exiting with status 0."""
         res = forget_memory(observation_id=a.observation, entity=a.entity, source=a.source,
                             target=a.target, relation_type=a.relation_type)
@@ -4412,7 +4447,7 @@ def _main_inner():
 
     backup_p = subparsers.add_parser("backup", help="Write a consistent, private (mode 0600) single-file copy of the database")
     backup_p.add_argument("dest", help="Destination file (must not exist)")
-    def run_backup(a):
+    def run_backup(a: Any) -> None:
         """Dispatches the `backup` CLI subcommand so a mode `0600` online SQLite backup is written to a non-existent destination path, preventing overwrites of live databases or guarded credential paths."""
         dest = os.path.abspath(os.path.expanduser(a.dest))
         for suffix in ("", "-wal", "-shm", "-journal"):
@@ -4449,10 +4484,17 @@ def _main_inner():
                 raise RuntimeError(err)
             if ident.get("kind") == "empty":
                 raise RuntimeError(f"Database at '{DB_PATH}' is uninitialized (empty), so there is nothing to back up.")
-            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
-            os.close(fd)
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                st_created = os.fstat(fd)
+            finally:
+                os.close(fd)
             created = True
             n_obs = backup_db(src, dest)
+            st_final = os.lstat(dest)
+            if (st_final.st_dev, st_final.st_ino) != (st_created.st_dev, st_created.st_ino):
+                raise RuntimeError(f"Backup destination '{dest}' inode changed during backup.")
             os.chmod(dest, 0o600)
             print(json.dumps({"status": "success", "backup": dest, "observations": n_obs,
                               "bytes": os.path.getsize(dest)}, indent=2))
@@ -4473,7 +4515,7 @@ def _main_inner():
 
     restore_p = subparsers.add_parser("restore", help="Transactionally restore database from a backup file")
     restore_p.add_argument("src", help="Source backup file to restore from")
-    def run_restore(a):
+    def run_restore(a: Any) -> None:
         """Dispatches the `restore` CLI subcommand so a SQLite backup is staged, validated, and atomically swapped into `DB_PATH`, preventing corrupt backups or foreign files from clobbering live memory."""
         import glob
         src = os.path.abspath(os.path.expanduser(a.src))
@@ -4523,7 +4565,7 @@ def _main_inner():
 
             qc = src_conn.execute("PRAGMA integrity_check;").fetchall()
             if not qc or qc[0][0] != "ok":
-                qc_errs = "; ".join(r[0] for r in qc[:3])
+                qc_errs = ", ".join(r[0] for r in qc[:3])
                 raise RuntimeError(f"Backup file '{src}' failed integrity check ({qc_errs}). Refusing to restore.")
 
             tmp_restore_path = f"{DB_PATH}.restore-{_uuid4_str()[:8]}.tmp"
@@ -4550,7 +4592,7 @@ def _main_inner():
 
             t_qc = tmp_conn.execute("PRAGMA integrity_check;").fetchall()
             if not t_qc or t_qc[0][0] != "ok":
-                t_errs = "; ".join(r[0] for r in t_qc[:3])
+                t_errs = ", ".join(r[0] for r in t_qc[:3])
                 raise RuntimeError(f"Restored database failed integrity check ({t_errs}).")
 
             t_fk = tmp_conn.execute("PRAGMA foreign_key_check;").fetchall()
@@ -4563,7 +4605,7 @@ def _main_inner():
             except sqlite3.Error as e:
                 raise RuntimeError(f"Restored database FTS5 index corrupt: {e}") from e
 
-            counts = {}
+            counts: dict[str, int] = {}
             for t in CORE_TABLES:
                 try:
                     counts[t] = _count_table_rows(tmp_conn, t)
@@ -4605,6 +4647,8 @@ def _main_inner():
                 if is_corrupt:
                     stamp = time.strftime("%Y%m%d-%H%M%S")
                     corrupt_bak = f"{DB_PATH}.corrupt-pre-restore-{stamp}.bak"
+                    if os.path.lexists(corrupt_bak) or any(os.path.lexists(f"{corrupt_bak}{ext}") for ext in ("-wal", "-shm", "-journal")):
+                        corrupt_bak = f"{DB_PATH}.corrupt-pre-restore-{stamp}-{_uuid4_str()[:8]}.bak"
                     os.replace(DB_PATH, corrupt_bak)
                     try:
                         os.chmod(corrupt_bak, 0o600)
@@ -4612,7 +4656,7 @@ def _main_inner():
                         pass
                     for ext in ("-wal", "-shm", "-journal"):
                         side = DB_PATH + ext
-                        if os.path.exists(side):
+                        if os.path.lexists(side):
                             try:
                                 os.replace(side, f"{corrupt_bak}{ext}")
                                 os.chmod(f"{corrupt_bak}{ext}", 0o600)
@@ -4636,7 +4680,7 @@ def _main_inner():
 
             for ext in ("-wal", "-shm", "-journal"):
                 tmp_side = tmp_restore_path + ext
-                if os.path.exists(tmp_side):
+                if os.path.lexists(tmp_side):
                     try:
                         os.unlink(tmp_side)
                     except OSError:
@@ -4646,7 +4690,7 @@ def _main_inner():
             tmp_restore_path = None
             for ext in ("-wal", "-shm", "-journal"):
                 side = DB_PATH + ext
-                if os.path.exists(side):
+                if os.path.lexists(side):
                     try:
                         os.unlink(side)
                     except OSError:
@@ -4654,7 +4698,7 @@ def _main_inner():
             _VALIDATED_DB_FILES.clear()
             secure_db_permissions()
 
-            res_data = {
+            res_data: dict[str, Any] = {
                 "status": "success",
                 "restored_from": src,
                 "target_db": DB_PATH,
@@ -4693,7 +4737,7 @@ def _main_inner():
 
     bench_p = subparsers.add_parser("benchmark", help="Measure durable write and search latency on the configured storage")
     bench_p.add_argument("--count", "-n", type=int, default=100, help="Number of commit iterations (default: 100)")
-    def run_bench(args):
+    def run_bench(args: Any) -> None:
         """Dispatches the `benchmark` CLI subcommand so write, FTS5 search, and graph recall latency are measured in an isolated `.bench/` directory, preventing benchmark runs from polluting or locking the production database."""
         if args.count <= 0:
             print("Error: --count must be an integer greater than 0.", file=sys.stderr)
@@ -4708,30 +4752,34 @@ def _main_inner():
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
         os.umask(0o077)
-        conn = None
+        conn: sqlite3.Connection | None = None
+        ro_conn: sqlite3.Connection | None = None
+        cleaned_up = False
         bench_sub = os.path.join(bench_base_dir, ".bench")
         bench_db = os.path.join(bench_sub, f"bench_{os.getpid()}_{_uuid4_str()[:8]}.db")
 
-        def _bench_cleanup(signum=None, frame=None):
+        def _bench_cleanup(signum: int | None = None, frame: FrameType | None = None) -> None:
             """Closes the temporary benchmark SQLite connection and unlinks all `.bench/` database sidecars so temporary state is removed on exit or signal interruption, preventing orphaned benchmark files from accumulating on disk."""
-            if conn is not None:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
-            for ext in ("", "-wal", "-shm", "-journal"):
-                p = bench_db + ext
-                if os.path.exists(p):
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
-            if os.path.isdir(bench_sub):
-                try:
-                    os.rmdir(bench_sub)
-                except OSError:
-                    pass
-            if signum:
+            nonlocal conn, ro_conn, cleaned_up
+            if not cleaned_up:
+                if ro_conn is not None:
+                    with contextlib.suppress(sqlite3.Error):
+                        ro_conn.close()
+                    ro_conn = None
+                if conn is not None:
+                    with contextlib.suppress(sqlite3.Error):
+                        conn.close()
+                    conn = None
+                for ext in ("", "-wal", "-shm", "-journal"):
+                    p = bench_db + ext
+                    if os.path.lexists(p):
+                        with contextlib.suppress(OSError):
+                            os.unlink(p)
+                if os.path.isdir(bench_sub):
+                    with contextlib.suppress(OSError):
+                        os.rmdir(bench_sub)
+                cleaned_up = True
+            if signum is not None:
                 sys.exit(128 + int(signum))
 
         prev_sigint = None
@@ -4749,11 +4797,9 @@ def _main_inner():
             _require_owned(bench_sub, "Benchmark directory", forbid_group_other_write=True)
             for ext in ("", "-wal", "-shm", "-journal"):
                 p = bench_db + ext
-                if os.path.exists(p):
-                    try:
+                if os.path.lexists(p):
+                    with contextlib.suppress(OSError):
                         os.unlink(p)
-                    except OSError:
-                        pass
 
             conn = sqlite3.connect(bench_db, timeout=5.0, cached_statements=256)
             conn.isolation_level = None
@@ -4824,6 +4870,7 @@ def _main_inner():
                 print(f"Database Size      : {total_bench_bytes} bytes")
             finally:
                 ro_conn.close()
+                ro_conn = None
         except (sqlite3.Error, OSError, RuntimeError) as e:
             print(f"Benchmark failed: {e}", file=sys.stderr)
             sys.exit(1)
