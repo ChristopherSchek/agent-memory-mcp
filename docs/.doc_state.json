@@ -1,0 +1,113 @@
+{
+  "version": "1.0.0",
+  "tier": "standard",
+  "last_synced_commit": "890e561bd3edff949de5f6441c3d1c1763f3a08e",
+  "last_synced_at": "2026-11-02T17:39:44.997070+00:00",
+  "generator": "doc_manager.py v1.0.0",
+  "project_name": "AgentMemoryMCP",
+  "stack_signals": [
+    "python"
+  ],
+  "tracked_docs": {
+    "docs/INDEX.md": {
+      "concern": "index",
+      "last_updated_at": "2026-11-02T17:34:58.142953+00:00",
+      "sha256": "fab1e3e1548f64019a886b069ace068fd56992b1aa5284a0508f091a2f4c8074",
+      "last_synced_commit": "890e561bd3edff949de5f6441c3d1c1763f3a08e"
+    },
+    "docs/architecture.md": {
+      "concern": "architecture",
+      "last_updated_at": "2026-11-02T17:39:44.997070+00:00",
+      "sha256": "67b8cf9098c1773807fab3d070c6c0387d68fa4fc24ebdd2ef327688f3389524",
+      "last_synced_commit": "890e561bd3edff949de5f6441c3d1c1763f3a08e"
+    },
+    "docs/technical_standards.md": {
+      "concern": "standards",
+      "last_updated_at": "2026-11-02T17:39:44.997070+00:00",
+      "sha256": "3d799390524590b71fe336247b9f8976ebe3bed755b054f8ab2388fc0e981788",
+      "last_synced_commit": "890e561bd3edff949de5f6441c3d1c1763f3a08e"
+    }
+  },
+  "mapping_rules": [
+    {
+      "source_pattern": "src/app/api/**",
+      "target_doc": "docs/api_reference.md",
+      "concern": "api"
+    },
+    {
+      "source_pattern": "src/app/actions/**",
+      "target_doc": "docs/api_reference.md",
+      "concern": "api"
+    },
+    {
+      "source_pattern": "migrations/**",
+      "target_doc": "docs/database_schema.md",
+      "concern": "database"
+    },
+    {
+      "source_pattern": "prisma/**",
+      "target_doc": "docs/database_schema.md",
+      "concern": "database"
+    },
+    {
+      "source_pattern": "**/*.prisma",
+      "target_doc": "docs/database_schema.md",
+      "concern": "database"
+    },
+    {
+      "source_pattern": "**/Dockerfile",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "**/docker-compose*.yml",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "**/docker-compose*.yaml",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "**/compose.yml",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "**/compose.yaml",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "**/*.tf",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "terraform/**",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "playbooks/**",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "roles/**",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "inventory/**",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    },
+    {
+      "source_pattern": "ansible.cfg",
+      "target_doc": "docs/deployment.md",
+      "concern": "deployment"
+    }
+  ]
+}
