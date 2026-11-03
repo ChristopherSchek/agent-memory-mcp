@@ -433,6 +433,7 @@ def _pre_extract_log_dir(argv: list[str]) -> str:
                 raw = argv[i + 1]
                 i += 2
                 continue
+            raw = ""
         elif arg.startswith("--log-dir="):
             raw = arg.split("=", 1)[1]
         i += 1
@@ -463,8 +464,21 @@ def _validate_and_init_log_dir(log_dir: str, am_mod: Any, home_dir: str) -> tupl
         parts = [seg for seg in p.split("/") if seg]
         if ".git" in parts:
             raise ValueError(f"Refusing --log-dir inside a .git directory: '{log_dir}'.")
-    if am_mod is not None and hasattr(am_mod, "_check_not_guarded_path"):
-        am_mod._check_not_guarded_path(norm_log, "LOG_DIR")
+    if am_mod is not None:
+        if hasattr(am_mod, "_check_not_guarded_path"):
+            am_mod._check_not_guarded_path(norm_log, "LOG_DIR")
+        for cand_db in (getattr(am_mod, "DB_PATH", ""), getattr(am_mod, "_RAW_DB_PATH", "")):
+            if not cand_db:
+                continue
+            abs_db = os.path.abspath(cand_db)
+            real_db = os.path.realpath(abs_db)
+            db_dir = os.path.dirname(abs_db)
+            if norm_log in (abs_db, db_dir) or real_log in (real_db, os.path.dirname(real_db)):
+                raise ValueError(f"Refusing --log-dir colliding with database path or directory: '{log_dir}'.")
+            if abs_db.startswith(norm_log.rstrip("/") + "/") or norm_log.startswith(abs_db.rstrip("/") + "/"):
+                raise ValueError(f"Refusing --log-dir overlapping database path: '{log_dir}'.")
+            if os.path.basename(db_dir) in ("agent_memory", "agent-memory") and norm_log.startswith(db_dir.rstrip("/") + "/"):
+                raise ValueError(f"Refusing --log-dir inside dedicated database directory: '{log_dir}'.")
     cur = norm_log
     while True:
         if os.path.lexists(cur):
@@ -694,7 +708,7 @@ def main() -> None:
                         finally:
                             os.close(fd_d)
 
-        parser = _TriStreamArgumentParser(description="Benchmark unassisted AI memory vs. agent-memory MCP across storage media.")
+        parser = _TriStreamArgumentParser(description="Benchmark unassisted AI memory vs. agent-memory MCP across storage media.", allow_abbrev=False)
         parser.add_argument("--version", "-v", action="version", version=f"benchmark_comparison {VERSION}")
         parser.add_argument("-n", "--count", type=int, default=100, help="Number of test iterations (default: 100)")
         parser.add_argument("--json", action="store_true", help="Output raw JSON results")

@@ -84,7 +84,8 @@ Audits commit watermarks and drift status before handoff so code matches specs, 
 Cross-references supplementary repository documentation discovered during convergence analysis so external notes remain discoverable, preventing orphaned specifications.
 
 1. **Discovered External Documentation**:
-   - [agent-memory: Autonomous Agent Deployment & Operation Runbook](../LLM_ONBOARDING.md) (341 lines)
+   - [agent-memory-mcp Repository Guide](../README.md) (190 lines)
+   - [agent-memory: Autonomous Agent Deployment & Operation Runbook](../LLM_ONBOARDING.md) (344 lines)
    - [Agent Memory MCP Instructions](../mcp/instructions.md) (24 lines)
    - [Skill: agent-memory (Persistent Semantic Memory & Knowledge Graph)](../skill/SKILL.md) (230 lines)
    - [Reference Specification: agent-memory-mcp](../skill/references/agent-memory-mcp.md) (113 lines)

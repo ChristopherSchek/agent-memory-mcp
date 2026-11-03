@@ -336,6 +336,7 @@ OPTANE_MODEL_MARKERS = (
     "INTEL MEMPEK", "OPTANE", "SSDPED1D", "SSDPED1K", "SSDPE21D", "SSDPE21K", "SSDPEL1D",
     "SSDPEL1K", "SSDPF21Q", "SSDPEK1W", "SSDPEK1A",
 )
+OPTANE_HYBRID_MARKERS = ("HBRPE", "HBRPL")
 OPTANE_PCI_IDS = {("0x8086", "0x2522"), ("0x8086", "0x2700"), ("0x8086", "0x2701"), ("0x8086", "0x4140")}
 _SYSFS = "/sys"
 _MOUNTINFO = "/proc/self/mountinfo"
@@ -467,10 +468,12 @@ def validate_storage_hardware(path: str, dev_id: int | None = None) -> None:
         for leaf in leaves:
             name = os.path.basename(leaf)
             model = _read_sysfs(os.path.join(leaf, "device", "model")) or ""
+            model_up = model.upper()
             v_raw = _read_sysfs(os.path.join(leaf, "device", "device", "vendor"))
             d_raw = _read_sysfs(os.path.join(leaf, "device", "device", "device"))
             pci_id = (v_raw.lower(), d_raw.lower()) if (v_raw and d_raw) else None
-            if not (any(m in model.upper() for m in OPTANE_MODEL_MARKERS) or pci_id in OPTANE_PCI_IDS):
+            is_hybrid = any(hm in model_up for hm in OPTANE_HYBRID_MARKERS) or bool(re.search(r"\bH(?:10|20)\b", model_up))
+            if is_hybrid or not (any(m in model_up for m in OPTANE_MODEL_MARKERS) or pci_id in OPTANE_PCI_IDS):
                 raise RuntimeError(f"Storage volume at '{path}' is on device '{name}' (model '{model or 'unknown'}'), not Intel Optane NVMe.")
             if _read_sysfs(os.path.join(leaf, "queue", "rotational")) != "0":
                 raise RuntimeError(f"Storage volume at '{path}' is on rotational or unverifiable media ('{name}').")
@@ -3583,22 +3586,29 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
     opts_def = _CLI_SUBCMD_OPTS.get(cmd)
     if opts_def is None:
         return argv
-    if "--" in argv:
-        return argv
 
     takes_val = opts_def["takes_val"]
     no_val = opts_def["no_val"]
     all_opts = opts_def["all_opts"]
-    long_opts = opts_def["long_opts"]
 
-    raw = argv[2:]
+    raw_all = argv[2:]
     has_dash = False
-    for a in raw:
+    for a in raw_all:
         if a.startswith("-"):
             has_dash = True
             break
     if not has_dash:
         return argv
+
+    post_ddash: list[str] = []
+    has_ddash = False
+    if "--" in raw_all:
+        dd_idx = raw_all.index("--")
+        post_ddash = raw_all[dd_idx + 1:]
+        raw = raw_all[:dd_idx]
+        has_ddash = True
+    else:
+        raw = raw_all
 
     options: list[str] = []
     positionals: list[str] = []
@@ -3607,13 +3617,6 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
 
     while idx < n_raw:
         arg_item = raw[idx]
-        if arg_item.startswith("--") and arg_item != "--":
-            name, eq, value = arg_item.partition("=")
-            if name not in all_opts:
-                candidates = [o for o in long_opts if o.startswith(name)]
-                if len(candidates) == 1:
-                    arg_item = candidates[0] + eq + value
-
         if arg_item.startswith("-") and "=" in arg_item:
             opt_name = arg_item.partition("=")[0]
             if opt_name in takes_val:
@@ -3631,10 +3634,6 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
                     or (cmd == "record" and nxt.startswith("-a") and len(nxt) > 2)
                     or (nxt.startswith("-c") and cmd in ("search", "recall", "record") and nxt[2:] in _CATEGORIES_ENUM)
                 )
-                if not nxt_is_opt and nxt.startswith("--") and nxt != "--":
-                    nxt_cands = [o for o in long_opts if o.startswith(nxt_base)]
-                    if len(nxt_cands) == 1:
-                        nxt_is_opt = True
                 if not nxt_is_opt and nxt != "--":
                     if nxt.startswith("-"):
                         options.append(f"{arg_item}={nxt}")
@@ -3680,7 +3679,8 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
         positionals.append(arg_item)
         idx += 1
 
-    has_leading_dash = any(p.startswith("-") for p in positionals)
+    positionals.extend(post_ddash)
+    has_leading_dash = has_ddash or any(p.startswith("-") for p in positionals)
     res = [argv[0], cmd]
     res.extend(options)
     if has_leading_dash:
@@ -3698,6 +3698,18 @@ def run_doctor(a: Any = None) -> None:
     healthy = True
     try:
         _validate_env_paths()
+        _check_not_guarded_path(DB_PATH, "Database path")
+        if _RAW_DB_PATH != DB_PATH:
+            _check_not_guarded_path(_RAW_DB_PATH, "Database path")
+    except (RuntimeError, OSError) as e:
+        rep_["storage_gate"] = str(e)
+        rep_["writable"] = "blocked (guarded or invalid environment path)"
+        rep_["permissions"] = f"error: {e}"
+        rep_["db_exists"] = False
+        rep_["healthy"] = False
+        print(json.dumps(rep_, indent=2, ensure_ascii=False))
+        sys.exit(1)
+    try:
         enforce_storage_gate(DB_PATH, read_only=True, label="Database path")
         rep_["storage_gate"] = "ok (non-Optane override)" if allow_non_optane() else "ok (Intel Optane verified)"
     except (RuntimeError, OSError) as e:
@@ -3762,6 +3774,10 @@ def run_doctor(a: Any = None) -> None:
                 if st_file.st_uid != euid:
                     perm_issues.append(f"database file is a symlink owned by uid {st_file.st_uid}")
                 st_file = os.stat(DB_PATH)
+            if not stat.S_ISREG(st_file.st_mode):
+                perm_issues.append("database path is not a regular file")
+            elif st_file.st_nlink > 1:
+                perm_issues.append(f"database file has multiple hardlinks (st_nlink={st_file.st_nlink})")
             if st_file.st_uid != euid:
                 perm_issues.append(f"database file owned by uid {st_file.st_uid} (expected {euid})")
             if st_file.st_mode & 0o022:
@@ -4335,12 +4351,12 @@ def _main_inner() -> None:
         return
 
     import argparse
-    parser = argparse.ArgumentParser(description="agent-memory: per-user Optane-backed memory for AI agents (CLI and stdio MCP server)")
+    parser = argparse.ArgumentParser(description="agent-memory: per-user Optane-backed memory for AI agents (CLI and stdio MCP server)", allow_abbrev=False)
     parser.add_argument("--version", "-v", action="version", version=f"agent-memory {VERSION} (schema {SCHEMA_VERSION_STR}, storage format {SCHEMA_VERSION})")
     parser.add_argument("--mcp", action="store_true", help="Run stdio JSON-RPC MCP server")
     subparsers = parser.add_subparsers(dest="cmd")
 
-    init_p = subparsers.add_parser("init", help="Create or migrate the memory database")
+    init_p = subparsers.add_parser("init", help="Create or migrate the memory database", allow_abbrev=False)
     init_p.add_argument("--force", "-f", action="store_true", help="Force database schema re-initialization and rebuild")
     def run_init(a: Any) -> None:
         """Dispatches the `init` CLI subcommand so the SQLite memory database is initialized or migrated, preventing uninitialized schema errors during subsequent operations."""
@@ -4352,10 +4368,10 @@ def _main_inner() -> None:
             sys.exit(1)
     init_p.set_defaults(func=run_init)
 
-    mcp_p = subparsers.add_parser("serve-mcp", help="Run stdio JSON-RPC MCP server")
+    mcp_p = subparsers.add_parser("serve-mcp", help="Run stdio JSON-RPC MCP server", allow_abbrev=False)
     mcp_p.set_defaults(func=lambda a: serve_mcp())
 
-    rec_p = subparsers.add_parser("record", help="Record observation")
+    rec_p = subparsers.add_parser("record", help="Record observation", allow_abbrev=False)
     rec_p.add_argument("content", help="Observation content")
     rec_p.add_argument("--entity", "-e", "--entity-name", "--name", dest="entity", help="Associated entity name")
     rec_p.add_argument("--type", "-t", "--entity-type", "--entity_type", default="concept", help="Entity type (service, repo, pattern, concept, host, operator)")
@@ -4373,7 +4389,7 @@ def _main_inner() -> None:
             sys.exit(1)
     rec_p.set_defaults(func=run_record)
 
-    rel_p = subparsers.add_parser("relate", help="Link two entities in knowledge graph")
+    rel_p = subparsers.add_parser("relate", help="Link two entities in knowledge graph", allow_abbrev=False)
     rel_p.add_argument("source", help="Source entity")
     rel_p.add_argument("target", help="Target entity")
     rel_p.add_argument("type", nargs="?", default=None, help="Relation type, a forward verb such as depends_on, hosted_on, provisions (default: 'references')")
@@ -4392,7 +4408,7 @@ def _main_inner() -> None:
             sys.exit(1)
     rel_p.set_defaults(func=run_relate)
 
-    search_p = subparsers.add_parser("search", help="Safe FTS5 search")
+    search_p = subparsers.add_parser("search", help="Safe FTS5 search", allow_abbrev=False)
     search_p.add_argument("query", nargs="*", default=[], help="Search words (joined with spaces, quote exact phrases)")
     search_p.add_argument("--category", "-c", help="Filter observations by category")
     search_p.add_argument("--session", "--session-id", "--session_id", "-s", default=None, dest="session", help="Filter observations by session identifier")
@@ -4409,7 +4425,7 @@ def _main_inner() -> None:
             sys.exit(1)
     search_p.set_defaults(func=run_search)
 
-    recall_p = subparsers.add_parser("recall", help="Recall entity and relations")
+    recall_p = subparsers.add_parser("recall", help="Recall entity and relations", allow_abbrev=False)
     recall_p.add_argument("name", help="Entity name")
     recall_p.add_argument("--category", "-c", default=None, help="Filter recalled observations by category")
     recall_p.add_argument("--session", "--session-id", "--session_id", "-s", default=None, dest="session", help="Filter observations by session identifier")
@@ -4427,7 +4443,7 @@ def _main_inner() -> None:
             sys.exit(1)
     recall_p.set_defaults(func=run_recall)
 
-    forget_p = subparsers.add_parser("forget", help="Delete an observation, an entity (with its facts and relations), or relation edge(s)")
+    forget_p = subparsers.add_parser("forget", help="Delete an observation, an entity (with its facts and relations), or relation edge(s)", allow_abbrev=False)
     forget_p.add_argument("--observation", "-o", "--observation-id", "--observation_id", dest="observation", help="Observation ID to delete")
     forget_p.add_argument("--entity", "-e", help="Entity to delete together with its observations and relations")
     forget_p.add_argument("--source", help="Relation source entity (with --target)")
@@ -4442,10 +4458,10 @@ def _main_inner() -> None:
             sys.exit(1)
     forget_p.set_defaults(func=run_forget)
 
-    doctor_p = subparsers.add_parser("doctor", help="Read-only health check of the installation and database")
+    doctor_p = subparsers.add_parser("doctor", help="Read-only health check of the installation and database", allow_abbrev=False)
     doctor_p.set_defaults(func=run_doctor)
 
-    backup_p = subparsers.add_parser("backup", help="Write a consistent, private (mode 0600) single-file copy of the database")
+    backup_p = subparsers.add_parser("backup", help="Write a consistent, private (mode 0600) single-file copy of the database", allow_abbrev=False)
     backup_p.add_argument("dest", help="Destination file (must not exist)")
     def run_backup(a: Any) -> None:
         """Dispatches the `backup` CLI subcommand so a mode `0600` online SQLite backup is written to a non-existent destination path, preventing overwrites of live databases or guarded credential paths."""
@@ -4513,7 +4529,7 @@ def _main_inner() -> None:
             src.close()
     backup_p.set_defaults(func=run_backup)
 
-    restore_p = subparsers.add_parser("restore", help="Transactionally restore database from a backup file")
+    restore_p = subparsers.add_parser("restore", help="Transactionally restore database from a backup file", allow_abbrev=False)
     restore_p.add_argument("src", help="Source backup file to restore from")
     def run_restore(a: Any) -> None:
         """Dispatches the `restore` CLI subcommand so a SQLite backup is staged, validated, and atomically swapped into `DB_PATH`, preventing corrupt backups or foreign files from clobbering live memory."""
@@ -4735,7 +4751,7 @@ def _main_inner() -> None:
                     pass
     restore_p.set_defaults(func=run_restore)
 
-    bench_p = subparsers.add_parser("benchmark", help="Measure durable write and search latency on the configured storage")
+    bench_p = subparsers.add_parser("benchmark", help="Measure durable write and search latency on the configured storage", allow_abbrev=False)
     bench_p.add_argument("--count", "-n", type=int, default=100, help="Number of commit iterations (default: 100)")
     def run_bench(args: Any) -> None:
         """Dispatches the `benchmark` CLI subcommand so write, FTS5 search, and graph recall latency are measured in an isolated `.bench/` directory, preventing benchmark runs from polluting or locking the production database."""

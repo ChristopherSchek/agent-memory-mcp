@@ -27,7 +27,7 @@ Walks through runtime prerequisite checks, installation, health verification, an
      ./install.sh --allow-non-optane
      ```
 
-   - **Defaults & Flags**: Defaults the database path to `/mnt/optane/$USER/agent_memory/memory.db` when `/mnt/optane/$USER` exists and is owned by `$USER` without group/world write permissions, or `${XDG_DATA_HOME:-~/.local/share}/agent-memory/memory.db` otherwise. Pass an explicit path with `--db /path/to/memory.db`. Additional installer flags include `--require-optane` (`--no-allow-non-optane`), `--no-client-config`, `--dry-run`, `--log-dir /abs/dir`, and `--uninstall`.
+   - **Defaults & Flags**: Defaults the database path to `/mnt/optane/$USER/agent_memory/memory.db` when `/mnt/optane/$USER` exists and is owned by `$USER` without group/world write permissions, or `${XDG_DATA_HOME:-~/.local/share}/agent-memory/memory.db` otherwise. Pass an explicit path with `--db /path/to/memory.db`. Additional installer flags include `--require-optane` (`--no-allow-non-optane`), `--no-client-config`, `--dry-run`, `--validate-args`, `--json`, `--version` (`-v`), `--log-dir /abs/dir`, and `--uninstall`.
 3. **Verify Health**: Confirm database integrity, permissions, storage gate status, and FTS5 index synchronization (`"healthy": true`) to validate the installation, preventing runtime MCP tool errors:
 
    ```bash

@@ -230,15 +230,18 @@ pre_init_log_dir() {
         if [ "${prev_is_log}" -eq 1 ]; then
             if [ -n "${arg}" ] && [[ "${arg}" != -* ]]; then
                 raw_log="${arg}"
+            else
+                raw_log=""
             fi
             prev_is_log=0
             continue
         fi
         case "${arg}" in
-            --log-dir) prev_is_log=1 ;;
+            --log-dir) raw_log=""; prev_is_log=1 ;;
             --log-dir=*) raw_log="${arg#--log-dir=}" ;;
         esac
     done
+    [ "${prev_is_log}" -eq 0 ] || raw_log=""
     [ -n "${raw_log}" ] || return 0
     raw_log="$(expand_tilde_path "${raw_log}")"
     command -v python3 >/dev/null 2>&1 || return 0
@@ -263,6 +266,15 @@ for p in (abs_log, real_log):
     if ".git" in [seg for seg in p.split("/") if seg]:
         sys.exit(1)
 mod._check_not_guarded_path(abs_log, "LOG_DIR")
+for cand_db in (getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
+    if not cand_db:
+        continue
+    abs_db = os.path.abspath(cand_db)
+    db_dir = os.path.dirname(abs_db)
+    if abs_log in (abs_db, db_dir) or abs_db.startswith(abs_log.rstrip("/") + "/") or abs_log.startswith(abs_db.rstrip("/") + "/"):
+        sys.exit(1)
+    if os.path.basename(db_dir) in ("agent_memory", "agent-memory") and abs_log.startswith(db_dir.rstrip("/") + "/"):
+        sys.exit(1)
 cur = abs_log
 while True:
     if os.path.lexists(cur):
@@ -411,11 +423,17 @@ for label, val in (
     real_v = os.path.realpath(abs_v)
     if abs_v in unsafe_top or real_v in unsafe_top:
         sys.exit(f"Refusing unsafe top-level directory for {label}: '{val}'.")
+    if label == "DB_OVERRIDE":
+        v_str = val.strip()
+        if "$" in v_str or "<user>" in v_str.lower() or ("__" in v_str and v_str.count("__") >= 2):
+            sys.exit(f"Refusing unexpanded template placeholder for {label}: '{val}'.")
+        if val.endswith("/") or os.path.isdir(abs_v):
+            sys.exit(f"{label} must be a database file path, not a directory: '{val}'.")
     if label == "MCP_CONFIG" and abs_v == os.path.abspath(def_mcp_cfg):
         if os.path.lexists(abs_v):
             st_m = os.lstat(abs_v)
-            if stat.S_ISLNK(st_m.st_mode) or not stat.S_ISREG(st_m.st_mode):
-                sys.exit(f"Refusing symlink or non-regular file for {label}: '{val}'.")
+            if stat.S_ISLNK(st_m.st_mode) or not stat.S_ISREG(st_m.st_mode) or st_m.st_nlink != 1:
+                sys.exit(f"Refusing symlink, hardlink, or non-regular file for {label}: '{val}'.")
         continue
     try:
         mod._check_not_guarded_path(val, label)
@@ -423,6 +441,22 @@ for label, val in (
         sys.exit(str(exc))
 if log_dir:
     abs_log = os.path.abspath(log_dir)
+    real_log = os.path.realpath(abs_log)
+    for target_lbl, target_val in (("BIN_DIR", bin_dir), ("MCP_DIR", mcp_dir), ("SKILL_DIR", skill_dir), ("MCP_CONFIG", mcp_cfg)):
+        if target_val and (abs_log == os.path.abspath(target_val) or real_log == os.path.realpath(target_val)):
+            sys.exit(f"Refusing LOG_DIR colliding with {target_lbl}: '{log_dir}'.")
+    for cand_db in (db_over, getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
+        if not cand_db:
+            continue
+        abs_db = os.path.abspath(cand_db)
+        real_db = os.path.realpath(abs_db)
+        db_dir = os.path.dirname(abs_db)
+        if abs_log in (abs_db, db_dir) or real_log in (real_db, os.path.dirname(real_db)):
+            sys.exit(f"Refusing LOG_DIR colliding with database path or directory: '{log_dir}'.")
+        if abs_db.startswith(abs_log.rstrip("/") + "/") or abs_log.startswith(abs_db.rstrip("/") + "/"):
+            sys.exit(f"Refusing LOG_DIR overlapping database path: '{log_dir}'.")
+        if os.path.basename(db_dir) in ("agent_memory", "agent-memory") and abs_log.startswith(db_dir.rstrip("/") + "/"):
+            sys.exit(f"Refusing LOG_DIR inside dedicated database directory: '{log_dir}'.")
     cur = abs_log
     while True:
         if os.path.lexists(cur):
@@ -509,6 +543,8 @@ if orig_existed:
         st_existing = os.lstat(path)
         if not stat.S_ISREG(st_existing.st_mode):
             sys.exit(f"Error: {path} is not a regular file.")
+        if st_existing.st_nlink != 1:
+            sys.exit(f"Error: {path} has multiple hardlinks (st_nlink={st_existing.st_nlink}).")
         if st_existing.st_uid != euid:
             sys.exit(f"Error: {path} is owned by uid {st_existing.st_uid}, not current user ({euid}).")
         if (st_existing.st_mode & 0o022) != 0:

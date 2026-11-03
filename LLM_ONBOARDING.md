@@ -89,6 +89,9 @@ Executes `install.sh` using the branch selected in Phase 1 to validate storage, 
      - `--db <path>`: Override the target SQLite database path (`AGENT_MEMORY_DB`).
      - `--no-client-config`: Skip automatic `~/.gemini/config/mcp_config.json` registration and `SKILL.md` installation.
      - `--dry-run`: Run preflight checks without modifying files.
+     - `--validate-args`: Validate CLI arguments and target paths without executing installation or preflight checks, then exit `0`.
+     - `--json`: Emit structured JSON summary output on `stdout`.
+     - `--version`, `-v`: Print installer version and exit `0`.
      - `--log-dir <dir>`: Write Tri-Stream telemetry (`results.json` and `debug.log`, mode `0600`) to `<dir>` (mode `0700`).
      - `--uninstall`: Remove the installed binary, skill, and MCP registration while preserving the SQLite database file.
      - `-h`, `--help`: Display installer usage information.
