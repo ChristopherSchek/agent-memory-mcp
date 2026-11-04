@@ -831,14 +831,13 @@ def get_connection(read_only: bool = False, check: bool = True, _migrated: bool 
         if is_new_db:
             if cur_st is not None:
                 _require_owned(real_db_path, "Database file", forbid_group_other_write=True, check_sidecars=True)
-            if not read_only or cur_st is None:
-                for base_p in dict.fromkeys((_RAW_DB_PATH, real_db_path)):
-                    for ext in ("-wal", "-shm", "-journal"):
-                        sidecar = base_p + ext
-                        if os.path.lexists(sidecar):
-                            raise RuntimeError(
-                                f"Database sidecar '{sidecar}' exists without a parent database file. Refusing to adopt orphaned sidecar."
-                            )
+            for base_p in dict.fromkeys((_RAW_DB_PATH, real_db_path)):
+                for ext in ("-wal", "-shm", "-journal"):
+                    sidecar = base_p + ext
+                    if os.path.lexists(sidecar):
+                        raise RuntimeError(
+                            f"Database sidecar '{sidecar}' exists without a parent database file. Refusing to adopt orphaned sidecar."
+                        )
         else:
             st_owned = _require_owned(real_db_path, "Database file", forbid_group_other_write=True, check_sidecars=True)
             _VALIDATED_DB_FILES.add((real_db_path, st_owned.st_dev, st_owned.st_ino, read_only))
@@ -1029,7 +1028,7 @@ def _backup_live_db(conn: sqlite3.Connection, prefix: str, label: str) -> str | 
     for n in range(100):
         dest = f"{path}.{prefix}-{stamp}{'' if n == 0 else f'-{n}'}.bak"
         try:
-            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
         except FileExistsError:
             continue
         os.close(fd)
@@ -1978,25 +1977,26 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
             entity_id = None
             canonical_name = None
             if clean_name:
-                dup_in_tx = conn.execute(
-                    """
-                    SELECT o.observation_id, o.category, o.session_id, e.entity_id, e.name
-                    FROM entities e
-                    JOIN observations o ON e.entity_id = o.entity_id
-                    WHERE e.name = ? COLLATE NOCASE AND o.content = ?
-                    LIMIT 1;
-                    """,
-                    (clean_name, clean_content),
-                ).fetchone()
-                if dup_in_tx:
-                    return {
-                        "status": "exists",
-                        "observation_id": dup_in_tx[0],
-                        "entity_id": dup_in_tx[3],
-                        "entity_name": dup_in_tx[4],
-                        "category": dup_in_tx[1],
-                        "session_id": dup_in_tx[2],
-                    }
+                if clean_summary is None and clean_attributes is None:
+                    dup_in_tx = conn.execute(
+                        """
+                        SELECT o.observation_id, o.category, o.session_id, e.entity_id, e.name, e.type
+                        FROM entities e
+                        JOIN observations o ON e.entity_id = o.entity_id
+                        WHERE e.name = ? COLLATE NOCASE AND o.content = ?
+                        LIMIT 1;
+                        """,
+                        (clean_name, clean_content),
+                    ).fetchone()
+                    if dup_in_tx and clean_entity_type in ("concept", str(dup_in_tx[5]).lower()):
+                        return {
+                            "status": "exists",
+                            "observation_id": dup_in_tx[0],
+                            "entity_id": dup_in_tx[3],
+                            "entity_name": dup_in_tx[4],
+                            "category": dup_in_tx[1],
+                            "session_id": dup_in_tx[2],
+                        }
                 if clean_attributes:
                     existing_attr_row = conn.execute(
                         "SELECT attributes FROM entities WHERE name = ? COLLATE NOCASE;",
@@ -3723,6 +3723,7 @@ def run_doctor(a: Any = None) -> None:
         healthy = False
 
     db_exists = os.path.exists(DB_PATH)
+    db_lexists = os.path.lexists(DB_PATH) or os.path.lexists(_RAW_DB_PATH)
     db_dir = os.path.dirname(DB_PATH)
     probe_dir = db_dir
     while not os.path.exists(probe_dir) and probe_dir != "/":
@@ -3745,7 +3746,10 @@ def run_doctor(a: Any = None) -> None:
 
     perm_issues: list[str] = []
     perm_warnings: list[str] = []
+    if db_lexists and not db_exists:
+        perm_issues.append(f"database path '{_RAW_DB_PATH}' is a broken symlink")
     euid = os.geteuid()
+    shared_roots = {os.path.realpath(os.path.expanduser("~")), os.path.realpath(OPTANE_BASE)}
     if os.path.exists(db_dir):
         try:
             st_dir = os.stat(db_dir)
@@ -3753,7 +3757,7 @@ def run_doctor(a: Any = None) -> None:
                 perm_issues.append(f"directory '{db_dir}' owned by uid {st_dir.st_uid} (expected {euid})")
             if st_dir.st_mode & 0o022:
                 perm_issues.append(f"directory '{db_dir}' is group/world-writable (mode {oct(st_dir.st_mode & 0o777)})")
-            elif st_dir.st_mode & 0o077:
+            elif (st_dir.st_mode & 0o077) and os.path.realpath(db_dir) not in shared_roots:
                 perm_warnings.append(f"directory '{db_dir}' mode {oct(st_dir.st_mode & 0o777)} has group/other access (expected 0700)")
         except OSError as e:
             perm_issues.append(f"failed to stat directory: {e}")
@@ -4534,6 +4538,7 @@ def _main_inner() -> None:
     def run_restore(a: Any) -> None:
         """Dispatches the `restore` CLI subcommand so a SQLite backup is staged, validated, and atomically swapped into `DB_PATH`, preventing corrupt backups or foreign files from clobbering live memory."""
         import glob
+        os.umask(0o077)
         src = os.path.abspath(os.path.expanduser(a.src))
         if not os.path.isfile(src):
             print(json.dumps({"error": f"Backup file '{src}' does not exist or is not a regular file."}, indent=2), file=sys.stderr)
@@ -4561,6 +4566,12 @@ def _main_inner() -> None:
                 if os.path.isdir(DB_PATH):
                     raise RuntimeError(f"Database path '{DB_PATH}' is a directory.")
                 _require_owned(DB_PATH, "Database file", forbid_group_other_write=True, check_sidecars=True)
+            else:
+                for base_p in dict.fromkeys((_RAW_DB_PATH, DB_PATH)):
+                    for ext in ("-wal", "-shm", "-journal"):
+                        side = base_p + ext
+                        if os.path.lexists(side):
+                            raise RuntimeError(f"Database sidecar '{side}' exists without a parent database file. Refusing to restore.")
         except (RuntimeError, OSError) as e:
             print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
             sys.exit(1)
@@ -4585,7 +4596,7 @@ def _main_inner() -> None:
                 raise RuntimeError(f"Backup file '{src}' failed integrity check ({qc_errs}). Refusing to restore.")
 
             tmp_restore_path = f"{DB_PATH}.restore-{_uuid4_str()[:8]}.tmp"
-            fd = os.open(tmp_restore_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+            fd = os.open(tmp_restore_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
             os.close(fd)
 
             tmp_conn = sqlite3.connect(f"file:{_pathname2url(tmp_restore_path)}", uri=True, timeout=5.0)
@@ -4702,15 +4713,16 @@ def _main_inner() -> None:
                     except OSError:
                         pass
 
+            for base_p in dict.fromkeys((_RAW_DB_PATH, DB_PATH)):
+                for ext in ("-wal", "-shm", "-journal"):
+                    side = base_p + ext
+                    if os.path.lexists(side):
+                        try:
+                            os.unlink(side)
+                        except OSError:
+                            pass
             os.replace(tmp_restore_path, DB_PATH)
             tmp_restore_path = None
-            for ext in ("-wal", "-shm", "-journal"):
-                side = DB_PATH + ext
-                if os.path.lexists(side):
-                    try:
-                        os.unlink(side)
-                    except OSError:
-                        pass
             _VALIDATED_DB_FILES.clear()
             secure_db_permissions()
 
@@ -4809,8 +4821,11 @@ def _main_inner() -> None:
             pass
 
         try:
+            if os.path.islink(bench_sub):
+                raise RuntimeError(f"Benchmark directory '{bench_sub}' is a symlink.")
             os.makedirs(bench_sub, mode=0o700, exist_ok=True)
             _require_owned(bench_sub, "Benchmark directory", forbid_group_other_write=True)
+            enforce_storage_gate(bench_sub, read_only=False, label="Benchmark storage path")
             for ext in ("", "-wal", "-shm", "-journal"):
                 p = bench_db + ext
                 if os.path.lexists(p):

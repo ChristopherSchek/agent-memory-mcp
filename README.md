@@ -31,8 +31,7 @@ Walks through runtime prerequisite checks, installation, health verification, an
 3. **Verify Health**: Confirm database integrity, permissions, storage gate status, and FTS5 index synchronization (`"healthy": true`) to validate the installation, preventing runtime MCP tool errors:
 
    ```bash
-   ~/.local/bin/agent-memory doctor
-   ALLOW_NON_OPTANE=1 ~/.local/bin/agent-memory doctor
+   ~/.local/bin/agent-memory doctor || ALLOW_NON_OPTANE=1 ~/.local/bin/agent-memory doctor
    ```
 
 4. **Benchmarks & Performance**: Compare physical write latency, context token scaling, and concurrency safety across storage media (`python3 benchmark/benchmark_comparison.py -n 100`) to quantify the architectural trade-offs of SQLite WAL + FTS5 versus flat files:

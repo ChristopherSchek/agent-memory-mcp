@@ -26,6 +26,9 @@ MAX_RESULTS_BYTES = 65536
 def detect_storage_label(target_path: str, fallback: str) -> str:
     """Resolves the underlying block device model from `/proc/mounts` and `/sys/block` for `target_path` so benchmark tables display accurate hardware labels, preventing missing sysfs metadata from crashing label detection."""
     with contextlib.suppress(OSError):
+        abs_target = os.path.abspath(target_path)
+        if (target_path.startswith("/mnt/optane") or abs_target.startswith("/mnt/optane")) and not os.path.exists(target_path):
+            return fallback
         real_path = os.path.realpath(target_path)
         while not os.path.exists(real_path) and real_path != "/":
             real_path = os.path.dirname(real_path)
@@ -184,9 +187,13 @@ def _load_agent_memory_mod(bin_path: str) -> Any:
     """Loads the `bin/agent-memory` module with fallback config probing disabled so helper functions can be invoked in-process, preventing ambient host config side effects."""
     saved_no_cfg = os.environ.get("AGENT_MEMORY_NO_CFG_FALLBACK")
     saved_allow = os.environ.get("ALLOW_NON_OPTANE")
+    saved_db = os.environ.get("AGENT_MEMORY_DB")
+    saved_opt = os.environ.get("OPTANE_BASE")
     try:
         os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
         os.environ["ALLOW_NON_OPTANE"] = "1"
+        os.environ.pop("AGENT_MEMORY_DB", None)
+        os.environ.pop("OPTANE_BASE", None)
         loader = importlib.machinery.SourceFileLoader("agent_memory_bench_mod", bin_path)
         spec = importlib.util.spec_from_loader("agent_memory_bench_mod", loader)
         if spec is None or spec.loader is None:
@@ -195,14 +202,16 @@ def _load_agent_memory_mod(bin_path: str) -> Any:
         spec.loader.exec_module(mod)
         return mod
     finally:
-        if saved_no_cfg is None:
-            os.environ.pop("AGENT_MEMORY_NO_CFG_FALLBACK", None)
-        else:
-            os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = saved_no_cfg
-        if saved_allow is None:
-            os.environ.pop("ALLOW_NON_OPTANE", None)
-        else:
-            os.environ["ALLOW_NON_OPTANE"] = saved_allow
+        for env_name, env_val in (
+            ("AGENT_MEMORY_NO_CFG_FALLBACK", saved_no_cfg),
+            ("ALLOW_NON_OPTANE", saved_allow),
+            ("AGENT_MEMORY_DB", saved_db),
+            ("OPTANE_BASE", saved_opt),
+        ):
+            if env_val is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = env_val
 
 
 def benchmark_mcp_engine(
@@ -349,7 +358,9 @@ def print_markdown_comparison(
     flash_map: dict[str, dict[str, Any]] = {}
     for r in results:
         p = r["pattern"]
-        if r.get("media") == optane_label or "Optane" in r.get("media", ""):
+        tier = r.get("tier")
+        is_optane_row = (tier == "optane") if tier in ("optane", "flash") else (r.get("media") == optane_label or "Optane" in r.get("media", ""))
+        if is_optane_row:
             optane_map[p] = r
         else:
             flash_map[p] = r
@@ -428,7 +439,13 @@ def _pre_extract_log_dir(argv: list[str]) -> str:
         arg = argv[i]
         if arg == "--":
             break
-        if arg == "--log-dir":
+        if arg in ("-h", "--help", "-v", "--version"):
+            return ""
+        if arg in ("-n", "--count"):
+            if i + 1 < len(argv):
+                i += 2
+                continue
+        elif arg == "--log-dir":
             if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
                 raw = argv[i + 1]
                 i += 2
@@ -464,42 +481,63 @@ def _validate_and_init_log_dir(log_dir: str, am_mod: Any, home_dir: str) -> tupl
         parts = [seg for seg in p.split("/") if seg]
         if ".git" in parts:
             raise ValueError(f"Refusing --log-dir inside a .git directory: '{log_dir}'.")
-    if am_mod is not None:
-        if hasattr(am_mod, "_check_not_guarded_path"):
-            am_mod._check_not_guarded_path(norm_log, "LOG_DIR")
-        for cand_db in (getattr(am_mod, "DB_PATH", ""), getattr(am_mod, "_RAW_DB_PATH", "")):
-            if not cand_db:
-                continue
-            abs_db = os.path.abspath(cand_db)
-            real_db = os.path.realpath(abs_db)
-            db_dir = os.path.dirname(abs_db)
-            if norm_log in (abs_db, db_dir) or real_log in (real_db, os.path.dirname(real_db)):
-                raise ValueError(f"Refusing --log-dir colliding with database path or directory: '{log_dir}'.")
-            if abs_db.startswith(norm_log.rstrip("/") + "/") or norm_log.startswith(abs_db.rstrip("/") + "/"):
-                raise ValueError(f"Refusing --log-dir overlapping database path: '{log_dir}'.")
-            if os.path.basename(db_dir) in ("agent_memory", "agent-memory") and norm_log.startswith(db_dir.rstrip("/") + "/"):
-                raise ValueError(f"Refusing --log-dir inside dedicated database directory: '{log_dir}'.")
+    if am_mod is not None and hasattr(am_mod, "_check_not_guarded_path"):
+        am_mod._check_not_guarded_path(norm_log, "LOG_DIR")
+    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+    if not xdg_data or not os.path.isabs(xdg_data):
+        xdg_data = os.path.join(home_dir, ".local", "share")
+    user_base = os.path.basename(os.path.abspath(home_dir).rstrip("/")) or "user"
+    env_db = os.environ.get("AGENT_MEMORY_DB", "").strip()
+    env_opt = os.environ.get("OPTANE_BASE", "").strip()
+    cand_dbs = [
+        env_db,
+        os.path.join(env_opt, "agent_memory", "memory.db") if env_opt else "",
+        getattr(am_mod, "DB_PATH", "") if am_mod is not None else "",
+        getattr(am_mod, "_RAW_DB_PATH", "") if am_mod is not None else "",
+        f"/mnt/optane/{user_base}/agent_memory/memory.db",
+        os.path.join(xdg_data, "agent-memory", "memory.db"),
+    ]
+    for cand_db in cand_dbs:
+        if not cand_db:
+            continue
+        abs_db = os.path.abspath(cand_db)
+        real_db = os.path.realpath(abs_db)
+        db_dir = os.path.dirname(abs_db)
+        real_db_dir = os.path.dirname(real_db)
+        if norm_log in (abs_db, db_dir) or real_log in (real_db, real_db_dir):
+            raise ValueError(f"Refusing --log-dir colliding with database path or directory: '{log_dir}'.")
+        if abs_db.startswith(norm_log.rstrip("/") + "/") or norm_log.startswith(abs_db.rstrip("/") + "/") or real_db.startswith(real_log.rstrip("/") + "/") or real_log.startswith(real_db.rstrip("/") + "/"):
+            raise ValueError(f"Refusing --log-dir overlapping database path: '{log_dir}'.")
+        if (os.path.basename(db_dir) in ("agent_memory", "agent-memory") and norm_log.startswith(db_dir.rstrip("/") + "/")) or (os.path.basename(real_db_dir) in ("agent_memory", "agent-memory") and real_log.startswith(real_db_dir.rstrip("/") + "/")):
+            raise ValueError(f"Refusing --log-dir inside dedicated database directory: '{log_dir}'.")
+    euid = os.geteuid()
     cur = norm_log
     while True:
         if os.path.lexists(cur):
             st_cur = os.lstat(cur)
             if stat.S_ISLNK(st_cur.st_mode):
                 raise ValueError(f"Refusing symlinked --log-dir component: '{cur}'.")
-            if cur == norm_log and not stat.S_ISDIR(st_cur.st_mode):
-                raise ValueError(f"--log-dir exists and is not a directory: '{norm_log}'.")
+            if cur == norm_log:
+                if not stat.S_ISDIR(st_cur.st_mode):
+                    raise ValueError(f"--log-dir exists and is not a directory: '{norm_log}'.")
+                if st_cur.st_uid != euid:
+                    raise ValueError(f"--log-dir is not owned by current user: '{norm_log}'.")
         parent = os.path.dirname(cur)
         if parent == cur:
             break
         cur = parent
     os.makedirs(norm_log, mode=0o700, exist_ok=True)
+    st_dir = os.lstat(norm_log)
+    if stat.S_ISLNK(st_dir.st_mode) or not stat.S_ISDIR(st_dir.st_mode) or st_dir.st_uid != euid:
+        raise ValueError(f"--log-dir validation failed after creation: '{norm_log}'.")
     os.chmod(norm_log, 0o700)
     dbg_path = os.path.join(norm_log, "debug.log")
     res_path = os.path.join(norm_log, "results.json")
     for fpath in (dbg_path, res_path):
         if os.path.lexists(fpath):
             st_f = os.lstat(fpath)
-            if stat.S_ISLNK(st_f.st_mode) or not stat.S_ISREG(st_f.st_mode) or st_f.st_nlink != 1:
-                raise ValueError(f"Refusing non-regular or symlinked telemetry target: '{fpath}'.")
+            if stat.S_ISLNK(st_f.st_mode) or not stat.S_ISREG(st_f.st_mode) or st_f.st_nlink != 1 or st_f.st_uid != euid:
+                raise ValueError(f"Refusing non-regular, foreign-owned, or symlinked telemetry target: '{fpath}'.")
     fd = os.open(dbg_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
     os.fchmod(fd, 0o600)
     os.close(fd)
@@ -517,9 +555,7 @@ def _redact_secrets_obj(obj: Any, am_mod: Any, depth: int = 0) -> Any:
                 pat = item[0] if isinstance(item, tuple) else item
                 with contextlib.suppress(Exception):
                     out = pat.sub("[REDACTED]", out)
-            screen_fn = getattr(am_mod, "_screen_for_secrets", None)
-            if callable(screen_fn) and screen_fn(out) is not None:
-                return "[REDACTED: potential secret]"
+        out = "".join(ch if (ch in ("\n", "\t") or 32 <= ord(ch) <= 126) else "?" for ch in out)
         return out
     if isinstance(obj, dict):
         sanitized_dict: dict[str, Any] = {}
@@ -730,7 +766,7 @@ def main() -> None:
             _write_tri_stream_results(
                 results_json_path,
                 exit_code=2,
-                dry_run=False,
+                dry_run=bool("--dry-run" in sys.argv[1:]),
                 summary=f"Argument validation error: {exc}",
                 errors=[{"code": "INVALID_ARGS", "message": str(exc)}],
                 data={},
@@ -768,8 +804,31 @@ def main() -> None:
         dry_run_flag = bool(args.dry_run)
         try:
             optane_user_dir = f"/mnt/optane/{username}"
-            has_optane = bool(am_mod._has_usable_user_optane_dir()) if (am_mod is not None and hasattr(am_mod, "_has_usable_user_optane_dir")) else False
+            has_optane = False
+            if (
+                am_mod is not None
+                and hasattr(am_mod, "_has_usable_user_optane_dir")
+                and am_mod._has_usable_user_optane_dir()
+                and os.access(optane_user_dir, os.W_OK | os.X_OK)
+            ):
+                try:
+                    if hasattr(am_mod, "validate_storage_hardware"):
+                        getattr(am_mod, "_VALIDATED_STORAGE_DEVS", set()).clear()
+                        am_mod.validate_storage_hardware(optane_user_dir)
+                    has_optane = True
+                except Exception:
+                    has_optane = False
             flash_base_dir = tempfile.gettempdir()
+            if os.path.realpath(flash_base_dir).startswith("/mnt/optane") or os.path.abspath(flash_base_dir).startswith("/mnt/optane"):
+                for alt_dir in ("/dev/shm", os.path.join(home_dir, ".cache"), home_dir):
+                    if (
+                        os.path.isdir(alt_dir)
+                        and os.access(alt_dir, os.W_OK | os.X_OK)
+                        and not os.path.realpath(alt_dir).startswith("/mnt/optane")
+                        and not os.path.abspath(alt_dir).startswith("/mnt/optane")
+                    ):
+                        flash_base_dir = alt_dir
+                        break
 
             flash_label = detect_storage_label(flash_base_dir, "Standard Local Storage")
             optane_label = detect_storage_label(optane_user_dir, "Dedicated Optane Volume")
@@ -785,21 +844,26 @@ def main() -> None:
 
             def _run_storage_tier(base_dir: str, label: str, allow_non_optane: bool, db_prefix: str) -> None:
                 """Runs flat-file and SQLite MCP benchmarks inside a temporary directory on a target storage tier so media comparisons execute identically, preventing divergent benchmark harness setup."""
+                tier_name = "optane" if not allow_non_optane else "flash"
                 with tempfile.TemporaryDirectory(dir=base_dir, prefix=".am_bench_") as td:
-                    results.append(benchmark_unassisted_markdown(td, args.count, media_name=label))
-                    results.append(benchmark_unassisted_json(td, args.count, media_name=label))
+                    md_res = benchmark_unassisted_markdown(td, args.count, media_name=label)
+                    md_res["tier"] = tier_name
+                    results.append(md_res)
+                    js_res = benchmark_unassisted_json(td, args.count, media_name=label)
+                    js_res["tier"] = tier_name
+                    results.append(js_res)
                     for sync_mode, suffix in (("FULL", "full"), ("NORMAL", "norm")):
                         db_file = os.path.join(td, f"{db_prefix}_{suffix}.db")
-                        results.append(
-                            benchmark_mcp_engine(
-                                bin_path,
-                                db_file,
-                                allow_non_optane=allow_non_optane,
-                                count=args.count,
-                                media_name=label,
-                                sync_override=sync_mode,
-                            )
+                        mcp_res = benchmark_mcp_engine(
+                            bin_path,
+                            db_file,
+                            allow_non_optane=allow_non_optane,
+                            count=args.count,
+                            media_name=label,
+                            sync_override=sync_mode,
                         )
+                        mcp_res["tier"] = tier_name
+                        results.append(mcp_res)
 
             _log_debug(f"[*] Running benchmarks on standard local storage ({flash_label})...")
             _run_storage_tier(flash_base_dir, flash_label, allow_non_optane=True, db_prefix="bench_flash")
@@ -812,7 +876,8 @@ def main() -> None:
                 """Computes a deterministic sort rank for benchmark entries so results order from fastest to slowest, preventing nondeterministic row ordering."""
                 p = r.get("pattern", "")
                 m = r.get("media", "")
-                is_optane = m == optane_label or "Optane" in m
+                tier = r.get("tier")
+                is_optane = (tier == "optane") if tier in ("optane", "flash") else (m == optane_label or "Optane" in m)
                 if "agent-memory" in p:
                     if "FULL" in p and is_optane:
                         return 1
