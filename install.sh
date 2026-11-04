@@ -83,6 +83,8 @@ import importlib.machinery, importlib.util, os, sys
 bundle_bin, text = sys.argv[1:3]
 os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
 os.environ["ALLOW_NON_OPTANE"] = "1"
+os.environ.pop("AGENT_MEMORY_DB", None)
+os.environ.pop("OPTANE_BASE", None)
 loader = importlib.machinery.SourceFileLoader("am_redact", bundle_bin)
 spec = importlib.util.spec_from_loader("am_redact", loader)
 mod = importlib.util.module_from_spec(spec)
@@ -91,6 +93,7 @@ out = text
 for item in getattr(mod, "_SECRET_PATTERNS", ()):
     pat = item[0] if isinstance(item, tuple) else item
     out = pat.sub("[REDACTED]", out)
+out = "".join(ch if (ch in "\n\t" or " " <= ch <= "~") else "?" for ch in out)
 if getattr(mod, "_screen_for_secrets", lambda s: None)(out) is not None:
     out = "[REDACTED: potential secret]"
 sys.stdout.write(out)
@@ -131,6 +134,8 @@ if os.path.isfile(bundle_bin):
     try:
         os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
         os.environ["ALLOW_NON_OPTANE"] = "1"
+        os.environ.pop("AGENT_MEMORY_DB", None)
+        os.environ.pop("OPTANE_BASE", None)
         loader = importlib.machinery.SourceFileLoader("am_res_redact", bundle_bin)
         spec = importlib.util.spec_from_loader("am_res_redact", loader)
         mod = importlib.util.module_from_spec(spec)
@@ -144,6 +149,7 @@ def _clean_str(val: str) -> str:
         for item in getattr(mod, "_SECRET_PATTERNS", ()):
             pat = item[0] if isinstance(item, tuple) else item
             out = pat.sub("[REDACTED]", out)
+        out = "".join(ch if (ch in "\n\t" or " " <= ch <= "~") else "?" for ch in out)
         if getattr(mod, "_screen_for_secrets", lambda s: None)(out) is not None:
             return "[REDACTED: potential secret]"
     return out
@@ -224,35 +230,53 @@ trap 'exit 143' TERM
 
 pre_init_log_dir() {
     local raw_log=""
+    local raw_db=""
     local prev_is_log=0
+    local prev_is_db=0
     local arg
     for arg in "$@"; do
+        case "${arg}" in
+            -h|--help|-v|--version) return 0 ;;
+        esac
         if [ "${prev_is_log}" -eq 1 ]; then
+            prev_is_log=0
             if [ -n "${arg}" ] && [[ "${arg}" != -* ]]; then
                 raw_log="${arg}"
-            else
-                raw_log=""
+                continue
             fi
-            prev_is_log=0
-            continue
+            raw_log=""
+        fi
+        if [ "${prev_is_db}" -eq 1 ]; then
+            prev_is_db=0
+            if [ -n "${arg}" ] && [[ "${arg}" != -* ]]; then
+                raw_db="${arg}"
+                continue
+            fi
+            raw_db=""
         fi
         case "${arg}" in
             --log-dir) raw_log=""; prev_is_log=1 ;;
             --log-dir=*) raw_log="${arg#--log-dir=}" ;;
+            --db) raw_db=""; prev_is_db=1 ;;
+            --db=*) raw_db="${arg#--db=}" ;;
         esac
     done
     [ "${prev_is_log}" -eq 0 ] || raw_log=""
+    [ "${prev_is_db}" -eq 0 ] || raw_db=""
     [ -n "${raw_log}" ] || return 0
     raw_log="$(expand_tilde_path "${raw_log}")"
+    [ -n "${raw_db}" ] && raw_db="$(expand_tilde_path "${raw_db}")"
     command -v python3 >/dev/null 2>&1 || return 0
-    if python3 -I - "${BUNDLE_BIN}" "${raw_log}" 2>/dev/null <<'PY'; then
+    if python3 -I - "${BUNDLE_BIN}" "${raw_log}" "${raw_db}" 2>/dev/null <<'PY'; then
 """Validates --log-dir before CLI flag parsing so early exit code 2 argument errors still emit Tri-Stream telemetry when --log-dir is valid, preventing missing results.json on syntax errors."""
 import importlib.machinery, importlib.util, os, stat, sys
-bundle_bin, log_dir = sys.argv[1:3]
+bundle_bin, log_dir, raw_db = sys.argv[1:4]
 if not os.path.isabs(log_dir) or not os.path.isfile(bundle_bin):
     sys.exit(1)
 os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
 os.environ["ALLOW_NON_OPTANE"] = "1"
+env_db = os.environ.pop("AGENT_MEMORY_DB", "").strip()
+env_opt = os.environ.pop("OPTANE_BASE", "").strip()
 loader = importlib.machinery.SourceFileLoader("am_pre_log", bundle_bin)
 spec = importlib.util.spec_from_loader("am_pre_log", loader)
 mod = importlib.util.module_from_spec(spec)
@@ -266,14 +290,30 @@ for p in (abs_log, real_log):
     if ".git" in [seg for seg in p.split("/") if seg]:
         sys.exit(1)
 mod._check_not_guarded_path(abs_log, "LOG_DIR")
-for cand_db in (getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
-    if not cand_db:
+h_dir = mod.AUTH_HOME
+bin_d = os.environ.get("AGENT_MEMORY_BIN_DIR") or os.environ.get("BIN_DIR") or os.path.join(h_dir, ".local", "bin")
+mcp_d = os.environ.get("AGENT_MEMORY_MCP_DIR") or os.environ.get("MCP_DIR") or os.path.join(h_dir, ".gemini", "antigravity-cli", "mcp", "agent-memory")
+skill_d = os.environ.get("AGENT_MEMORY_SKILL_DIR") or os.environ.get("SKILL_DIR") or os.path.join(h_dir, ".gemini", "config", "skills", "agent-memory")
+mcp_c = os.environ.get("AGENT_MEMORY_MCP_CONFIG") or os.environ.get("MCP_CONFIG") or os.path.join(h_dir, ".gemini", "config", "mcp_config.json")
+for t_val in (bin_d, mcp_d, skill_d, mcp_c):
+    if t_val:
+        at = os.path.abspath(os.path.expanduser(t_val))
+        rt = os.path.realpath(at)
+        if abs_log in (at, rt) or real_log in (at, rt) or abs_log.startswith(at.rstrip("/") + "/") or at.startswith(abs_log.rstrip("/") + "/") or real_log.startswith(rt.rstrip("/") + "/") or rt.startswith(real_log.rstrip("/") + "/"):
+            sys.exit(1)
+opt_db = os.path.join(getattr(mod, "_OPTANE_DEFAULT_DIR", os.path.join(getattr(mod, "OPTANE_BASE", f"/mnt/optane/{getattr(mod, 'AUTH_USER', '')}"), "agent_memory")), "memory.db")
+env_opt_db = os.path.join(env_opt, "agent_memory", "memory.db") if env_opt else ""
+non_opt_db = os.path.join(h_dir, ".local", "share", "agent-memory", "memory.db")
+for cand_db in (raw_db, env_db, env_opt_db, opt_db, non_opt_db, getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
+    if not cand_db or not os.path.isabs(cand_db):
         continue
     abs_db = os.path.abspath(cand_db)
+    real_db = os.path.realpath(abs_db)
     db_dir = os.path.dirname(abs_db)
-    if abs_log in (abs_db, db_dir) or abs_db.startswith(abs_log.rstrip("/") + "/") or abs_log.startswith(abs_db.rstrip("/") + "/"):
+    real_db_dir = os.path.dirname(real_db)
+    if abs_log in (abs_db, db_dir) or real_log in (real_db, real_db_dir) or abs_db.startswith(abs_log.rstrip("/") + "/") or abs_log.startswith(abs_db.rstrip("/") + "/") or real_db.startswith(real_log.rstrip("/") + "/") or real_log.startswith(real_db.rstrip("/") + "/"):
         sys.exit(1)
-    if os.path.basename(db_dir) in ("agent_memory", "agent-memory") and abs_log.startswith(db_dir.rstrip("/") + "/"):
+    if (os.path.basename(db_dir) in ("agent_memory", "agent-memory") and abs_log.startswith(db_dir.rstrip("/") + "/")) or (os.path.basename(real_db_dir) in ("agent_memory", "agent-memory") and real_log.startswith(real_db_dir.rstrip("/") + "/")):
         sys.exit(1)
 cur = abs_log
 while True:
@@ -404,6 +444,8 @@ if not os.path.isfile(bundle_bin):
     sys.exit(f"bundle is incomplete: bin/agent-memory not found at '{bundle_bin}'.")
 os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
 os.environ["ALLOW_NON_OPTANE"] = "1"
+env_db = os.environ.pop("AGENT_MEMORY_DB", "").strip()
+env_opt = os.environ.pop("OPTANE_BASE", "").strip()
 loader = importlib.machinery.SourceFileLoader("am_path_guard", bundle_bin)
 spec = importlib.util.spec_from_loader("am_path_guard", loader)
 mod = importlib.util.module_from_spec(spec)
@@ -429,33 +471,78 @@ for label, val in (
             sys.exit(f"Refusing unexpanded template placeholder for {label}: '{val}'.")
         if val.endswith("/") or os.path.isdir(abs_v):
             sys.exit(f"{label} must be a database file path, not a directory: '{val}'.")
-    if label == "MCP_CONFIG" and abs_v == os.path.abspath(def_mcp_cfg):
+    if label == "MCP_CONFIG":
         if os.path.lexists(abs_v):
             st_m = os.lstat(abs_v)
             if stat.S_ISLNK(st_m.st_mode) or not stat.S_ISREG(st_m.st_mode) or st_m.st_nlink != 1:
                 sys.exit(f"Refusing symlink, hardlink, or non-regular file for {label}: '{val}'.")
-        continue
+        cur_p = os.path.dirname(abs_v)
+        while True:
+            if os.path.lexists(cur_p) and stat.S_ISLNK(os.lstat(cur_p).st_mode):
+                sys.exit(f"Refusing symlinked parent directory for {label}: '{cur_p}'.")
+            par_p = os.path.dirname(cur_p)
+            if par_p == cur_p:
+                break
+            cur_p = par_p
+        if abs_v == os.path.abspath(def_mcp_cfg):
+            continue
+    if label in ("BIN_DIR", "MCP_DIR", "SKILL_DIR"):
+        cur_d = abs_v
+        while True:
+            if os.path.lexists(cur_d):
+                st_d = os.lstat(cur_d)
+                if stat.S_ISLNK(st_d.st_mode):
+                    sys.exit(f"Refusing symlinked directory component for {label}: '{cur_d}'.")
+                if cur_d == abs_v and not stat.S_ISDIR(st_d.st_mode):
+                    sys.exit(f"Refusing non-directory target for {label}: '{abs_v}'.")
+            par_d = os.path.dirname(cur_d)
+            if par_d == cur_d:
+                break
+            cur_d = par_d
     try:
         mod._check_not_guarded_path(val, label)
     except RuntimeError as exc:
         sys.exit(str(exc))
+for dir_lbl, dir_val, leaves in (
+    ("BIN_DIR", bin_dir, ("agent-memory",)),
+    ("SKILL_DIR", skill_dir, ("SKILL.md", "references", "references/agent-memory-mcp.md")),
+    ("MCP_DIR", mcp_dir, ("instructions.md", "memory_record.json", "memory_search.json", "memory_recall.json", "memory_relate.json", "memory_forget.json")),
+):
+    if not dir_val:
+        continue
+    abs_d = os.path.abspath(dir_val)
+    for lf in leaves:
+        lp = os.path.join(abs_d, lf)
+        if os.path.lexists(lp):
+            st_lf = os.lstat(lp)
+            if stat.S_ISLNK(st_lf.st_mode):
+                sys.exit(f"Refusing symlinked target in {dir_lbl}: '{lp}'.")
+            if lf != "references" and (not stat.S_ISREG(st_lf.st_mode) or st_lf.st_nlink != 1):
+                sys.exit(f"Refusing non-regular or hardlinked target in {dir_lbl}: '{lp}'.")
 if log_dir:
     abs_log = os.path.abspath(log_dir)
     real_log = os.path.realpath(abs_log)
     for target_lbl, target_val in (("BIN_DIR", bin_dir), ("MCP_DIR", mcp_dir), ("SKILL_DIR", skill_dir), ("MCP_CONFIG", mcp_cfg)):
-        if target_val and (abs_log == os.path.abspath(target_val) or real_log == os.path.realpath(target_val)):
-            sys.exit(f"Refusing LOG_DIR colliding with {target_lbl}: '{log_dir}'.")
-    for cand_db in (db_over, getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
+        if target_val:
+            at = os.path.abspath(target_val)
+            rt = os.path.realpath(at)
+            if abs_log in (at, rt) or real_log in (at, rt) or abs_log.startswith(at.rstrip("/") + "/") or at.startswith(abs_log.rstrip("/") + "/") or real_log.startswith(rt.rstrip("/") + "/") or rt.startswith(real_log.rstrip("/") + "/"):
+                sys.exit(f"Refusing LOG_DIR colliding with {target_lbl}: '{log_dir}'.")
+    opt_db = os.path.join(getattr(mod, "_OPTANE_DEFAULT_DIR", os.path.join(getattr(mod, "OPTANE_BASE", f"/mnt/optane/{getattr(mod, 'AUTH_USER', '')}"), "agent_memory")), "memory.db")
+    env_opt_db = os.path.join(env_opt, "agent_memory", "memory.db") if env_opt else ""
+    non_opt_db = os.path.join(mod.AUTH_HOME, ".local", "share", "agent-memory", "memory.db")
+    for cand_db in (db_over, env_db, env_opt_db, opt_db, non_opt_db, getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
         if not cand_db:
             continue
         abs_db = os.path.abspath(cand_db)
         real_db = os.path.realpath(abs_db)
         db_dir = os.path.dirname(abs_db)
-        if abs_log in (abs_db, db_dir) or real_log in (real_db, os.path.dirname(real_db)):
+        real_db_dir = os.path.dirname(real_db)
+        if abs_log in (abs_db, db_dir) or real_log in (real_db, real_db_dir):
             sys.exit(f"Refusing LOG_DIR colliding with database path or directory: '{log_dir}'.")
-        if abs_db.startswith(abs_log.rstrip("/") + "/") or abs_log.startswith(abs_db.rstrip("/") + "/"):
+        if abs_db.startswith(abs_log.rstrip("/") + "/") or abs_log.startswith(abs_db.rstrip("/") + "/") or real_db.startswith(real_log.rstrip("/") + "/") or real_log.startswith(real_db.rstrip("/") + "/"):
             sys.exit(f"Refusing LOG_DIR overlapping database path: '{log_dir}'.")
-        if os.path.basename(db_dir) in ("agent_memory", "agent-memory") and abs_log.startswith(db_dir.rstrip("/") + "/"):
+        if (os.path.basename(db_dir) in ("agent_memory", "agent-memory") and abs_log.startswith(db_dir.rstrip("/") + "/")) or (os.path.basename(real_db_dir) in ("agent_memory", "agent-memory") and real_log.startswith(real_db_dir.rstrip("/") + "/")):
             sys.exit(f"Refusing LOG_DIR inside dedicated database directory: '{log_dir}'.")
     cur = abs_log
     while True:
@@ -479,7 +566,7 @@ PY
 }
 
 if ! VALIDATE_ERR="$(validate_install_paths 2>&1)"; then
-    if [ "${LOG_DIR_VALIDATED}" -ne 1 ] || [ "${LOG_DIR}" != "${VALIDATED_LOG_DIR:-}" ]; then
+    if [ "${LOG_DIR_VALIDATED}" -ne 1 ] || [ "${LOG_DIR}" != "${VALIDATED_LOG_DIR:-}" ] || [[ "${VALIDATE_ERR}" == *LOG_DIR* ]]; then
         LOG_DIR=""
         LOG_DIR_VALIDATED=0
     fi
@@ -514,6 +601,7 @@ install_file_atomic() {
     mkdir -p "${dst_dir}"
     [ ! -L "${dst_dir}" ] || die "Refusing symlinked destination directory: ${dst_dir}"
     [ ! -L "${dst}" ] || die "Refusing symlinked destination file: ${dst}"
+    [ ! -d "${dst}" ] || die "Refusing directory at destination file path: ${dst}"
     TMP_ATOMIC="$(mktemp "${dst_dir}/.$(basename "${dst}").XXXXXX")"
     cp "${src}" "${TMP_ATOMIC}"
     chmod "${mode}" "${TMP_ATOMIC}"

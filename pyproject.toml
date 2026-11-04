@@ -9,9 +9,13 @@ description = "Per-user SQLite WAL + FTS5 persistent memory and knowledge graph 
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
+dependencies = []
 
 [tool.setuptools]
 py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 include = ["*.py", "bin/agent-memory"]

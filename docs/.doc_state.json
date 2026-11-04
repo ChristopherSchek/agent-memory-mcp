@@ -1,8 +1,8 @@
 {
   "version": "1.0.0",
   "tier": "standard",
-  "last_synced_commit": "a7e4c5c711a3dee4d803ae8a985f7856c5563467",
-  "last_synced_at": "2026-11-02T18:52:36.994043+00:00",
+  "last_synced_commit": "a9793983e574e7fd9857b51fe57ac67e9c9445d2",
+  "last_synced_at": "2026-11-04T05:59:59.776442+00:00",
   "generator": "doc_manager.py v1.0.0",
   "project_name": "AgentMemoryMCP",
   "stack_signals": [
@@ -11,21 +11,21 @@
   "tracked_docs": {
     "docs/INDEX.md": {
       "concern": "index",
-      "last_updated_at": "2026-11-02T18:41:32.120604+00:00",
-      "sha256": "b60bad1dda6ce7d88ab292d7c9a7886d3a075847c440e6faedf4852d659815be",
-      "last_synced_commit": "a7e4c5c711a3dee4d803ae8a985f7856c5563467"
+      "last_updated_at": "2026-11-04T05:59:59.776442+00:00",
+      "sha256": "cc8bb2ccd3a78071e3c188e77cb30cc09af1220e5de134b5245d9bb44c1779dd",
+      "last_synced_commit": "a9793983e574e7fd9857b51fe57ac67e9c9445d2"
     },
     "docs/architecture.md": {
       "concern": "architecture",
-      "last_updated_at": "2026-11-02T18:41:32.120604+00:00",
-      "sha256": "bf6d4ff42ea22216168196fa10111670b0bb9dfda83b0596f9ede9384cfb8dc0",
-      "last_synced_commit": "a7e4c5c711a3dee4d803ae8a985f7856c5563467"
+      "last_updated_at": "2026-11-04T05:59:59.776442+00:00",
+      "sha256": "7598f0b5f5fa263f6c547614f301fc63056987301b723abc188d27e5062d9250",
+      "last_synced_commit": "a9793983e574e7fd9857b51fe57ac67e9c9445d2"
     },
     "docs/technical_standards.md": {
       "concern": "standards",
-      "last_updated_at": "2026-11-02T18:41:32.120604+00:00",
-      "sha256": "594785f10e37de644352bda2d39751beea1db48d8e14ca92165fdef20ba73262",
-      "last_synced_commit": "a7e4c5c711a3dee4d803ae8a985f7856c5563467"
+      "last_updated_at": "2026-11-04T05:59:59.776442+00:00",
+      "sha256": "b60555ce1e36fe95e25b8056d5fa24d2404fe10ea07aaedf867cdd96f56dbb8a",
+      "last_synced_commit": "a9793983e574e7fd9857b51fe57ac67e9c9445d2"
     }
   },
   "mapping_rules": [

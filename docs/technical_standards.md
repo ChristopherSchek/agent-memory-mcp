@@ -7,7 +7,7 @@ Establishes runtime baselines, linting gates, security invariants, and test requ
 Defines the Python 3.10+, SQLite 3.35+ (FTS5 and JSON1), and Bash toolchain baselines so local development and production deployments behave identically, preventing extension-loading or environment mismatches.
 
 1. **Zero-Dependency Python & SQLite Baseline**: Targets Python 3.10+ using only the Python standard library (`dependencies = []` in [pyproject.toml](../pyproject.toml)) with built-in `sqlite3` (`>= 3.35.0`) compiled with FTS5 and JSON1 (`json_patch`) support.
-2. **First-Party Verification Tooling**: Static analysis and test runners (`ruff`, `mypy`, `pytest`, `shellcheck`, `markdownlint`) are procured exclusively from verified first-party registries.
+2. **First-Party Verification Tooling**: Static analysis and test runners (`ruff`, `mypy`, `pytest`, `bandit`, `shellcheck`, `markdownlint`) are procured exclusively from verified first-party registries.
 3. **Executable Size & Permission Discipline**: [bin/agent-memory](../bin/agent-memory) remains under the `262,144`-byte `PreToolUse` inspection ceiling and enforces `0700` directory modes and `0600` regular-file modes on all database, backup, and telemetry files.
    - *Positive Exemplar*: `Keep bin/agent-memory within the 262,144-byte ceiling and zero external runtime dependencies in pyproject.toml.`
    - *Negative Exemplar*: `Add third-party runtime package dependencies to bin/agent-memory or create world-readable SQLite database files.` (STRICTLY FORBIDDEN)
@@ -24,17 +24,17 @@ Verifies script byte size, Python version, and SQLite FTS5/JSON1 capabilities pr
 
 Enforces static analysis, shell linting, docstring structure, and Markdown formatting across all repository files so defects are caught pre-commit, preventing broken builds or policy violations.
 
-1. **Python & Shell Linters**: [bin/agent-memory](../bin/agent-memory), [benchmark/benchmark_comparison.py](../benchmark/benchmark_comparison.py), and [tests/test_agent_memory.py](../tests/test_agent_memory.py) must pass `ruff check` and `mypy` with zero warnings, and [install.sh](../install.sh) must pass `shellcheck` cleanly.
+1. **Python & Shell Linters**: [bin/agent-memory](../bin/agent-memory), [benchmark/benchmark_comparison.py](../benchmark/benchmark_comparison.py), and [tests/test_agent_memory.py](../tests/test_agent_memory.py) must pass `ruff check`, `mypy`, and `bandit` with zero warnings, and [install.sh](../install.sh) must pass `shellcheck` cleanly.
 2. **Single-Line 3-Part Docstrings**: Every Python module, class, and function docstring must be a single line containing `" so "` and `", preventing "` with zero semicolons.
 3. **4-Part H2 Markdown Structure**: [README.md](../README.md), [LLM_ONBOARDING.md](../LLM_ONBOARDING.md), [skill/SKILL.md](../skill/SKILL.md), [skill/references/agent-memory-mcp.md](../skill/references/agent-memory-mcp.md), and `docs/*.md` must pass `markdownlint` and follow the 4-part H2 skeleton.
-   - *Positive Exemplar*: `Validate all Python, Bash, and Markdown edits with ruff check, mypy, shellcheck, and markdownlint before staging.`
+   - *Positive Exemplar*: `Validate all Python, Bash, and Markdown edits with ruff check, mypy, bandit, shellcheck, and markdownlint before staging.`
    - *Negative Exemplar*: `Use multi-line docstrings, prose semicolons, smart quotes, or inline linter suppressions.` (STRICTLY FORBIDDEN)
 
 ### Verification & Failure Recovery
 
 Runs static analysis across all Python, Bash, and Markdown files prior to commit so syntax and style defects are eliminated immediately, preventing CI or audit failures.
 
-- Run `ruff check bin/agent-memory benchmark/ tests/ && shellcheck install.sh && markdownlint *.md skill/**/*.md docs/*.md` and fix any reported issue.
+- Run `ruff check bin/agent-memory benchmark/ tests/ && mypy bin/agent-memory benchmark/benchmark_comparison.py tests/test_agent_memory.py && bandit -r bin/agent-memory benchmark/ tests/ && shellcheck install.sh && markdownlint *.md skill/SKILL.md skill/**/*.md docs/*.md` and fix any reported issue.
 
 ---
 

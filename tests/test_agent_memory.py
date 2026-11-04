@@ -622,7 +622,27 @@ class TestAgentMemoryHermetic(unittest.TestCase):
                 conn_holder=conn_holder,
                 err_holder=err_holder,
             )
-            self.assertTrue(json.loads(str(r2))["result"].get("isError"))
+            r2_obj = json.loads(str(r2))["result"]
+            self.assertTrue(r2_obj.get("isError"))
+            self.assertIn("not found", r2_obj["content"][0]["text"].lower())
+            r3 = self.am.process_single_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "memory_recall",
+                        "arguments": {"entity": "bak-ent"},
+                    },
+                },
+                conn_holder[0],
+                self.am.TOOLS,
+                conn_holder=conn_holder,
+                err_holder=err_holder,
+            )
+            r3_obj = json.loads(str(r3))["result"]
+            self.assertFalse(r3_obj.get("isError"))
+            self.assertEqual(json.loads(r3_obj["content"][0]["text"])["name"], "bak-ent")
         finally:
             if conn_holder[0] is not None:
                 conn_holder[0].close()
@@ -696,13 +716,21 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         second = self.am.record_observation(
             content="Shared observation content",
             entity_name="preserve-ent",
-            entity_type="repo",
-            summary="Overwritten summary",
         )
         self.assertEqual(second.get("status"), "exists")
         recalled = self.am.recall_entity("preserve-ent")
         self.assertEqual(recalled["type"], "service")
         self.assertEqual(recalled["summary"], "Original summary")
+        third = self.am.record_observation(
+            content="Shared observation content",
+            entity_name="preserve-ent",
+            entity_type="repo",
+            summary="Updated summary",
+        )
+        self.assertEqual(third.get("status"), "exists")
+        recalled_updated = self.am.recall_entity("preserve-ent")
+        self.assertEqual(recalled_updated["type"], "repo")
+        self.assertEqual(recalled_updated["summary"], "Updated summary")
 
     def test_mcp_stdio_batch_and_legacy_migration(self) -> None:
         """Verifies stdio MCP loop batch bounds, notification ID rejection, legacy database schema migration, and hardware storage gate validation so protocol and storage invariants hold, preventing batch DoS, legacy data loss, or storage gate regressions."""
@@ -765,8 +793,9 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             am._VALIDATED_STORAGE_DEVS.clear()
             with mock.patch.object(
                 am, "_backing_block_devices", return_value=[]
-            ), self.assertRaises(RuntimeError):
-                am.enforce_storage_gate(self.tmpdir.name, read_only=True)
+            ), self.assertRaises(RuntimeError) as cm_unres:
+                am.validate_storage_hardware(self.tmpdir.name, dev_id=999992)
+            self.assertIn("could not be resolved to a physical device", str(cm_unres.exception))
 
     def test_plain_writing_and_tri_stream_contracts(self) -> None:
         """Verifies AST 3-part docstrings, 7-bit ASCII compliance, MCP schema 3-part descriptions, and Tri-Stream CLI telemetry across benchmark_comparison.py and install.sh so repository-wide governance gates hold, preventing documentation or telemetry regressions."""
@@ -853,6 +882,13 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         inst_log_dir = os.path.join(self.tmpdir.name, "install_logs")
         inst_err_dir = os.path.join(self.tmpdir.name, "install_err_logs")
         inst_path_err_dir = os.path.join(self.tmpdir.name, "install_path_err_logs")
+        spawn_env = dict(
+            os.environ,
+            AGENT_MEMORY_BIN_DIR=os.path.join(self.tmpdir.name, "bin"),
+            AGENT_MEMORY_MCP_DIR=os.path.join(self.tmpdir.name, "mcp"),
+            AGENT_MEMORY_SKILL_DIR=os.path.join(self.tmpdir.name, "skill"),
+            AGENT_MEMORY_MCP_CONFIG=os.path.join(self.tmpdir.name, "mcp_config.json"),
+        )
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
         try:
             file_actions = [
@@ -867,10 +903,12 @@ class TestAgentMemoryHermetic(unittest.TestCase):
                     "--dry-run",
                     "--no-client-config",
                     "--allow-non-optane",
+                    "--db",
+                    self.db_path,
                     "--log-dir",
                     inst_log_dir,
                 ],
-                os.environ,
+                spawn_env,
                 file_actions=file_actions,
             )
             _, status_code = os.waitpid(pid, 0)
@@ -883,7 +921,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
                     inst_err_dir,
                     "--unknown-flag",
                 ],
-                os.environ,
+                spawn_env,
                 file_actions=file_actions,
             )
             _, err_status = os.waitpid(pid_err, 0)
@@ -897,7 +935,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
                     "--db",
                     "relative/path.db",
                 ],
-                os.environ,
+                spawn_env,
                 file_actions=file_actions,
             )
             _, path_err_status = os.waitpid(pid_path_err, 0)
@@ -938,7 +976,10 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             bench_mod.main()
         self.assertEqual(cm_b_abbrev.exception.code, 2)
 
-        self.assertEqual(bench_mod._pre_extract_log_dir(["--log-dir", "/tmp/valid", "--log-dir", "--dry-run"]), "")
+        valid_tmp_log = os.path.join(self.tmpdir.name, "valid")
+        self.assertEqual(bench_mod._pre_extract_log_dir(["--log-dir", valid_tmp_log, "--log-dir", "--dry-run"]), "")
+        self.assertEqual(bench_mod._pre_extract_log_dir(["-n", "--log-dir"]), "")
+        self.assertEqual(bench_mod._pre_extract_log_dir(["--log-dir", valid_tmp_log, "--help"]), "")
 
         am = self.am
         with mock.patch.object(am, "_backing_block_devices", return_value=["/sys/block/nvme0n1"]), mock.patch.object(

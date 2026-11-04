@@ -19,7 +19,7 @@ Establishes non-negotiable safety and isolation constraints before executing any
 
 ### Verification & Failure Recovery
 
-Audits planned installation commands against the five safety guardrails before execution so catalog and runtime invariants hold, preventing configuration loss or secret exposure.
+Audits planned installation commands against the six safety guardrails before execution so catalog and runtime invariants hold, preventing configuration loss or secret exposure.
 
 - If an existing client configuration file is malformed JSON, back it up with mode `0600` and halt for operator inspection before writing changes.
 
@@ -116,8 +116,7 @@ Runs read-only diagnostics against the installed binary and database to confirm 
 1. **Execute Health Check**:
 
    ```bash
-   ~/.local/bin/agent-memory doctor
-   ALLOW_NON_OPTANE=1 ~/.local/bin/agent-memory doctor
+   ~/.local/bin/agent-memory doctor || ALLOW_NON_OPTANE=1 ~/.local/bin/agent-memory doctor
    ```
 
 2. **Expected Output Criteria**: Verify the command exits with code `0` and outputs JSON containing `"healthy": true`, `"sqlite_features": "ok (UPSERT, JSON1, FTS5)"`, `"writable": "ok"`, `"permissions": "ok"`, and `"fts_index": "ok"` (with no `"permissions_warning"` field).
@@ -154,11 +153,13 @@ Registers the `agent-memory` MCP server in the active AI coding client to expose
        try:
            with open(config_path, "r", encoding="utf-8") as f:
                data = json.load(f)
+           if not isinstance(data, dict):
+               raise ValueError("Top-level JSON value must be an object")
        except (OSError, ValueError, TypeError) as e:
-           print(f"Warning: existing config could not be parsed ({e}), backing up first.")
+           print(f"Error: existing config could not be parsed ({e}), backing up and halting.", file=sys.stderr)
            os.rename(config_path, config_path + ".bak")
            os.chmod(config_path + ".bak", 0o600)
-           data = {}
+           sys.exit(1)
 
    if "mcpServers" not in data or not isinstance(data["mcpServers"], dict):
        data["mcpServers"] = {}
@@ -196,7 +197,9 @@ Registers the `agent-memory` MCP server in the active AI coding client to expose
 3. **Claude Code Registration via CLI**:
 
    ```bash
-   DOC_JSON="$("${HOME}/.local/bin/agent-memory" doctor 2>/dev/null || ALLOW_NON_OPTANE=1 "${HOME}/.local/bin/agent-memory" doctor)"
+   if ! DOC_JSON="$("${HOME}/.local/bin/agent-memory" doctor 2>/dev/null)"; then
+       DOC_JSON="$(ALLOW_NON_OPTANE=1 "${HOME}/.local/bin/agent-memory" doctor)"
+   fi
    DB_PATH="$(python3 -I -c $'import json,sys\nprint(json.loads(sys.argv[1])["db_path"])' "${DOC_JSON}")"
    ALLOW_FLAG="$(python3 -I -c $'import json,sys\nprint("1" if json.loads(sys.argv[1]).get("allow_non_optane") else "0")' "${DOC_JSON}")"
 
@@ -328,7 +331,7 @@ Maps diagnostic failure symptoms to deterministic recovery procedures to guide a
    |---|---|---|
    | `storage_gate: '<db_path>' is not on a verified Intel Optane NVMe device` | Host storage is standard flash, cloud volume, or virtual disk. | Run `./install.sh --allow-non-optane`. Storage path resolves to `/mnt/optane/$USER/agent_memory/memory.db` if `/mnt/optane/$USER` exists and is owned by `$USER` (mode `0700`), or `${XDG_DATA_HOME:-~/.local/share}/agent-memory/memory.db` otherwise. |
    | `writable: no: '<path>' is not writable by uid <uid>` | Directory or database permissions mismatch. | Verify current UID matches directory: `ls -ld <dir>`. If owned by user, run `chmod 700 <dir>` (and `chmod 600 <db>`). |
-   | `permissions: error: '<path>' is a symlink owned by uid <uid>` | Target or sidecar file is a symlink. | Delete the symlink. `agent-memory` prohibits symlinked database or sidecar files (`-wal`, `-shm`, `-journal`) for integrity. |
+   | `permissions: error: '<path>' is a symlink owned by uid <uid>` | Target or sidecar file is a foreign-owned or sidecar symlink. | Replace or remove the symlink. `agent-memory` permits user-owned symlinks on `DB_PATH` resolving to a user-owned `0600` regular file, and prohibits foreign-owned symlinks and all sidecar symlinks (`-wal`, `-shm`, `-journal`). |
    | `fts_index: out of sync: <M> indexed vs <N> facts (run 'agent-memory init')` | SQLite full-text index drifted from `observations`. | Run `~/.local/bin/agent-memory init`. If issues persist, run `~/.local/bin/agent-memory init --force` (takes a backup before rebuilding). |
    | `foreign_keys: <N> violation(s): ...` | Referential integrity violation in SQLite tables. | Run `~/.local/bin/agent-memory restore <backup.db>` from the latest clean backup or rebuild via `~/.local/bin/agent-memory init --force`. |
    | `Storage is unavailable` tool call error | Database was locked or permissions changed mid-session. | Run `~/.local/bin/agent-memory doctor`, resolve failing field, and restart client process. |
