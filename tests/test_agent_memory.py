@@ -60,7 +60,8 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.addCleanup(self._restore_env)
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
-        self.db_path = os.path.join(self.tmpdir.name, "memory.db")
+        self.tmp_root = os.path.realpath(self.tmpdir.name)
+        self.db_path = os.path.join(self.tmp_root, "memory.db")
         self.am = _load_agent_memory_module(self.db_path)
         self.am.init_db(force=True)
 
@@ -841,7 +842,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         bench_mod = importlib.util.module_from_spec(bench_spec)
         bench_spec.loader.exec_module(bench_mod)
 
-        bench_log_dir = os.path.join(self.tmpdir.name, "bench_logs")
+        bench_log_dir = os.path.join(self.tmp_root, "bench_logs")
         sig_before = signal.getsignal(signal.SIGINT)
         with mock.patch.object(sys, "argv", [bench_script, "--validate-args"]), mock.patch.object(
             sys, "stdout", io.StringIO()
@@ -879,15 +880,15 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertTrue(Path(bench_log_dir, "debug.log").is_file())
 
         install_script = str(repo_root / "install.sh")
-        inst_log_dir = os.path.join(self.tmpdir.name, "install_logs")
-        inst_err_dir = os.path.join(self.tmpdir.name, "install_err_logs")
-        inst_path_err_dir = os.path.join(self.tmpdir.name, "install_path_err_logs")
+        inst_log_dir = os.path.join(self.tmp_root, "install_logs")
+        inst_err_dir = os.path.join(self.tmp_root, "install_err_logs")
+        inst_path_err_dir = os.path.join(self.tmp_root, "install_path_err_logs")
         spawn_env = dict(
             os.environ,
-            AGENT_MEMORY_BIN_DIR=os.path.join(self.tmpdir.name, "bin"),
-            AGENT_MEMORY_MCP_DIR=os.path.join(self.tmpdir.name, "mcp"),
-            AGENT_MEMORY_SKILL_DIR=os.path.join(self.tmpdir.name, "skill"),
-            AGENT_MEMORY_MCP_CONFIG=os.path.join(self.tmpdir.name, "mcp_config.json"),
+            AGENT_MEMORY_BIN_DIR=os.path.join(self.tmp_root, "bin"),
+            AGENT_MEMORY_MCP_DIR=os.path.join(self.tmp_root, "mcp"),
+            AGENT_MEMORY_SKILL_DIR=os.path.join(self.tmp_root, "skill"),
+            AGENT_MEMORY_MCP_CONFIG=os.path.join(self.tmp_root, "mcp_config.json"),
         )
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
         try:
