@@ -136,7 +136,7 @@ Parses the JSON output of `agent-memory doctor` to verify that every health chec
 Registers the `agent-memory` MCP server in the active AI coding client to expose the `memory_*` tools so operational and security invariants hold, preventing unmerged writes from destroying other registered MCP servers.
 
 1. **Client Detection Rules**:
-   - **Google Antigravity**: If running in Antigravity or `~/.gemini/antigravity-cli` exists, `./install.sh` has already registered the MCP server in `~/.gemini/config/mcp_config.json`. Do not edit manually.
+   - **Google Antigravity**: If running in Antigravity or `~/.gemini/antigravity-cli` exists, `./install.sh` has already registered the MCP server in `~/.gemini/config/mcp_config.json` and additively reconciled canonical `agent-memory` skill, CLI, and MCP tool permission grants into existing Antigravity and Claude runtime permission files. Do not edit manually.
    - **Other Clients**: Use the atomic merge script or `claude mcp add` command below for Claude Code (`~/.claude.json`), Gemini CLI (`~/.gemini/config/mcp_config.json`), Cursor (`~/.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Claude Desktop (`~/.config/Claude/claude_desktop_config.json` or `~/Library/Application Support/Claude/claude_desktop_config.json`), or VS Code / Cline (`~/.cline/data/settings/cline_mcp_settings.json`).
 2. **Safe Atomic Merge Script**:
 
