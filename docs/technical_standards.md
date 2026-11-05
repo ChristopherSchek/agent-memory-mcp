@@ -42,7 +42,7 @@ Runs static analysis across all Python, Bash, and Markdown files prior to commit
 
 Mandates hermetic unit and integration testing across CLI subcommands, JSON-RPC 2.0 MCP tools, symlink/hardlink guards, and installer workflows so every execution path is verified, preventing regressions.
 
-1. **Comprehensive Unit & MCP Test Suite ([tests/test_agent_memory.py](../tests/test_agent_memory.py))**: Exercises `init`, `record`, `search`, `recall`, `relate`, `forget`, `backup`, `restore`, `doctor`, `benchmark`, newline-delimited stdio JSON-RPC 2.0 requests and batches, and [install.sh](../install.sh) Tri-Stream contracts inside hermetic temporary directories.
+1. **Comprehensive Unit & MCP Test Suite ([tests/test_agent_memory.py](../tests/test_agent_memory.py))**: Exercises `init`, `record`, `search`, `recall`, `relate`, `forget`, `backup`, `restore`, `doctor`, `benchmark`, newline-delimited stdio JSON-RPC 2.0 requests and batches, and [install.sh](../install.sh) Tri-Stream contracts inside canonicalized hermetic temporary directories (`os.path.realpath` across Linux and macOS).
 2. **Adversarial Input & Hardlink Rejection**: Verifies that prefix flag abbreviations are rejected (`exit_code == 2`), hardlinked database/log/config files (`st_nlink > 1`) are refused, Optane H10/H20 hybrid models are rejected, and `--log-dir` collisions with the database path fail closed.
 3. **Benchmark CLI Verification**: Confirms [benchmark/benchmark_comparison.py](../benchmark/benchmark_comparison.py) honors `--validate-args`, `--dry-run`, `--json`, `--version`, and `--log-dir`.
    - *Positive Exemplar*: `Run pytest tests/test_agent_memory.py in hermetic temporary directories with ALLOW_NON_OPTANE=1.`
