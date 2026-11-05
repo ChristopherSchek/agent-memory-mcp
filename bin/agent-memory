@@ -3462,6 +3462,20 @@ def serve_mcp() -> None:
                     _send_rpc(format_rpc_error(None, -32700, f"Parse error: {e}"))
                     continue
 
+                if is_ro_media:
+                    try:
+                        if not (os.statvfs(target_check_dir).f_flag & os.ST_RDONLY):
+                            is_ro_media = False
+                            if conn_holder[0] is not None:
+                                with contextlib.suppress(sqlite3.Error):
+                                    conn_holder[0].close()
+                                conn_holder[0] = None
+                            _VALIDATED_DB_FILES.clear()
+                            _VALIDATED_DIRS.clear()
+                            _VALIDATED_STORAGE_GATES.clear()
+                    except OSError:
+                        pass
+
                 if isinstance(msg, dict):
                     current_has_id = "id" in msg
                     current_req_id = msg.get("id") if current_has_id else None
