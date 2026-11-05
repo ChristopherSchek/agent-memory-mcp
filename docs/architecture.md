@@ -71,7 +71,7 @@ Monitors JSON-RPC framing and Tri-Stream telemetry outputs during pre-flight ver
 
 Binds `agent-memory-mcp` to the `agent-baseline` catalog reference stub and benchmark harness so skill instructions and performance metrics stay synchronized, preventing deployment drift.
 
-1. **Baseline Catalog Integration**: Deployed to `~/.local/bin/agent-memory`, `~/.gemini/antigravity-cli/mcp/agent-memory/`, and `~/.gemini/config/skills/agent-memory/` via [install.sh](../install.sh) and linked from `agent-baseline` via `agent-memory/reference.md`.
+1. **Baseline Catalog Integration**: Deployed to `~/.local/bin/agent-memory`, `~/.gemini/antigravity-cli/mcp/agent-memory/`, and `~/.gemini/config/skills/agent-memory/` via [install.sh](../install.sh) (which also additively reconciles canonical `agent-memory` skill, CLI, and MCP tool permission grants into existing Antigravity and Claude runtime permission files) and linked from `agent-baseline` via `agent-memory/reference.md`.
 2. **Comparative Benchmark Suite**: [benchmark/benchmark_comparison.py](../benchmark/benchmark_comparison.py) benchmarks latency, recall accuracy, and token efficiency with full Tri-Stream `--log-dir` and `allow_abbrev=False` support.
 3. **Docs-as-Code Synchronization**: Tracks commit watermarks in `docs/.doc_state.json` and cross-links [README.md](../README.md), [LLM_ONBOARDING.md](../LLM_ONBOARDING.md), [skill/SKILL.md](../skill/SKILL.md), and [skill/references/agent-memory-mcp.md](../skill/references/agent-memory-mcp.md) in [INDEX.md](INDEX.md).
    - *Positive Exemplar*: `Run ./install.sh and advance docs/.doc_state.json whenever bin/agent-memory or skill/SKILL.md is updated.`
