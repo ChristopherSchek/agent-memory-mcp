@@ -1,6 +1,6 @@
 # agent-memory-mcp
 
-Provides a per-user SQLite semantic memory and knowledge graph store (CLI and stdio MCP server) backed by Intel Optane NVMe media by default (or standard storage via `--allow-non-optane`) so durable technical context persists across sessions, preventing flat `MEMORY.md` files from causing O(N) prompt token blowup and concurrent subagent write corruption.
+Provides a per-user SQLite semantic memory and knowledge graph store (CLI and stdio MCP server) backed by Intel Optane NVMe media by default (or standard storage via `--allow-non-optane`) so durable technical context persists across sessions, preventing flat `MEMORY.md` files from causing O(N) prompt token blowup and concurrent subagent write corruption. See [docs/INDEX.md](docs/INDEX.md) for the Docs-as-Code specification hub and [LLM_ONBOARDING.md](LLM_ONBOARDING.md) for autonomous agent deployment.
 
 ## 1. Quickstart & Benchmarks
 

@@ -104,7 +104,7 @@ PY
 }
 
 log_debug() {
-    if [ "${LOG_DIR_VALIDATED}" -eq 1 ] && [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" == /* ]] && [ -d "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}/debug.log" ]; then
+    if [ "${LOG_DIR_VALIDATED}" -eq 1 ] && [ -n "${LOG_DIR}" ] && [ "${LOG_DIR}" = "${VALIDATED_LOG_DIR:-}" ] && [[ "${LOG_DIR}" == /* ]] && [ -d "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}/debug.log" ]; then
         local safe_msg
         safe_msg="$(redact_line "$*")"
         printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${safe_msg}" >> "${LOG_DIR}/debug.log"
@@ -116,7 +116,7 @@ write_results_json() {
     local status="$1"
     local detail="$2"
     local exit_code="${3:-0}"
-    if [ "${LOG_DIR_VALIDATED}" -eq 1 ] && [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" == /* ]] && [ -d "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}" ] && command -v python3 >/dev/null 2>&1; then
+    if [ "${LOG_DIR_VALIDATED}" -eq 1 ] && [ -n "${LOG_DIR}" ] && [ "${LOG_DIR}" = "${VALIDATED_LOG_DIR:-}" ] && [[ "${LOG_DIR}" == /* ]] && [ -d "${LOG_DIR}" ] && [ ! -L "${LOG_DIR}" ] && command -v python3 >/dev/null 2>&1; then
         python3 -I - "${LOG_DIR}/results.json" "${status}" "${detail}" "${DB_PATH_RESOLVED:-}" "${DRY_RUN}" "${UNINSTALL}" "${exit_code}" "${VERSION}" "${START_EPOCH_MS}" "${BUNDLE_BIN}" <<'PY'
 """Writes the canonical Tri-Stream results.json envelope atomically with secret redaction, 64 KiB cap, fsync, and 0600 permissions so installer status is recorded deterministically, preventing partial or schema-invalid telemetry files."""
 import importlib.machinery, importlib.util, json, os, socket, stat, sys, tempfile, time
@@ -235,16 +235,13 @@ pre_init_log_dir() {
     local prev_is_db=0
     local arg
     for arg in "$@"; do
-        case "${arg}" in
-            -h|--help|-v|--version) return 0 ;;
-        esac
         if [ "${prev_is_log}" -eq 1 ]; then
             prev_is_log=0
             if [ -n "${arg}" ] && [[ "${arg}" != -* ]]; then
                 raw_log="${arg}"
                 continue
             fi
-            raw_log=""
+            return 0
         fi
         if [ "${prev_is_db}" -eq 1 ]; then
             prev_is_db=0
@@ -252,16 +249,23 @@ pre_init_log_dir() {
                 raw_db="${arg}"
                 continue
             fi
-            raw_db=""
         fi
         case "${arg}" in
+            -h|--help|-v|--version) return 0 ;;
             --log-dir) raw_log=""; prev_is_log=1 ;;
-            --log-dir=*) raw_log="${arg#--log-dir=}" ;;
+            --log-dir=*)
+                raw_log="${arg#--log-dir=}"
+                if [ -z "${raw_log}" ] || [[ "${raw_log}" == -* ]]; then return 0; fi
+                ;;
             --db) raw_db=""; prev_is_db=1 ;;
-            --db=*) raw_db="${arg#--db=}" ;;
+            --db=*)
+                raw_db="${arg#--db=}"
+                if [ -z "${raw_db}" ] || [[ "${raw_db}" == -* ]]; then raw_db=""; fi
+                ;;
+            *) ;;
         esac
     done
-    [ "${prev_is_log}" -eq 0 ] || raw_log=""
+    [ "${prev_is_log}" -eq 0 ] || return 0
     [ "${prev_is_db}" -eq 0 ] || raw_db=""
     [ -n "${raw_log}" ] || return 0
     raw_log="$(expand_tilde_path "${raw_log}")"
@@ -319,9 +323,7 @@ cur = abs_log
 while True:
     if os.path.lexists(cur):
         st_c = os.lstat(cur)
-        if stat.S_ISLNK(st_c.st_mode):
-            sys.exit(1)
-        if cur == abs_log and not stat.S_ISDIR(st_c.st_mode):
+        if stat.S_ISLNK(st_c.st_mode) or not stat.S_ISDIR(st_c.st_mode):
             sys.exit(1)
     parent = os.path.dirname(cur)
     if parent == cur:
@@ -360,10 +362,10 @@ while [ $# -gt 0 ]; do
         --allow-non-optane) ALLOW_NON_OPTANE_FLAG=1 ;;
         --allow-non-optane=1|--allow-non-optane=true|--allow-non-optane=yes|--allow-non-optane=on) ALLOW_NON_OPTANE_FLAG=1 ;;
         --require-optane|--no-allow-non-optane|--allow-non-optane=0|--allow-non-optane=false|--allow-non-optane=no|--allow-non-optane=off) ALLOW_NON_OPTANE_FLAG=0 ;;
-        --db) [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || arg_die "--db requires a non-empty path"; DB_OVERRIDE="$2"; shift ;;
-        --db=*) DB_OVERRIDE="${1#--db=}"; [ -n "${DB_OVERRIDE}" ] && [[ "${DB_OVERRIDE}" != -* ]] || arg_die "--db requires a non-empty path" ;;
-        --log-dir) [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || arg_die "--log-dir requires a non-empty directory path"; LOG_DIR="$2"; shift ;;
-        --log-dir=*) LOG_DIR="${1#--log-dir=}"; [ -n "${LOG_DIR}" ] && [[ "${LOG_DIR}" != -* ]] || arg_die "--log-dir requires a non-empty directory path" ;;
+        --db) if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then arg_die "--db requires a non-empty path"; fi; DB_OVERRIDE="$(expand_tilde_path "$2")"; shift ;;
+        --db=*) DB_OVERRIDE="${1#--db=}"; if [ -z "${DB_OVERRIDE}" ] || [[ "${DB_OVERRIDE}" == -* ]]; then arg_die "--db requires a non-empty path"; fi; DB_OVERRIDE="$(expand_tilde_path "${DB_OVERRIDE}")" ;;
+        --log-dir) if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then LOG_DIR=""; LOG_DIR_VALIDATED=0; arg_die "--log-dir requires a non-empty directory path"; fi; LOG_DIR="$(expand_tilde_path "$2")"; shift ;;
+        --log-dir=*) LOG_DIR="${1#--log-dir=}"; if [ -z "${LOG_DIR}" ] || [[ "${LOG_DIR}" == -* ]]; then LOG_DIR=""; LOG_DIR_VALIDATED=0; arg_die "--log-dir requires a non-empty directory path"; fi; LOG_DIR="$(expand_tilde_path "${LOG_DIR}")" ;;
         --dry-run) DRY_RUN=1 ;;
         --validate-args) VALIDATE_ARGS=1 ;;
         --json) JSON_OUT=1 ;;
@@ -412,6 +414,7 @@ DEFAULT_MCP_CONFIG="${HOME_DIR}/.gemini/config/mcp_config.json"
 BIN_DIR="$(expand_tilde_path "${AGENT_MEMORY_BIN_DIR:-${BIN_DIR:-${HOME_DIR}/.local/bin}}")"
 BIN="${BIN_DIR}/agent-memory"
 GEMINI_DIR="${HOME_DIR}/.gemini"
+HAS_CUSTOM_AG="${AGENT_MEMORY_MCP_DIR:-${MCP_DIR:-}}${AGENT_MEMORY_SKILL_DIR:-${SKILL_DIR:-}}${AGENT_MEMORY_MCP_CONFIG:-${MCP_CONFIG:-}}"
 MCP_DIR="$(expand_tilde_path "${AGENT_MEMORY_MCP_DIR:-${MCP_DIR:-${GEMINI_DIR}/antigravity-cli/mcp/agent-memory}}")"
 SKILL_DIR="$(expand_tilde_path "${AGENT_MEMORY_SKILL_DIR:-${SKILL_DIR:-${GEMINI_DIR}/config/skills/agent-memory}}")"
 MCP_CONFIG="$(expand_tilde_path "${AGENT_MEMORY_MCP_CONFIG:-${MCP_CONFIG:-${DEFAULT_MCP_CONFIG}}}")"
@@ -424,7 +427,7 @@ PY="$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.executable))')"
 [ -x "${PY}" ] || die "could not resolve the python3 interpreter path."
 
 validate_install_paths() {
-    "${PY}" -I - "${BUNDLE_BIN}" "${LOG_DIR}" "${BIN_DIR}" "${MCP_DIR}" "${SKILL_DIR}" "${MCP_CONFIG}" "${DB_OVERRIDE}" "${DEFAULT_MCP_CONFIG}" <<'PY'
+    CLIENT_CONFIG="${CLIENT_CONFIG}" UNINSTALL="${UNINSTALL}" "${PY}" -I - "${BUNDLE_BIN}" "${LOG_DIR}" "${BIN_DIR}" "${MCP_DIR}" "${SKILL_DIR}" "${MCP_CONFIG}" "${DB_OVERRIDE}" "${DEFAULT_MCP_CONFIG}" <<'PY'
 """Validates installer target paths against relative paths, unsafe top-level directories, symlinks, and host perimeter quarantine rules so installation cannot clobber sensitive stores, preventing path traversal or perimeter breaches."""
 import importlib.machinery, importlib.util, os, stat, sys
 bundle_bin, log_dir, bin_dir, mcp_dir, skill_dir, mcp_cfg, db_over, def_mcp_cfg = sys.argv[1:9]
@@ -471,6 +474,12 @@ for label, val in (
             sys.exit(f"Refusing unexpanded template placeholder for {label}: '{val}'.")
         if val.endswith("/") or os.path.isdir(abs_v):
             sys.exit(f"{label} must be a database file path, not a directory: '{val}'.")
+    client_cfg_on = os.environ.get("CLIENT_CONFIG", "1") != "0"
+    uninstall_on = os.environ.get("UNINSTALL", "0") == "1"
+    if label == "MCP_CONFIG" and not client_cfg_on:
+        continue
+    if label in ("MCP_DIR", "SKILL_DIR") and not client_cfg_on and not uninstall_on:
+        continue
     if label == "MCP_CONFIG":
         if os.path.lexists(abs_v):
             st_m = os.lstat(abs_v)
@@ -478,23 +487,24 @@ for label, val in (
                 sys.exit(f"Refusing symlink, hardlink, or non-regular file for {label}: '{val}'.")
         cur_p = os.path.dirname(abs_v)
         while True:
-            if os.path.lexists(cur_p) and stat.S_ISLNK(os.lstat(cur_p).st_mode):
-                sys.exit(f"Refusing symlinked parent directory for {label}: '{cur_p}'.")
+            if os.path.lexists(cur_p):
+                st_p = os.lstat(cur_p)
+                if stat.S_ISLNK(st_p.st_mode) or not stat.S_ISDIR(st_p.st_mode):
+                    sys.exit(f"Refusing symlinked or non-directory parent for {label}: '{cur_p}'.")
             par_p = os.path.dirname(cur_p)
             if par_p == cur_p:
                 break
             cur_p = par_p
-        if abs_v == os.path.abspath(def_mcp_cfg):
+        auth_def_mcp = os.path.join(mod.AUTH_HOME, ".gemini", "config", os.path.basename(def_mcp_cfg))
+        if abs_v == os.path.abspath(auth_def_mcp):
             continue
     if label in ("BIN_DIR", "MCP_DIR", "SKILL_DIR"):
         cur_d = abs_v
         while True:
             if os.path.lexists(cur_d):
                 st_d = os.lstat(cur_d)
-                if stat.S_ISLNK(st_d.st_mode):
-                    sys.exit(f"Refusing symlinked directory component for {label}: '{cur_d}'.")
-                if cur_d == abs_v and not stat.S_ISDIR(st_d.st_mode):
-                    sys.exit(f"Refusing non-directory target for {label}: '{abs_v}'.")
+                if stat.S_ISLNK(st_d.st_mode) or not stat.S_ISDIR(st_d.st_mode):
+                    sys.exit(f"Refusing symlinked or non-directory component for {label}: '{cur_d}'.")
             par_d = os.path.dirname(cur_d)
             if par_d == cur_d:
                 break
@@ -510,6 +520,8 @@ for dir_lbl, dir_val, leaves in (
 ):
     if not dir_val:
         continue
+    if dir_lbl in ("SKILL_DIR", "MCP_DIR") and os.environ.get("CLIENT_CONFIG", "1") == "0" and os.environ.get("UNINSTALL", "0") != "1":
+        continue
     abs_d = os.path.abspath(dir_val)
     for lf in leaves:
         lp = os.path.join(abs_d, lf)
@@ -517,12 +529,31 @@ for dir_lbl, dir_val, leaves in (
             st_lf = os.lstat(lp)
             if stat.S_ISLNK(st_lf.st_mode):
                 sys.exit(f"Refusing symlinked target in {dir_lbl}: '{lp}'.")
-            if lf != "references" and (not stat.S_ISREG(st_lf.st_mode) or st_lf.st_nlink != 1):
+            if lf == "references":
+                if not stat.S_ISDIR(st_lf.st_mode):
+                    sys.exit(f"Refusing non-directory references target in {dir_lbl}: '{lp}'.")
+            elif not stat.S_ISREG(st_lf.st_mode) or st_lf.st_nlink != 1:
                 sys.exit(f"Refusing non-regular or hardlinked target in {dir_lbl}: '{lp}'.")
+_cc_on = os.environ.get("CLIENT_CONFIG", "1") != "0"
+_un_on = os.environ.get("UNINSTALL", "0") == "1"
+_active_targets = [("BIN_DIR", bin_dir)]
+if _cc_on or _un_on:
+    _active_targets.extend([("MCP_DIR", mcp_dir), ("SKILL_DIR", skill_dir)])
+if _cc_on:
+    _active_targets.append(("MCP_CONFIG", mcp_cfg))
+if db_over:
+    abs_dbo = os.path.abspath(db_over)
+    real_dbo = os.path.realpath(abs_dbo)
+    for t_lbl, t_val in _active_targets:
+        if t_val:
+            at = os.path.abspath(t_val)
+            rt = os.path.realpath(at)
+            if abs_dbo in (at, rt) or real_dbo in (at, rt) or abs_dbo.startswith(at.rstrip("/") + "/") or at.startswith(abs_dbo.rstrip("/") + "/"):
+                sys.exit(f"Refusing DB_OVERRIDE colliding with {t_lbl}: '{db_over}'.")
 if log_dir:
     abs_log = os.path.abspath(log_dir)
     real_log = os.path.realpath(abs_log)
-    for target_lbl, target_val in (("BIN_DIR", bin_dir), ("MCP_DIR", mcp_dir), ("SKILL_DIR", skill_dir), ("MCP_CONFIG", mcp_cfg)):
+    for target_lbl, target_val in _active_targets:
         if target_val:
             at = os.path.abspath(target_val)
             rt = os.path.realpath(at)
@@ -548,10 +579,8 @@ if log_dir:
     while True:
         if os.path.lexists(cur):
             st_c = os.lstat(cur)
-            if stat.S_ISLNK(st_c.st_mode):
-                sys.exit(f"Refusing symlinked LOG_DIR component: '{cur}'.")
-            if cur == abs_log and not stat.S_ISDIR(st_c.st_mode):
-                sys.exit(f"LOG_DIR exists and is not a directory: '{abs_log}'.")
+            if stat.S_ISLNK(st_c.st_mode) or not stat.S_ISDIR(st_c.st_mode):
+                sys.exit(f"Refusing symlinked or non-directory LOG_DIR component: '{cur}'.")
         parent = os.path.dirname(cur)
         if parent == cur:
             break
@@ -581,6 +610,7 @@ if [ -n "${LOG_DIR}" ] && [ "${LOG_DIR_VALIDATED}" -eq 0 ]; then
     [ -f "${LOG_DIR}/debug.log" ] || : > "${LOG_DIR}/debug.log"
     chmod 600 "${LOG_DIR}/debug.log"
     LOG_DIR_VALIDATED=1
+    VALIDATED_LOG_DIR="${LOG_DIR}"
 fi
 
 if [ "${VALIDATE_ARGS}" -eq 1 ]; then
@@ -637,8 +667,6 @@ if orig_existed:
             sys.exit(f"Error: {path} is owned by uid {st_existing.st_uid}, not current user ({euid}).")
         if (st_existing.st_mode & 0o022) != 0:
             sys.exit(f"Error: {path} is group/world-writable (mode {oct(st_existing.st_mode & 0o777)}).")
-        if (st_existing.st_mode & 0o077) == 0:
-            orig_mode = st_existing.st_mode & 0o777
         with open(path, encoding="utf-8") as f:
             text = f.read()
         data = json.loads(text) if text.strip() else {}
@@ -747,8 +775,13 @@ cl_cmds = [
     f"python3 {bin_path}",
     f"/usr/bin/python3 {bin_path}",
 ]
+py_exe = os.path.abspath(sys.executable)
+if py_exe not in ("python3", "/usr/bin/python3"):
+    ag_grants.append(f"command({py_exe} {bin_path})")
+    cl_cmds.append(f"{py_exe} {bin_path}")
 cl_reads = [skill_dir, mcp_dir]
-if os.path.isdir(repo_dir):
+is_remove = os.environ.get("UNINSTALL_PERMS") == "1"
+if os.path.isdir(repo_dir) and not repo_dir.startswith(("/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/")):
     r_bin = os.path.join(repo_dir, "bin", "agent-memory")
     r_inst = os.path.join(repo_dir, "install.sh")
     ag_grants.extend([
@@ -760,6 +793,9 @@ if os.path.isdir(repo_dir):
         f"command(/bin/bash {r_inst})",
     ])
     cl_cmds.extend([r_bin, f"python3 {r_bin}", f"/usr/bin/python3 {r_bin}", r_inst, f"/bin/bash {r_inst}"])
+    if py_exe not in ("python3", "/usr/bin/python3"):
+        ag_grants.append(f"command({py_exe} {r_bin})")
+        cl_cmds.append(f"{py_exe} {r_bin}")
     cl_reads.append(repo_dir)
 cl_tools = [
     "mcp__agent-memory__memory_search",
@@ -773,6 +809,14 @@ def _update_json(cfg_path, updater):
     if not os.path.lexists(cfg_path):
         return
     try:
+        cur_p = os.path.dirname(os.path.abspath(cfg_path))
+        while True:
+            if os.path.lexists(cur_p) and stat.S_ISLNK(os.lstat(cur_p).st_mode):
+                return
+            par_p = os.path.dirname(cur_p)
+            if par_p == cur_p:
+                break
+            cur_p = par_p
         st_c = os.lstat(cfg_path)
         if stat.S_ISLNK(st_c.st_mode) or not stat.S_ISREG(st_c.st_mode) or st_c.st_nlink != 1 or st_c.st_uid != euid or (st_c.st_mode & 0o022) != 0:
             return
@@ -798,7 +842,7 @@ def _update_json(cfg_path, updater):
     except Exception:
         return
 def _upd_ag(d):
-    """Appends missing Antigravity permission grants into userSettings.globalPermissionGrants.allow and returns True when modified so runtime grants stay synchronized, preventing duplicate entries."""
+    """Appends or removes Antigravity permission grants in userSettings.globalPermissionGrants.allow and returns True when modified so runtime grants stay synchronized, preventing duplicate or stale entries."""
     us = d.setdefault("userSettings", {})
     if not isinstance(us, dict):
         return False
@@ -810,12 +854,16 @@ def _upd_ag(d):
         return False
     changed = False
     for g in ag_grants:
-        if g not in allow:
+        if is_remove:
+            while g in allow:
+                allow.remove(g)
+                changed = True
+        elif g not in allow:
             allow.append(g)
             changed = True
     return changed
 def _upd_cl(d):
-    """Appends missing Claude permission grants into permissions.commands.allow, permissions.filesystem.allowRead, and permissions.tools.allow and returns True when modified so runtime grants stay synchronized, preventing duplicate entries."""
+    """Appends or removes Claude permission grants in permissions.commands.allow, permissions.filesystem.allowRead, and permissions.tools.allow and returns True when modified so runtime grants stay synchronized, preventing duplicate or stale entries."""
     p = d.setdefault("permissions", {})
     if not isinstance(p, dict):
         return False
@@ -826,12 +874,18 @@ def _upd_cl(d):
             lst = sub_d.setdefault(leaf_k, [])
             if isinstance(lst, list):
                 for it in items:
-                    if it not in lst:
+                    if is_remove:
+                        while it in lst:
+                            lst.remove(it)
+                            changed = True
+                    elif it not in lst:
                         lst.append(it)
                         changed = True
     return changed
-_update_json(ag_cfg, _upd_ag)
-if skill_dir.startswith(os.path.join(home_dir, ".gemini")):
+if os.path.basename(os.path.dirname(skill_dir)) == "skills":
+    _update_json(ag_cfg, _upd_ag)
+gem_prefix = os.path.join(home_dir, ".gemini").rstrip("/") + "/"
+if skill_dir.startswith(gem_prefix):
     _update_json(cl_cfg, _upd_cl)
 PY
 }
@@ -859,8 +913,9 @@ if [ "${UNINSTALL}" -eq 1 ]; then
     if [ "${DRY_RUN}" -eq 0 ]; then
         rm -f "${SKILL_DIR}/SKILL.md" "${SKILL_DIR}/references/agent-memory-mcp.md"
         rmdir "${SKILL_DIR}/references" "${SKILL_DIR}" 2>/dev/null || true
-        rm -f "${MCP_DIR}/instructions.md" "${MCP_DIR}"/memory_*.json; rmdir "${MCP_DIR}" 2>/dev/null || true
+        rm -f "${MCP_DIR}/instructions.md" "${MCP_DIR}/memory_record.json" "${MCP_DIR}/memory_search.json" "${MCP_DIR}/memory_recall.json" "${MCP_DIR}/memory_relate.json" "${MCP_DIR}/memory_forget.json"; rmdir "${MCP_DIR}" 2>/dev/null || true
         rm -f "${BIN}"
+        [ "${CLIENT_CONFIG}" -eq 1 ] && UNINSTALL_PERMS=1 reconcile_client_permissions
         say "Removed ${BIN}, skill and MCP instructions."
     else
         say "[dry-run] Would remove ${BIN}, ${SKILL_DIR}, and ${MCP_DIR}."
@@ -917,7 +972,13 @@ if [ -n "${DB_OVERRIDE}" ]; then
         /*) ;;
         *) die "--db must be an absolute path (got '${DB_OVERRIDE}')." ;;
     esac
-    VALIDATE_DB_ERR="$(validate_install_paths 2>&1)" || die "${VALIDATE_DB_ERR}"
+    if ! VALIDATE_DB_ERR="$(validate_install_paths 2>&1)"; then
+        if [ "${LOG_DIR_VALIDATED}" -ne 1 ] || [ "${LOG_DIR}" != "${VALIDATED_LOG_DIR:-}" ] || [[ "${VALIDATE_DB_ERR}" == *LOG_DIR* ]]; then
+            LOG_DIR=""
+            LOG_DIR_VALIDATED=0
+        fi
+        die "${VALIDATE_DB_ERR}"
+    fi
 fi
 ENV_BASE=(env -u AGENT_MEMORY_DB -u OPTANE_BASE -u ALLOW_NON_OPTANE "AGENT_MEMORY_NO_CFG_FALLBACK=1" "ALLOW_NON_OPTANE=${ALLOW_NON_OPTANE_FLAG}")
 PRE_ENV=("${ENV_BASE[@]}")
@@ -974,7 +1035,7 @@ say "Preflight passed (database: ${DB_PATH_RESOLVED})"
 RUN_ENV=("${ENV_BASE[@]}" "AGENT_MEMORY_DB=${DB_PATH_RESOLVED}")
 
 DO_ANTIGRAVITY=0
-if [ "${CLIENT_CONFIG}" -eq 1 ] && { [ -d "${GEMINI_DIR}" ] || [ -e "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ] || [ -n "${AGENT_MEMORY_MCP_DIR:-}" ] || [ -n "${AGENT_MEMORY_SKILL_DIR:-}" ] || [ -n "${AGENT_MEMORY_MCP_CONFIG:-}" ] || command -v agy >/dev/null 2>&1; }; then
+if [ "${CLIENT_CONFIG}" -eq 1 ] && { [ -d "${GEMINI_DIR}" ] || [ -e "${MCP_CONFIG}" ] || [ -L "${MCP_CONFIG}" ] || [ -n "${HAS_CUSTOM_AG:-}" ] || command -v agy >/dev/null 2>&1; }; then
     DO_ANTIGRAVITY=1
     MCP_CHK_ERR="$(mcp_config_edit check "${MCP_CONFIG}" 2>&1)" || die "${MCP_CHK_ERR}"
 fi
@@ -997,7 +1058,8 @@ POST_DOCTOR_OUT="$("${RUN_ENV[@]}" "${PY}" -I "${BUNDLE_BIN}" doctor 2>&1)" || {
 
 SELFTEST_OUT="$("${RUN_ENV[@]}" "${PY}" -I - "${PY}" "${BUNDLE_BIN}" "${DB_PATH_RESOLVED}" 2>&1 <<'PY'
 """Executes an isolated CLI and MCP stdio self-test against a temporary sibling database file so end-to-end record, search, forget, and JSON-RPC operations are verified before binary installation, preventing live production database mutation during installer self-tests."""
-import json, os, subprocess, sys, uuid
+import json, os, signal, subprocess, sys, uuid
+signal.signal(signal.SIGTERM, lambda *_a: sys.exit(143))
 py_exe, bin_path, live_db = sys.argv[1:4]
 probe_db = os.path.join(os.path.dirname(live_db), f".selftest_{os.getpid()}_{uuid.uuid4().hex[:8]}.db")
 cmd = [py_exe, "-I", bin_path]
@@ -1046,13 +1108,14 @@ say "${SELFTEST_OUT}"
 
 if [ ! -d "${BIN_DIR}" ]; then
     mkdir -p "${BIN_DIR}"
-    chmod 755 "${BIN_DIR}" 2>/dev/null || true
+    chmod 700 "${BIN_DIR}" 2>/dev/null || true
 fi
 [ ! -L "${BIN_DIR}" ] || die "Refusing symlinked BIN_DIR: ${BIN_DIR}"
 [ ! -L "${BIN}" ] || die "Refusing symlinked destination binary: ${BIN}"
+[ ! -d "${BIN}" ] || die "Refusing directory at destination binary path: ${BIN}"
 TMP_BIN="$(mktemp "${BIN_DIR}/.agent-memory.XXXXXX")"
 cp "${BUNDLE_BIN}" "${TMP_BIN}"
-chmod 755 "${TMP_BIN}"
+chmod 700 "${TMP_BIN}"
 mv -f "${TMP_BIN}" "${BIN}"
 TMP_BIN=""
 "${RUN_ENV[@]}" "${PY}" -I "${BIN}" --version >/dev/null || die "installed binary does not run: ${BIN}"

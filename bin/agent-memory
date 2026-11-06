@@ -1569,11 +1569,19 @@ def sanitize_fts_query(raw_query: str) -> str:
             had_wildcard = curr_token.endswith("*")
 
             col_match = None
+            bare_col = False
             if ":" in curr_token:
                 for col in _VALID_FTS_COLS:
+                    if curr_token.lower() == col + ":":
+                        bare_col = True
+                        break
                     if curr_token.lower().startswith(col + ":") and len(curr_token) > len(col) + 1:
                         col_match = col
                         break
+            if bare_col:
+                if classified and classified[-1] == _TOK_NOT:
+                    classified.pop()
+                continue
             if col_match:
                 val_part = curr_token[len(col_match) + 1:]
                 if col_match == "entity_name":
@@ -2284,6 +2292,10 @@ def _extract_inline_category(query: str) -> tuple[str, str | None, str | None]:
     if "category:" not in query.lower():
         return query, None, None
     quoted = [m.span() for m in re.finditer(r'"(?:""|[^"])*"', query)]
+    for bad_m in re.finditer(r'(?i)(?:(?<=[\s(])|^)(?:NOT\s+|[-+]?)category:\s*(?:\(|$|\s)', query):
+        if not any(a <= bad_m.start() < b for a, b in quoted):
+            if not any(a <= bad_m.start() < b for a, b in [m.span() for m in _INLINE_CATEGORY_RE.finditer(query)]):
+                return query, None, "Inline category: filter requires a non-empty value and cannot wrap parentheses."
     matches = [m for m in _INLINE_CATEGORY_RE.finditer(query)
                if not any(a < m.start() < b for a, b in quoted)]
     if not matches:
@@ -2303,7 +2315,8 @@ def _extract_inline_category(query: str) -> tuple[str, str | None, str | None]:
             paren_depth += 1
         elif ch == ")" and paren_depth > 0:
             paren_depth -= 1
-    if paren_depth > 0 or _OR_LEFT_RE.search(prefix) or _OR_RIGHT_RE.search(suffix):
+    has_top_or = bool(re.search(r'(?:^|\s)OR(?:\s|$)', re.sub(r'\([^()]*\)|"(?:""|[^"])*"', ' ', prefix + " " + suffix)))
+    if paren_depth > 0 or has_top_or or _OR_LEFT_RE.search(prefix) or _OR_RIGHT_RE.search(suffix):
         return query, None, "Inline category: filter cannot be nested inside parentheses or combined with OR. Pass the category parameter instead."
     prefix = _AND_LEFT_RE.sub(" ", prefix)
     if not prefix.strip():
@@ -3111,6 +3124,8 @@ def process_single_rpc(msg: dict[str, Any], mcp_conn: sqlite3.Connection | None,
                 _VALIDATED_DB_FILES.clear()
                 _VALIDATED_DIRS.clear()
                 _VALIDATED_STORAGE_GATES.clear()
+                _STATVFS_CACHE.clear()
+                _MOUNT_CACHE.clear()
                 if conn_holder is not None:
                     conn_holder[0] = None
 
@@ -3473,6 +3488,8 @@ def serve_mcp() -> None:
                             _VALIDATED_DB_FILES.clear()
                             _VALIDATED_DIRS.clear()
                             _VALIDATED_STORAGE_GATES.clear()
+                            _STATVFS_CACHE.clear()
+                            _MOUNT_CACHE.clear()
                     except OSError:
                         pass
 
