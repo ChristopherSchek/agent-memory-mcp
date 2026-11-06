@@ -784,7 +784,8 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         am.DB_PATH = legacy_db
         am._RAW_DB_PATH = legacy_db
         am._VALIDATED_DB_FILES.clear()
-        am.init_db()
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            am.init_db()
         recalled = am.recall_entity("legacy-node")
         self.assertEqual(recalled["name"], "legacy-node")
         self.assertEqual(len(recalled["observations"]), 1)
@@ -801,6 +802,19 @@ class TestAgentMemoryHermetic(unittest.TestCase):
     def test_plain_writing_and_tri_stream_contracts(self) -> None:
         """Verifies AST 3-part docstrings, 7-bit ASCII compliance, MCP schema 3-part descriptions, and Tri-Stream CLI telemetry across benchmark_comparison.py and install.sh so repository-wide governance gates hold, preventing documentation or telemetry regressions."""
         repo_root = Path(__file__).resolve().parent.parent
+        ascii_only_targets = [
+            repo_root / "install.sh",
+            repo_root / "skill" / "SKILL.md",
+            repo_root / "skill" / "references" / "agent-memory-mcp.md",
+        ]
+        for asc_path in ascii_only_targets:
+            asc_src = asc_path.read_text(encoding="utf-8")
+            for idx, ch in enumerate(asc_src):
+                code = ord(ch)
+                self.assertTrue(
+                    code in (9, 10) or (32 <= code <= 126),
+                    f"Non-ASCII or disallowed byte {code} in {asc_path} at offset {idx}",
+                )
         py_targets = [
             repo_root / "bin" / "agent-memory",
             repo_root / "benchmark" / "benchmark_comparison.py",
@@ -883,12 +897,24 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         inst_log_dir = os.path.join(self.tmp_root, "install_logs")
         inst_err_dir = os.path.join(self.tmp_root, "install_err_logs")
         inst_path_err_dir = os.path.join(self.tmp_root, "install_path_err_logs")
+        fake_home = os.path.join(self.tmp_root, "home")
+        ag_cfg_dir = os.path.join(fake_home, ".gemini", "config")
+        cl_cfg_dir = os.path.join(fake_home, ".claude")
+        os.makedirs(ag_cfg_dir, mode=0o700, exist_ok=True)
+        os.makedirs(cl_cfg_dir, mode=0o700, exist_ok=True)
+        ag_cfg_file = os.path.join(ag_cfg_dir, "config.json")
+        cl_cfg_file = os.path.join(cl_cfg_dir, "settings.json")
+        Path(ag_cfg_file).write_text('{}\n', encoding="utf-8")
+        os.chmod(ag_cfg_file, 0o600)
+        Path(cl_cfg_file).write_text('{}\n', encoding="utf-8")
+        os.chmod(cl_cfg_file, 0o600)
         spawn_env = dict(
             os.environ,
+            HOME=fake_home,
             AGENT_MEMORY_BIN_DIR=os.path.join(self.tmp_root, "bin"),
-            AGENT_MEMORY_MCP_DIR=os.path.join(self.tmp_root, "mcp"),
-            AGENT_MEMORY_SKILL_DIR=os.path.join(self.tmp_root, "skill"),
-            AGENT_MEMORY_MCP_CONFIG=os.path.join(self.tmp_root, "mcp_config.json"),
+            AGENT_MEMORY_MCP_DIR=os.path.join(fake_home, ".gemini", "antigravity-cli", "mcp", "agent-memory"),
+            AGENT_MEMORY_SKILL_DIR=os.path.join(ag_cfg_dir, "skills", "agent-memory"),
+            AGENT_MEMORY_MCP_CONFIG=os.path.join(ag_cfg_dir, "mcp_config.json"),
         )
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
         try:
@@ -955,6 +981,43 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         path_err_res = json.loads(Path(inst_path_err_dir, "results.json").read_text(encoding="utf-8"))
         self.assertEqual(path_err_res["status"], "error")
         self.assertEqual(path_err_res["exit_code"], 2)
+
+        full_log_dir = os.path.join(self.tmp_root, "install_full_logs")
+        uninst_log_dir = os.path.join(self.tmp_root, "uninstall_logs")
+        devnull_fd2 = os.open(os.devnull, os.O_WRONLY)
+        try:
+            fa2 = [(os.POSIX_SPAWN_DUP2, devnull_fd2, 1), (os.POSIX_SPAWN_DUP2, devnull_fd2, 2)]
+            pid_full = os.posix_spawnp(
+                "bash",
+                ["bash", install_script, "--allow-non-optane", "--db", self.db_path, "--log-dir", full_log_dir],
+                spawn_env,
+                file_actions=fa2,
+            )
+            _, full_status = os.waitpid(pid_full, 0)
+            self.assertEqual(os.waitstatus_to_exitcode(full_status), 0)
+            installed_bin = Path(self.tmp_root, "bin", "agent-memory")
+            self.assertTrue(installed_bin.is_file())
+            self.assertEqual(installed_bin.stat().st_mode & 0o777, 0o700)
+            self.assertTrue(Path(ag_cfg_dir, "skills", "agent-memory", "SKILL.md").is_file())
+            ag_after_inst = json.loads(Path(ag_cfg_file).read_text(encoding="utf-8"))
+            self.assertIn("command(agent-memory)", ag_after_inst["userSettings"]["globalPermissionGrants"]["allow"])
+            cl_after_inst = json.loads(Path(cl_cfg_file).read_text(encoding="utf-8"))
+            self.assertIn("agent-memory", cl_after_inst["permissions"]["commands"]["allow"])
+            pid_uninst = os.posix_spawnp(
+                "bash",
+                ["bash", install_script, "--uninstall", "--log-dir", uninst_log_dir],
+                spawn_env,
+                file_actions=fa2,
+            )
+            _, uninst_status = os.waitpid(pid_uninst, 0)
+            self.assertEqual(os.waitstatus_to_exitcode(uninst_status), 0)
+            self.assertFalse(installed_bin.exists())
+            ag_after_uninst = json.loads(Path(ag_cfg_file).read_text(encoding="utf-8"))
+            self.assertEqual(ag_after_uninst["userSettings"]["globalPermissionGrants"]["allow"], [])
+            cl_after_uninst = json.loads(Path(cl_cfg_file).read_text(encoding="utf-8"))
+            self.assertEqual(cl_after_uninst["permissions"]["commands"]["allow"], [])
+        finally:
+            os.close(devnull_fd2)
 
         self.assertEqual(
             self.am._normalize_cli_argv(["agent-memory", "record", "-e", "-my-entity", "--", "-leading-content"]),

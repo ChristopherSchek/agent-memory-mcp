@@ -85,7 +85,7 @@ Cross-references supplementary repository documentation discovered during conver
 
 1. **Discovered External Documentation**:
    - [agent-memory-mcp Repository Guide](../README.md) (189 lines)
-   - [agent-memory: Autonomous Agent Deployment & Operation Runbook](../LLM_ONBOARDING.md) (343 lines)
+   - [agent-memory: Autonomous Agent Deployment & Operation Runbook](../LLM_ONBOARDING.md) (347 lines)
    - [Agent Memory MCP Instructions](../mcp/instructions.md) (24 lines)
    - [Skill: agent-memory (Persistent Semantic Memory & Knowledge Graph)](../skill/SKILL.md) (230 lines)
    - [Reference Specification: agent-memory-mcp](../skill/references/agent-memory-mcp.md) (113 lines)

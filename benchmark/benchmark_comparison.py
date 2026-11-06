@@ -442,7 +442,7 @@ def _pre_extract_log_dir(argv: list[str]) -> str:
         if arg in ("-h", "--help", "-v", "--version"):
             return ""
         if arg in ("-n", "--count"):
-            if i + 1 < len(argv):
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
                 i += 2
                 continue
         elif arg == "--log-dir":
@@ -820,7 +820,7 @@ def main() -> None:
                     has_optane = False
             flash_base_dir = tempfile.gettempdir()
             if os.path.realpath(flash_base_dir).startswith("/mnt/optane") or os.path.abspath(flash_base_dir).startswith("/mnt/optane"):
-                for alt_dir in ("/dev/shm", os.path.join(home_dir, ".cache"), home_dir):
+                for alt_dir in (os.path.join(home_dir, ".cache"), home_dir):
                     if (
                         os.path.isdir(alt_dir)
                         and os.access(alt_dir, os.W_OK | os.X_OK)
