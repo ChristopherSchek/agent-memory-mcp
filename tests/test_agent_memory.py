@@ -24,6 +24,19 @@ _ENV_KEYS = (
     "OPTANE_BASE",
     "AGENT_MEMORY_SYNC",
     "XDG_DATA_HOME",
+    "HOME",
+    "AGENT_MEMORY_BIN_DIR",
+    "BIN_DIR",
+    "AGENT_MEMORY_MCP_DIR",
+    "MCP_DIR",
+    "AGENT_MEMORY_SKILL_DIR",
+    "SKILL_DIR",
+    "AGENT_MEMORY_MCP_CONFIG",
+    "MCP_CONFIG",
+    "CLIENT_CONFIG",
+    "UNINSTALL",
+    "LOG_DIR",
+    "DB_OVERRIDE",
 )
 
 
@@ -33,6 +46,8 @@ def _load_agent_memory_module(db_path: str) -> Any:
     os.environ["ALLOW_NON_OPTANE"] = "1"
     os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
     os.environ.pop("OPTANE_BASE", None)
+    os.environ.pop("AGENT_MEMORY_SYNC", None)
+    os.environ.pop("XDG_DATA_HOME", None)
     script_path = Path(__file__).resolve().parent.parent / "bin" / "agent-memory"
     loader = importlib.machinery.SourceFileLoader("agent_memory_bin", str(script_path))
     spec = importlib.util.spec_from_loader("agent_memory_bin", loader)
@@ -54,13 +69,33 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             else:
                 os.environ[k] = val
 
+    def _restore_signals(self) -> None:
+        """Restores snapshotted process signal handlers after each test so signal dispositions remain clean, preventing leaked handlers across test cases."""
+        for sig, handler in self._saved_signals.items():
+            signal.signal(sig, handler)
+
     def setUp(self) -> None:
-        """Snapshots environment variables, creates an isolated temporary directory, and initializes a fresh agent-memory database before each test so test runs start from a clean state, preventing cross-test state contamination."""
+        """Snapshots environment variables, process umask, and signal handlers while initializing an isolated HOME and agent-memory database before each test so test runs start from a clean state, preventing cross-test state contamination."""
         self._saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
         self.addCleanup(self._restore_env)
+        for scrub_key in _ENV_KEYS:
+            if scrub_key != "HOME":
+                os.environ.pop(scrub_key, None)
+        self._saved_umask = os.umask(0o022)
+        self.addCleanup(os.umask, self._saved_umask)
+        self._saved_signals: dict[Any, Any] = {
+            signal.SIGINT: signal.getsignal(signal.SIGINT),
+            signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        }
+        if hasattr(signal, "SIGPIPE"):
+            self._saved_signals[signal.SIGPIPE] = signal.getsignal(signal.SIGPIPE)
+        self.addCleanup(self._restore_signals)
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         self.tmp_root = os.path.realpath(self.tmpdir.name)
+        self.isolated_home = os.path.join(self.tmp_root, "isolated_home")
+        os.makedirs(self.isolated_home, mode=0o700, exist_ok=True)
+        os.environ["HOME"] = self.isolated_home
         self.db_path = os.path.join(self.tmp_root, "memory.db")
         self.am = _load_agent_memory_module(self.db_path)
         self.am.init_db(force=True)
@@ -415,7 +450,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
 
     def test_orphan_sidecar_and_empty_ro_guards(self) -> None:
         """Verifies that get_connection rejects pre-existing orphan sidecars when creating a new DB and refuses to initialize 0-byte empty databases on read-only opens so database open invariants hold, preventing sidecar adoption or read-only disk mutation."""
-        orphan_db = os.path.join(self.tmpdir.name, "orphan.db")
+        orphan_db = os.path.join(self.tmp_root, "orphan.db")
         with open(orphan_db + "-wal", "wb") as f:
             f.write(b"stale wal")
         self.am.DB_PATH = orphan_db
@@ -424,7 +459,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             self.am.get_connection()
         self.assertIn("sidecar", str(cm.exception))
 
-        empty_db = os.path.join(self.tmpdir.name, "empty.db")
+        empty_db = os.path.join(self.tmp_root, "empty.db")
         with open(empty_db, "wb"):
             pass
         os.chmod(empty_db, 0o600)
@@ -517,7 +552,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             self.am._check_not_guarded_path(os.path.expanduser("~"), "DB_PATH")
         with self.assertRaises(RuntimeError):
             self.am._check_not_guarded_path(
-                os.path.join(self.tmpdir.name, ".git", "memory.db"), "DB_PATH"
+                os.path.join(self.tmp_root, ".git", "memory.db"), "DB_PATH"
             )
 
         self.assertFalse(
@@ -526,12 +561,15 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertFalse(
             self.am._fast_cli_dispatch(["agent-memory", "record", "first", "--", "second"])
         )
+        with mock.patch.object(sys, "stdout", io.StringIO()), self.assertRaises(SystemExit) as cm_empty_type:
+            self.am._fast_cli_dispatch(["agent-memory", "record", "--type=", "-e", "ent1", "fact"])
+        self.assertEqual(cm_empty_type.exception.code, 1)
         norm_forget = self.am._normalize_cli_argv(
             ["agent-memory", "forget", "extra", "-o", "obs-1"]
         )
         self.assertEqual(norm_forget[:3], ["agent-memory", "forget", "-o"])
 
-        zero_orphan = os.path.join(self.tmpdir.name, "zero_orphan.db")
+        zero_orphan = os.path.join(self.tmp_root, "zero_orphan.db")
         with open(zero_orphan, "wb"):
             pass
         os.chmod(zero_orphan, 0o600)
@@ -555,8 +593,8 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(cm_doc_miss.exception.code, 1)
         self.assertIn("orphaned sidecar", json.loads(doc_buf_missing.getvalue())["permissions"])
 
-        sym_target = os.path.join(self.tmpdir.name, "sym_subdir", "real.db")
-        sym_link = os.path.join(self.tmpdir.name, "link.db")
+        sym_target = os.path.join(self.tmp_root, "sym_subdir", "real.db")
+        sym_link = os.path.join(self.tmp_root, "link.db")
         os.symlink(sym_target, sym_link)
         self.am._RAW_DB_PATH = sym_link
         self.am.DB_PATH = os.path.realpath(sym_link)
@@ -566,14 +604,18 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertTrue(os.path.isfile(sym_target))
 
         os.chmod(sym_target, 0o644)
+        os.chmod(os.path.dirname(sym_target), 0o755)
+        self.am._VALIDATED_DB_FILES.clear()
+        self.am._VALIDATED_DIRS.clear()
         ro_conn = self.am.get_connection(read_only=True)
         ro_conn.close()
         self.assertEqual(os.stat(sym_target).st_mode & 0o777, 0o644)
+        self.assertEqual(os.stat(os.path.dirname(sym_target)).st_mode & 0o777, 0o755)
         os.chmod(sym_target, 0o600)
         os.chmod(os.path.dirname(sym_target), 0o700)
 
         self.am.record_observation(content="Before backup", entity_name="bak-ent")
-        bak_path = os.path.join(self.tmpdir.name, "backup.db")
+        bak_path = os.path.join(self.tmp_root, "backup.db")
         orig_stdout = sys.stdout
         orig_argv = sys.argv
         try:
@@ -750,8 +792,12 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         ) + "\n"
         in_buf = io.StringIO(stdin_payload)
         out_buf = io.StringIO()
+        prev_mcp_int = signal.getsignal(signal.SIGINT)
+        prev_mcp_term = signal.getsignal(signal.SIGTERM)
         with mock.patch.object(sys, "stdin", in_buf), mock.patch.object(sys, "stdout", out_buf):
             self.am.serve_mcp()
+        self.assertEqual(signal.getsignal(signal.SIGINT), prev_mcp_int)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), prev_mcp_term)
         lines = [json.loads(line) for line in out_buf.getvalue().splitlines() if line.strip()]
         self.assertEqual(len(lines), 3)
         self.assertEqual(lines[0]["error"]["code"], -32600)
@@ -759,7 +805,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertIsInstance(lines[2], list)
         self.assertEqual(len(lines[2]), 2)
 
-        legacy_db = os.path.join(self.tmpdir.name, "legacy.db")
+        legacy_db = os.path.join(self.tmp_root, "legacy.db")
         lconn = sqlite3.connect(legacy_db)
         lconn.execute(
             "CREATE TABLE entities (entity_id TEXT PRIMARY KEY, name TEXT, type TEXT, summary TEXT, created_at TEXT, updated_at TEXT);"
@@ -790,13 +836,109 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(recalled["name"], "legacy-node")
         self.assertEqual(len(recalled["observations"]), 1)
 
+        with sqlite3.connect(legacy_db) as dconn:
+            dconn.execute("DROP INDEX IF EXISTS idx_observations_entity_created")
+            dconn.execute("DELETE FROM observations_fts")
+            dconn.commit()
+        am._VALIDATED_DB_FILES.clear()
+        am.init_db()
+        self.assertEqual(len(am.search_memory(query="Legacy fact")), 1)
+
+        import threading
+
+        in_tx_dup = am.record_observation(
+            content="Legacy fact on host",
+            entity_name="legacy-node",
+            entity_type="host",
+            summary="Updated host summary in transaction",
+            category="architecture",
+        )
+        self.assertEqual(in_tx_dup["status"], "exists")
+
+        thread_results: list[dict[str, Any]] = []
+        thread_lock = threading.Lock()
+
+        def _concurrent_writer(idx_w: int) -> None:
+            """Executes a concurrent record_observation call on its own SQLite connection so multi-connection WAL write serialization and duplicate race recovery are verified, preventing lock or duplicate errors."""
+            res_w = am.record_observation(
+                content="Shared concurrent observation",
+                entity_name="concurrent-node",
+                entity_type="service",
+                summary=f"Summary {idx_w}",
+                category="architecture",
+            )
+            with thread_lock:
+                thread_results.append(res_w)
+
+        t1 = threading.Thread(target=_concurrent_writer, args=(1,))
+        t2 = threading.Thread(target=_concurrent_writer, args=(2,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10.0)
+        t2.join(timeout=10.0)
+        self.assertEqual(len(thread_results), 2)
+        statuses = sorted(r.get("status", "") for r in thread_results)
+        self.assertEqual(statuses, ["exists", "success"])
+
+        corrupt_init_db = os.path.join(self.tmp_root, "corrupt_init.db")
+        Path(corrupt_init_db).write_bytes(b"SQLite format 3\x00" + (b"\xff" * 4080))
+        os.chmod(corrupt_init_db, 0o600)
+        am.DB_PATH = corrupt_init_db
+        am._RAW_DB_PATH = corrupt_init_db
+        am._VALIDATED_DB_FILES.clear()
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            am.init_db(force=True)
+        self.assertTrue(
+            any(
+                fn.startswith("corrupt_init.db.corrupt-") and fn.endswith(".bak")
+                for fn in os.listdir(self.tmp_root)
+            )
+        )
+
+        foreign_db = os.path.join(self.tmp_root, "foreign.db")
+        with sqlite3.connect(foreign_db) as fconn:
+            fconn.execute("PRAGMA application_id = 286331153")
+            fconn.execute("CREATE TABLE other_app (item_num INT)")
+            fconn.commit()
+        os.chmod(foreign_db, 0o600)
+        am.DB_PATH = foreign_db
+        am._RAW_DB_PATH = foreign_db
+        am._VALIDATED_DB_FILES.clear()
+        with self.assertRaises(RuntimeError) as cm_foreign:
+            am.init_db()
+        self.assertIn("foreign", str(cm_foreign.exception).lower())
+
+        newer_db = os.path.join(self.tmp_root, "newer.db")
+        with sqlite3.connect(newer_db) as nconn:
+            nconn.execute(f"PRAGMA application_id = {am.APP_ID}")
+            nconn.execute("PRAGMA user_version = 999")
+            nconn.execute("CREATE TABLE entities (entity_id TEXT PRIMARY KEY)")
+            nconn.commit()
+        os.chmod(newer_db, 0o600)
+        am.DB_PATH = newer_db
+        am._RAW_DB_PATH = newer_db
+        am._VALIDATED_DB_FILES.clear()
+        with self.assertRaises(RuntimeError) as cm_newer:
+            am.init_db()
+        self.assertIn("newer", str(cm_newer.exception).lower())
+
+        am.DB_PATH = legacy_db
+        am._RAW_DB_PATH = legacy_db
+        am._VALIDATED_DB_FILES.clear()
+        with mock.patch.object(
+            sqlite3, "connect", side_effect=sqlite3.OperationalError("database is locked")
+        ), self.assertRaises(RuntimeError) as cm_locked_init:
+            am.init_db(force=True)
+        self.assertIn("locked", str(cm_locked_init.exception).lower())
+        self.assertTrue(os.path.isfile(legacy_db))
+
         with mock.patch.dict(os.environ, {"ALLOW_NON_OPTANE": "0"}):
             am._VALIDATED_STORAGE_GATES.clear()
             am._VALIDATED_STORAGE_DEVS.clear()
             with mock.patch.object(
                 am, "_backing_block_devices", return_value=[]
             ), self.assertRaises(RuntimeError) as cm_unres:
-                am.validate_storage_hardware(self.tmpdir.name, dev_id=999992)
+                am.validate_storage_hardware(self.tmp_root, dev_id=999992)
             self.assertIn("could not be resolved to a physical device", str(cm_unres.exception))
 
     def test_plain_writing_and_tri_stream_contracts(self) -> None:
@@ -804,8 +946,14 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         repo_root = Path(__file__).resolve().parent.parent
         ascii_only_targets = [
             repo_root / "install.sh",
+            repo_root / "README.md",
+            repo_root / "LLM_ONBOARDING.md",
+            repo_root / "pyproject.toml",
+            repo_root / "mcp" / "instructions.md",
             repo_root / "skill" / "SKILL.md",
             repo_root / "skill" / "references" / "agent-memory-mcp.md",
+            *(repo_root / "mcp" / f"{t['name']}.json" for t in self.am.TOOLS),
+            *(p for p in sorted((repo_root / "docs").iterdir()) if p.is_file() and p.suffix == ".md"),
         ]
         for asc_path in ascii_only_targets:
             asc_src = asc_path.read_text(encoding="utf-8")
@@ -1040,10 +1188,53 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             bench_mod.main()
         self.assertEqual(cm_b_abbrev.exception.code, 2)
 
-        valid_tmp_log = os.path.join(self.tmpdir.name, "valid")
+        valid_tmp_log = os.path.join(self.tmp_root, "valid")
         self.assertEqual(bench_mod._pre_extract_log_dir(["--log-dir", valid_tmp_log, "--log-dir", "--dry-run"]), "")
         self.assertEqual(bench_mod._pre_extract_log_dir(["-n", "--log-dir"]), "")
         self.assertEqual(bench_mod._pre_extract_log_dir(["--log-dir", valid_tmp_log, "--help"]), "")
+        redacted_metrics = bench_mod._redact_secrets_obj(
+            {"prompt_context_tokens": 225, "prompt_context_tokens_str": "225 tokens", "api_token": 999},
+            self.am,
+        )
+        self.assertEqual(redacted_metrics["prompt_context_tokens"], 225)
+        self.assertEqual(redacted_metrics["prompt_context_tokens_str"], "225 tokens")
+        self.assertEqual(redacted_metrics["api_token"], "[REDACTED]")
+
+        rest_src = os.path.join(self.tmp_root, "restore_src.db")
+        self.am.DB_PATH = rest_src
+        self.am._RAW_DB_PATH = rest_src
+        self.am._VALIDATED_DB_FILES.clear()
+        self.am.init_db()
+        os.chmod(rest_src, 0o600)
+        corrupt_rest_dst = os.path.join(self.tmp_root, "corrupt_rest_dst.db")
+        Path(corrupt_rest_dst).write_bytes(b"SQLite format 3\x00" + (b"\xff" * 4080))
+        os.chmod(corrupt_rest_dst, 0o600)
+        self.am.DB_PATH = corrupt_rest_dst
+        self.am._RAW_DB_PATH = corrupt_rest_dst
+        self.am._VALIDATED_DB_FILES.clear()
+        rest_err_buf = io.StringIO()
+        with mock.patch.object(
+            sqlite3,
+            "connect",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), mock.patch.object(
+            sys, "argv", ["agent-memory", "restore", rest_src]
+        ), mock.patch.object(sys, "stderr", rest_err_buf), self.assertRaises(SystemExit) as cm_rest_lock:
+            self.am.main()
+        self.assertEqual(cm_rest_lock.exception.code, 1)
+        self.assertIn("database is locked", rest_err_buf.getvalue())
+        self.assertNotIn("corrupted", rest_err_buf.getvalue())
+
+        with mock.patch.object(
+            sys, "argv", ["agent-memory", "restore", rest_src]
+        ), mock.patch.object(sys, "stdout", io.StringIO()), mock.patch.object(sys, "stderr", io.StringIO()):
+            self.am.main()
+        self.assertTrue(
+            any(
+                fn.startswith("corrupt_rest_dst.db.corrupt-") and fn.endswith(".bak")
+                for fn in os.listdir(self.tmp_root)
+            )
+        )
 
         am = self.am
         with mock.patch.object(am, "_backing_block_devices", return_value=["/sys/block/nvme0n1"]), mock.patch.object(
@@ -1055,14 +1246,14 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         ):
             am._VALIDATED_STORAGE_DEVS.clear()
             with self.assertRaises(RuntimeError) as cm_hybrid:
-                am.validate_storage_hardware(self.tmpdir.name, dev_id=999991)
+                am.validate_storage_hardware(self.tmp_root, dev_id=999991)
             self.assertIn("not Intel Optane NVMe", str(cm_hybrid.exception))
 
-        hl_db_target = os.path.join(self.tmpdir.name, "hl_target.db")
+        hl_db_target = os.path.join(self.tmp_root, "hl_target.db")
         with sqlite3.connect(hl_db_target) as hl_conn:
             hl_conn.execute("CREATE TABLE t (x INT)")
         os.chmod(hl_db_target, 0o600)
-        hl_db_alias = os.path.join(self.tmpdir.name, "hl_alias.db")
+        hl_db_alias = os.path.join(self.tmp_root, "hl_alias.db")
         os.link(hl_db_target, hl_db_alias)
         self.am.DB_PATH = hl_db_target
         self.am._RAW_DB_PATH = hl_db_target
@@ -1072,11 +1263,21 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(cm_doc_hl.exception.code, 1)
         self.assertIn("multiple hardlinks", json.loads(doc_hl_buf.getvalue())["permissions"])
 
-        guarded_db = os.path.join(self.tmpdir.name, ".git", "memory.db")
+        guarded_db = os.path.join(self.tmp_root, ".git", "memory.db")
         self.am.DB_PATH = guarded_db
         self.am._RAW_DB_PATH = guarded_db
+        self.am._GUARDED_PATHS_CACHE = None
+        orig_exists = os.path.exists
         doc_guard_buf = io.StringIO()
-        with mock.patch.object(os.path, "exists", side_effect=AssertionError("os.path.exists should not be called on guarded path")), mock.patch.object(
+        with mock.patch.object(
+            os.path,
+            "exists",
+            side_effect=lambda p: (
+                (_ for _ in ()).throw(AssertionError("os.path.exists should not be called on guarded path"))
+                if os.path.abspath(str(p)) == os.path.abspath(guarded_db)
+                else orig_exists(p)
+            ),
+        ), mock.patch.object(
             sys, "stdout", doc_guard_buf
         ), self.assertRaises(SystemExit) as cm_doc_guard:
             self.am.run_doctor()
