@@ -483,22 +483,23 @@ def _validate_and_init_log_dir(log_dir: str, am_mod: Any, home_dir: str) -> tupl
             raise ValueError(f"Refusing --log-dir inside a .git directory: '{log_dir}'.")
     if am_mod is not None and hasattr(am_mod, "_check_not_guarded_path"):
         am_mod._check_not_guarded_path(norm_log, "LOG_DIR")
-    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+    xdg_data = os.path.expanduser(os.path.expandvars(os.environ.get("XDG_DATA_HOME", "").strip()))
     if not xdg_data or not os.path.isabs(xdg_data):
         xdg_data = os.path.join(home_dir, ".local", "share")
     user_base = os.path.basename(os.path.abspath(home_dir).rstrip("/")) or "user"
-    env_db = os.environ.get("AGENT_MEMORY_DB", "").strip()
-    env_opt = os.environ.get("OPTANE_BASE", "").strip()
+    env_db = os.path.expanduser(os.path.expandvars(os.environ.get("AGENT_MEMORY_DB", "").strip()))
+    env_opt = os.path.expanduser(os.path.expandvars(os.environ.get("OPTANE_BASE", "").strip()))
     cand_dbs = [
-        env_db,
-        os.path.join(env_opt, "agent_memory", "memory.db") if env_opt else "",
+        env_db if os.path.isabs(env_db) else "",
+        os.path.join(env_opt, "agent_memory", "memory.db") if (env_opt and os.path.isabs(env_opt)) else "",
         getattr(am_mod, "DB_PATH", "") if am_mod is not None else "",
         getattr(am_mod, "_RAW_DB_PATH", "") if am_mod is not None else "",
         f"/mnt/optane/{user_base}/agent_memory/memory.db",
         os.path.join(xdg_data, "agent-memory", "memory.db"),
     ]
-    for cand_db in cand_dbs:
-        if not cand_db:
+    for raw_cand_db in cand_dbs:
+        cand_db = os.path.expanduser(os.path.expandvars(str(raw_cand_db).strip()))
+        if not cand_db or not os.path.isabs(cand_db):
             continue
         abs_db = os.path.abspath(cand_db)
         real_db = os.path.realpath(abs_db)
@@ -561,7 +562,10 @@ def _redact_secrets_obj(obj: Any, am_mod: Any, depth: int = 0) -> Any:
         sanitized_dict: dict[str, Any] = {}
         for k, v in obj.items():
             k_str = str(_redact_secrets_obj(str(k), am_mod, depth + 1))
-            if any(tok in k_str.lower() for tok in ("pass" + "word", "sec" + "ret", "tok" + "en", "api_" + "key", "priv" + "ate_key")):
+            k_low = k_str.lower()
+            if k_low not in ("prompt_context_tokens", "prompt_context_tokens_str") and any(
+                tok in k_low for tok in ("pass" + "word", "sec" + "ret", "tok" + "en", "api_" + "key", "priv" + "ate_key")
+            ):
                 sanitized_dict[k_str] = "[REDACTED]"
             else:
                 sanitized_dict[k_str] = _redact_secrets_obj(v, am_mod, depth + 1)

@@ -1360,6 +1360,14 @@ def init_db(force: bool = False, conn: sqlite3.Connection | None = None, silent_
                     if missing:
                         for stmt in SCHEMA_STATEMENTS:
                             conn.execute(stmt)
+                    if not fts_drift:
+                        try:
+                            indexed = conn.execute("SELECT COUNT(*) FROM observations_fts_docsize;").fetchone()[0]
+                            obs_count = conn.execute("SELECT COUNT(*) FROM observations;").fetchone()[0]
+                            if indexed != obs_count:
+                                fts_drift = True
+                        except sqlite3.OperationalError:
+                            fts_drift = True
                     if fts_drift or (missing and any(kind in ("table", "trigger") for kind, _ in missing)):
                         conn.execute("INSERT INTO observations_fts(observations_fts) VALUES('rebuild');")
                     with contextlib.suppress(sqlite3.OperationalError):
@@ -3384,6 +3392,9 @@ def serve_mcp() -> None:
     """Runs the stdio JSON-RPC MCP server loop over a persistent hot SQLite connection so agent tool calls execute with low latency, preventing per-request connection teardown from evicting memory-mapped pages."""
     global _MCP_DB_INODE
 
+    prev_sigterm = None
+    prev_sigint = None
+
     def _sig_handler(signum: int, frame: FrameType | None) -> None:
         """Handles `SIGTERM` and `SIGINT` by masking recursive signals and exiting cleanly with status 0 so `finally` connection teardown runs, preventing abrupt process termination from leaving uncheckpointed WAL frames."""
         with contextlib.suppress(ValueError, AttributeError, OSError):
@@ -3391,6 +3402,8 @@ def serve_mcp() -> None:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         sys.exit(0)
     with contextlib.suppress(ValueError, AttributeError):
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        prev_sigint = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGTERM, _sig_handler)
         signal.signal(signal.SIGINT, _sig_handler)
 
@@ -3556,6 +3569,11 @@ def serve_mcp() -> None:
                         cur.close()
             with contextlib.suppress(sqlite3.Error):
                 active_conn.close()
+        with contextlib.suppress(ValueError, AttributeError, OSError):
+            if prev_sigterm is not None:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            if prev_sigint is not None:
+                signal.signal(signal.SIGINT, prev_sigint)
 
 _CLI_SUBCMD_OPTS: dict[str, dict[str, Any]] = {
     "search": {
@@ -4250,10 +4268,10 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
         src = positionals[0]
         tgt = positionals[1]
         pos_type = positionals[2] if len(positionals) == 3 else None
-        if opt_type and pos_type and opt_type.strip().lower() != pos_type.strip().lower():
+        if opt_type is not None and pos_type is not None and opt_type.strip().lower() != pos_type.strip().lower():
             print(f"Error: conflicting relation types '{pos_type}' (positional) and '{opt_type}' (--type).", file=sys.stderr)
             sys.exit(1)
-        rel_type = opt_type or pos_type or "references"
+        rel_type = opt_type if opt_type is not None else (pos_type if pos_type is not None else "references")
         res = relate_entities(src, tgt, rel_type, weight, metadata)
         print(json.dumps(res, indent=2))
         if isinstance(res, dict) and "error" in res:
@@ -4433,10 +4451,10 @@ def _main_inner() -> None:
     rel_p.add_argument("--metadata", "-m", help="JSON metadata for relation edge")
     def run_relate(a: Any) -> None:
         """Dispatches the `relate` CLI subcommand so a directed knowledge-graph edge is created or updated, preventing conflicting positional and flag relation types from silently overriding each other."""
-        if a.opt_type and a.type and a.opt_type.strip().lower() != a.type.strip().lower():
+        if a.opt_type is not None and a.type is not None and a.opt_type.strip().lower() != a.type.strip().lower():
             print(f"Error: conflicting relation types '{a.type}' (positional) and '{a.opt_type}' (--type).", file=sys.stderr)
             sys.exit(1)
-        rel_type = a.opt_type or a.type or "references"
+        rel_type = a.opt_type if a.opt_type is not None else (a.type if a.type is not None else "references")
         res = relate_entities(a.source, a.target, rel_type, a.weight, a.metadata)
         print(json.dumps(res, indent=2))
         if isinstance(res, dict) and "error" in res:
