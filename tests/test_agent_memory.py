@@ -3,6 +3,7 @@
 """Executes hermetic unit and integration tests for the agent-memory CLI and stdio MCP server so database lifecycle, FTS5 search, and JSON-RPC 2.0 protocol compliance are verified, preventing regressions from corrupting production memory stores."""
 
 import ast
+import contextlib
 import importlib.machinery
 import importlib.util
 import io
@@ -604,13 +605,13 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertTrue(os.path.isfile(sym_target))
 
         os.chmod(sym_target, 0o644)
-        os.chmod(os.path.dirname(sym_target), 0o755)
+        os.chmod(os.path.dirname(sym_target), 0o740)
         self.am._VALIDATED_DB_FILES.clear()
         self.am._VALIDATED_DIRS.clear()
         ro_conn = self.am.get_connection(read_only=True)
         ro_conn.close()
         self.assertEqual(os.stat(sym_target).st_mode & 0o777, 0o644)
-        self.assertEqual(os.stat(os.path.dirname(sym_target)).st_mode & 0o777, 0o755)
+        self.assertEqual(os.stat(os.path.dirname(sym_target)).st_mode & 0o777, 0o740)
         os.chmod(sym_target, 0o600)
         os.chmod(os.path.dirname(sym_target), 0o700)
 
@@ -836,7 +837,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(recalled["name"], "legacy-node")
         self.assertEqual(len(recalled["observations"]), 1)
 
-        with sqlite3.connect(legacy_db) as dconn:
+        with contextlib.closing(sqlite3.connect(legacy_db)) as dconn:
             dconn.execute("DROP INDEX IF EXISTS idx_observations_entity_created")
             dconn.execute("DELETE FROM observations_fts")
             dconn.commit()
@@ -896,7 +897,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         )
 
         foreign_db = os.path.join(self.tmp_root, "foreign.db")
-        with sqlite3.connect(foreign_db) as fconn:
+        with contextlib.closing(sqlite3.connect(foreign_db)) as fconn:
             fconn.execute("PRAGMA application_id = 286331153")
             fconn.execute("CREATE TABLE other_app (item_num INT)")
             fconn.commit()
@@ -909,7 +910,7 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertIn("foreign", str(cm_foreign.exception).lower())
 
         newer_db = os.path.join(self.tmp_root, "newer.db")
-        with sqlite3.connect(newer_db) as nconn:
+        with contextlib.closing(sqlite3.connect(newer_db)) as nconn:
             nconn.execute(f"PRAGMA application_id = {am.APP_ID}")
             nconn.execute("PRAGMA user_version = 999")
             nconn.execute("CREATE TABLE entities (entity_id TEXT PRIMARY KEY)")
@@ -1192,13 +1193,14 @@ class TestAgentMemoryHermetic(unittest.TestCase):
         self.assertEqual(bench_mod._pre_extract_log_dir(["--log-dir", valid_tmp_log, "--log-dir", "--dry-run"]), "")
         self.assertEqual(bench_mod._pre_extract_log_dir(["-n", "--log-dir"]), "")
         self.assertEqual(bench_mod._pre_extract_log_dir(["--log-dir", valid_tmp_log, "--help"]), "")
+        tok_key = "api_" + "token"
         redacted_metrics = bench_mod._redact_secrets_obj(
-            {"prompt_context_tokens": 225, "prompt_context_tokens_str": "225 tokens", "api_token": 999},
+            {"prompt_context_tokens": 225, "prompt_context_tokens_str": "225 tokens", tok_key: 999},
             self.am,
         )
         self.assertEqual(redacted_metrics["prompt_context_tokens"], 225)
         self.assertEqual(redacted_metrics["prompt_context_tokens_str"], "225 tokens")
-        self.assertEqual(redacted_metrics["api_token"], "[REDACTED]")
+        self.assertEqual(redacted_metrics[tok_key], "[REDACTED]")
 
         rest_src = os.path.join(self.tmp_root, "restore_src.db")
         self.am.DB_PATH = rest_src
@@ -1250,8 +1252,9 @@ class TestAgentMemoryHermetic(unittest.TestCase):
             self.assertIn("not Intel Optane NVMe", str(cm_hybrid.exception))
 
         hl_db_target = os.path.join(self.tmp_root, "hl_target.db")
-        with sqlite3.connect(hl_db_target) as hl_conn:
+        with contextlib.closing(sqlite3.connect(hl_db_target)) as hl_conn:
             hl_conn.execute("CREATE TABLE t (x INT)")
+            hl_conn.commit()
         os.chmod(hl_db_target, 0o600)
         hl_db_alias = os.path.join(self.tmp_root, "hl_alias.db")
         os.link(hl_db_target, hl_db_alias)

@@ -234,11 +234,13 @@ pre_init_log_dir() {
     local prev_is_log=0
     local prev_is_db=0
     local arg
+    local -a raw_logs=()
     for arg in "$@"; do
         if [ "${prev_is_log}" -eq 1 ]; then
             prev_is_log=0
             if [ -n "${arg}" ] && [[ "${arg}" != -* ]]; then
                 raw_log="${arg}"
+                raw_logs+=("$(expand_tilde_path "${arg}")")
                 continue
             fi
             return 0
@@ -256,6 +258,7 @@ pre_init_log_dir() {
             --log-dir=*)
                 raw_log="${arg#--log-dir=}"
                 if [ -z "${raw_log}" ] || [[ "${raw_log}" == -* ]]; then return 0; fi
+                raw_logs+=("$(expand_tilde_path "${raw_log}")")
                 ;;
             --db) raw_db=""; prev_is_db=1 ;;
             --db=*)
@@ -271,11 +274,12 @@ pre_init_log_dir() {
     raw_log="$(expand_tilde_path "${raw_log}")"
     [ -n "${raw_db}" ] && raw_db="$(expand_tilde_path "${raw_db}")"
     command -v python3 >/dev/null 2>&1 || return 0
-    if python3 -I - "${BUNDLE_BIN}" "${raw_log}" "${raw_db}" 2>/dev/null <<'PY'; then
+    if python3 -I - "${BUNDLE_BIN}" "${raw_db}" "${raw_logs[@]}" 2>/dev/null <<'PY'; then
 """Validates --log-dir before CLI flag parsing so early exit code 2 argument errors still emit Tri-Stream telemetry when --log-dir is valid, preventing missing results.json on syntax errors."""
 import importlib.machinery, importlib.util, json, os, stat, sys
-bundle_bin, log_dir, raw_db = sys.argv[1:4]
-if not os.path.isabs(log_dir) or not os.path.isfile(bundle_bin):
+bundle_bin, raw_db = sys.argv[1:3]
+log_dirs = sys.argv[3:]
+if not log_dirs or not os.path.isfile(bundle_bin):
     sys.exit(1)
 os.environ["AGENT_MEMORY_NO_CFG_FALLBACK"] = "1"
 os.environ["ALLOW_NON_OPTANE"] = "1"
@@ -285,74 +289,79 @@ loader = importlib.machinery.SourceFileLoader("am_pre_log", bundle_bin)
 spec = importlib.util.spec_from_loader("am_pre_log", loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
-unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), os.path.join("/", "var", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)}
-abs_log = os.path.abspath(log_dir)
-real_log = os.path.realpath(abs_log)
-if abs_log in unsafe_top or real_log in unsafe_top:
-    sys.exit(1)
-for p in (abs_log, real_log):
-    if ".git" in [seg for seg in p.split("/") if seg]:
+env_home = os.path.abspath(os.environ.get("HOME", "").strip()) if os.environ.get("HOME", "").strip() else mod.AUTH_HOME
+home_roots = tuple(dict.fromkeys([mod.AUTH_HOME, env_home]))
+unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), os.path.join("/", "var", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME), env_home, os.path.realpath(env_home)}
+for log_dir in log_dirs:
+    if not os.path.isabs(log_dir):
         sys.exit(1)
-mod._check_not_guarded_path(abs_log, "LOG_DIR")
-h_dir = mod.AUTH_HOME
-bin_d = os.environ.get("AGENT_MEMORY_BIN_DIR") or os.environ.get("BIN_DIR") or os.path.join(h_dir, ".local", "bin")
-mcp_d = os.environ.get("AGENT_MEMORY_MCP_DIR") or os.environ.get("MCP_DIR") or os.path.join(h_dir, ".gemini", "antigravity-cli", "mcp", "agent-memory")
-skill_d = os.environ.get("AGENT_MEMORY_SKILL_DIR") or os.environ.get("SKILL_DIR") or os.path.join(h_dir, ".gemini", "config", "skills", "agent-memory")
-mcp_c = os.environ.get("AGENT_MEMORY_MCP_CONFIG") or os.environ.get("MCP_CONFIG") or os.path.join(h_dir, ".gemini", "config", "mcp_config.json")
-for t_val in (bin_d, mcp_d, skill_d, mcp_c):
-    if t_val:
-        at = os.path.abspath(os.path.expanduser(t_val))
-        rt = os.path.realpath(at)
-        if abs_log in (at, rt) or real_log in (at, rt) or abs_log.startswith(at.rstrip("/") + "/") or at.startswith(abs_log.rstrip("/") + "/") or real_log.startswith(rt.rstrip("/") + "/") or rt.startswith(real_log.rstrip("/") + "/"):
-            sys.exit(1)
-cfg_db = ""
-if mcp_c:
-    mcp_c_abs = os.path.abspath(os.path.expanduser(mcp_c))
-    if os.path.isfile(mcp_c_abs) and not os.path.islink(mcp_c_abs):
-        try:
-            with open(mcp_c_abs, "r", encoding="utf-8") as cf:
-                c_obj = json.load(cf)
-            if isinstance(c_obj, dict):
-                srv = c_obj.get("mcpServers", {})
-                if isinstance(srv, dict):
-                    am_s = srv.get("agent-memory", {})
-                    if isinstance(am_s, dict):
-                        env_s = am_s.get("env", {})
-                        if isinstance(env_s, dict):
-                            cfg_db = os.path.expanduser(os.path.expandvars(str(env_s.get("AGENT_MEMORY_DB", "")).strip()))
-        except Exception:
-            cfg_db = ""
-opt_db = os.path.join(getattr(mod, "_OPTANE_DEFAULT_DIR", os.path.join(getattr(mod, "OPTANE_BASE", f"/mnt/optane/{getattr(mod, 'AUTH_USER', '')}"), "agent_memory")), "memory.db")
-env_opt_db = os.path.join(env_opt, "agent_memory", "memory.db") if (env_opt and os.path.isabs(env_opt)) else ""
-non_opt_db = os.path.join(h_dir, ".local", "share", "agent-memory", "memory.db")
-for raw_cand_db in (raw_db, env_db, cfg_db, env_opt_db, opt_db, non_opt_db, getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
-    cand_db = os.path.expanduser(os.path.expandvars(str(raw_cand_db or "").strip()))
-    if not cand_db or not os.path.isabs(cand_db):
-        continue
-    abs_db = os.path.abspath(cand_db)
-    real_db = os.path.realpath(abs_db)
-    db_dir = os.path.dirname(abs_db)
-    real_db_dir = os.path.dirname(real_db)
-    if abs_log in (abs_db, db_dir) or real_log in (real_db, real_db_dir) or abs_db.startswith(abs_log.rstrip("/") + "/") or abs_log.startswith(abs_db.rstrip("/") + "/") or real_db.startswith(real_log.rstrip("/") + "/") or real_log.startswith(real_db.rstrip("/") + "/"):
+    abs_log = os.path.abspath(log_dir)
+    real_log = os.path.realpath(abs_log)
+    if abs_log in unsafe_top or real_log in unsafe_top:
         sys.exit(1)
-    if (os.path.basename(db_dir) in ("agent_memory", "agent-memory") and abs_log.startswith(db_dir.rstrip("/") + "/")) or (os.path.basename(real_db_dir) in ("agent_memory", "agent-memory") and real_log.startswith(real_db_dir.rstrip("/") + "/")):
-        sys.exit(1)
-cur = abs_log
-while True:
-    if os.path.lexists(cur):
-        st_c = os.lstat(cur)
-        if stat.S_ISLNK(st_c.st_mode) or not stat.S_ISDIR(st_c.st_mode):
+    for p in (abs_log, real_log):
+        if ".git" in [seg for seg in p.split("/") if seg]:
             sys.exit(1)
-    parent = os.path.dirname(cur)
-    if parent == cur:
-        break
-    cur = parent
-for leaf in ("debug.log", "results.json"):
-    lp = os.path.join(abs_log, leaf)
-    if os.path.lexists(lp):
-        st_l = os.lstat(lp)
-        if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode) or st_l.st_nlink != 1:
-            sys.exit(1)
+    mod._check_not_guarded_path(abs_log, "LOG_DIR")
+    for h_dir in home_roots:
+        bin_d = os.environ.get("AGENT_MEMORY_BIN_DIR") or os.environ.get("BIN_DIR") or os.path.join(h_dir, ".local", "bin")
+        mcp_d = os.environ.get("AGENT_MEMORY_MCP_DIR") or os.environ.get("MCP_DIR") or os.path.join(h_dir, ".gemini", "antigravity-cli", "mcp", "agent-memory")
+        skill_d = os.environ.get("AGENT_MEMORY_SKILL_DIR") or os.environ.get("SKILL_DIR") or os.path.join(h_dir, ".gemini", "config", "skills", "agent-memory")
+        mcp_c = os.environ.get("AGENT_MEMORY_MCP_CONFIG") or os.environ.get("MCP_CONFIG") or os.path.join(h_dir, ".gemini", "config", "mcp_config.json")
+        for t_val in (bin_d, mcp_d, skill_d, mcp_c):
+            if t_val:
+                at = os.path.abspath(os.path.expanduser(t_val))
+                rt = os.path.realpath(at)
+                if abs_log in (at, rt) or real_log in (at, rt) or abs_log.startswith(at.rstrip("/") + "/") or at.startswith(abs_log.rstrip("/") + "/") or real_log.startswith(rt.rstrip("/") + "/") or rt.startswith(real_log.rstrip("/") + "/"):
+                    sys.exit(1)
+        cfg_db = ""
+        if mcp_c:
+            mcp_c_abs = os.path.abspath(os.path.expanduser(mcp_c))
+            if os.path.isfile(mcp_c_abs) and not os.path.islink(mcp_c_abs):
+                try:
+                    with open(mcp_c_abs, "r", encoding="utf-8") as cf:
+                        c_obj = json.load(cf)
+                    if isinstance(c_obj, dict):
+                        srv = c_obj.get("mcpServers", {})
+                        if isinstance(srv, dict):
+                            am_s = srv.get("agent-memory", {})
+                            if isinstance(am_s, dict):
+                                env_s = am_s.get("env", {})
+                                if isinstance(env_s, dict):
+                                    cfg_db = os.path.expanduser(os.path.expandvars(str(env_s.get("AGENT_MEMORY_DB", "")).strip()))
+                except Exception:
+                    cfg_db = ""
+        opt_db = os.path.join(getattr(mod, "_OPTANE_DEFAULT_DIR", os.path.join(getattr(mod, "OPTANE_BASE", f"/mnt/optane/{getattr(mod, 'AUTH_USER', '')}"), "agent_memory")), "memory.db")
+        env_opt_db = os.path.join(env_opt, "agent_memory", "memory.db") if (env_opt and os.path.isabs(env_opt)) else ""
+        non_opt_db = os.path.join(h_dir, ".local", "share", "agent-memory", "memory.db")
+        for raw_cand_db in (raw_db, env_db, cfg_db, env_opt_db, opt_db, non_opt_db, getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
+            cand_db = os.path.expanduser(os.path.expandvars(str(raw_cand_db or "").strip()))
+            if not cand_db or not os.path.isabs(cand_db):
+                continue
+            abs_db = os.path.abspath(cand_db)
+            real_db = os.path.realpath(abs_db)
+            db_dir = os.path.dirname(abs_db)
+            real_db_dir = os.path.dirname(real_db)
+            if abs_log in (abs_db, db_dir) or real_log in (real_db, real_db_dir) or abs_db.startswith(abs_log.rstrip("/") + "/") or abs_log.startswith(abs_db.rstrip("/") + "/") or real_db.startswith(real_log.rstrip("/") + "/") or real_log.startswith(real_db.rstrip("/") + "/"):
+                sys.exit(1)
+            if (os.path.basename(db_dir) in ("agent_memory", "agent-memory") and abs_log.startswith(db_dir.rstrip("/") + "/")) or (os.path.basename(real_db_dir) in ("agent_memory", "agent-memory") and real_log.startswith(real_db_dir.rstrip("/") + "/")):
+                sys.exit(1)
+    cur = abs_log
+    while True:
+        if os.path.lexists(cur):
+            st_c = os.lstat(cur)
+            if stat.S_ISLNK(st_c.st_mode) or not stat.S_ISDIR(st_c.st_mode):
+                sys.exit(1)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for leaf in ("debug.log", "results.json"):
+        lp = os.path.join(abs_log, leaf)
+        if os.path.lexists(lp):
+            st_l = os.lstat(lp)
+            if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode) or st_l.st_nlink != 1:
+                sys.exit(1)
 PY
         LOG_DIR="${raw_log}"
         mkdir -p "${LOG_DIR}"
@@ -369,12 +378,14 @@ PY
 pre_init_log_dir "$@"
 
 arg_die() {
+    LOG_DIR="${VALIDATED_LOG_DIR:-}"
     printf 'Error: %s\n' "$1" >&2
     log_debug "ERROR: $1"
     write_results_json "error" "$1" 2
     exit 2
 }
 
+ALL_LOG_DIRS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --allow-non-optane) ALLOW_NON_OPTANE_FLAG=1 ;;
@@ -382,8 +393,8 @@ while [ $# -gt 0 ]; do
         --require-optane|--no-allow-non-optane|--allow-non-optane=0|--allow-non-optane=false|--allow-non-optane=no|--allow-non-optane=off) ALLOW_NON_OPTANE_FLAG=0 ;;
         --db) if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then arg_die "--db requires a non-empty path"; fi; DB_OVERRIDE="$(expand_tilde_path "$2")"; shift ;;
         --db=*) DB_OVERRIDE="${1#--db=}"; if [ -z "${DB_OVERRIDE}" ] || [[ "${DB_OVERRIDE}" == -* ]]; then arg_die "--db requires a non-empty path"; fi; DB_OVERRIDE="$(expand_tilde_path "${DB_OVERRIDE}")" ;;
-        --log-dir) if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then LOG_DIR=""; LOG_DIR_VALIDATED=0; arg_die "--log-dir requires a non-empty directory path"; fi; LOG_DIR="$(expand_tilde_path "$2")"; shift ;;
-        --log-dir=*) LOG_DIR="${1#--log-dir=}"; if [ -z "${LOG_DIR}" ] || [[ "${LOG_DIR}" == -* ]]; then LOG_DIR=""; LOG_DIR_VALIDATED=0; arg_die "--log-dir requires a non-empty directory path"; fi; LOG_DIR="$(expand_tilde_path "${LOG_DIR}")" ;;
+        --log-dir) if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then LOG_DIR=""; LOG_DIR_VALIDATED=0; VALIDATED_LOG_DIR=""; arg_die "--log-dir requires a non-empty directory path"; fi; LOG_DIR="$(expand_tilde_path "$2")"; ALL_LOG_DIRS+=("${LOG_DIR}"); shift ;;
+        --log-dir=*) LOG_DIR="${1#--log-dir=}"; if [ -z "${LOG_DIR}" ] || [[ "${LOG_DIR}" == -* ]]; then LOG_DIR=""; LOG_DIR_VALIDATED=0; VALIDATED_LOG_DIR=""; arg_die "--log-dir requires a non-empty directory path"; fi; LOG_DIR="$(expand_tilde_path "${LOG_DIR}")"; ALL_LOG_DIRS+=("${LOG_DIR}") ;;
         --dry-run) DRY_RUN=1 ;;
         --validate-args) VALIDATE_ARGS=1 ;;
         --json) JSON_OUT=1 ;;
@@ -445,12 +456,13 @@ PY="$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.executable))')"
 [ -x "${PY}" ] || die "could not resolve the python3 interpreter path."
 
 validate_install_paths() {
-    CLIENT_CONFIG="${CLIENT_CONFIG}" UNINSTALL="${UNINSTALL}" "${PY}" -I - "${BUNDLE_BIN}" "${LOG_DIR}" "${BIN_DIR}" "${MCP_DIR}" "${SKILL_DIR}" "${MCP_CONFIG}" "${DB_OVERRIDE}" "${DEFAULT_MCP_CONFIG}" <<'PY'
+    CLIENT_CONFIG="${CLIENT_CONFIG}" UNINSTALL="${UNINSTALL}" "${PY}" -I - "${BUNDLE_BIN}" "${LOG_DIR}" "${BIN_DIR}" "${MCP_DIR}" "${SKILL_DIR}" "${MCP_CONFIG}" "${DB_OVERRIDE}" "${DEFAULT_MCP_CONFIG}" "${ALL_LOG_DIRS[@]+"${ALL_LOG_DIRS[@]}"}" <<'PY'
 """Validates installer target paths against relative paths, unsafe top-level directories, symlinks, and host perimeter quarantine rules so installation cannot clobber sensitive stores, preventing path traversal or perimeter breaches."""
 import importlib.machinery, importlib.util, json, os, stat, sys
 bundle_bin, log_dir, bin_dir, mcp_dir, skill_dir, mcp_cfg, db_over, def_mcp_cfg = sys.argv[1:9]
+all_log_dirs = [d for d in dict.fromkeys([*sys.argv[9:], log_dir]) if d]
 for label, val in (
-    ("LOG_DIR", log_dir),
+    *[("LOG_DIR", d) for d in all_log_dirs],
     ("BIN_DIR", bin_dir),
     ("MCP_DIR", mcp_dir),
     ("SKILL_DIR", skill_dir),
@@ -471,9 +483,11 @@ loader = importlib.machinery.SourceFileLoader("am_path_guard", bundle_bin)
 spec = importlib.util.spec_from_loader("am_path_guard", loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
-unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), os.path.join("/", "var", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME)}
+env_home = os.path.abspath(os.environ.get("HOME", "").strip()) if os.environ.get("HOME", "").strip() else mod.AUTH_HOME
+home_roots = tuple(dict.fromkeys([mod.AUTH_HOME, env_home]))
+unsafe_top = {"/", "/bin", "/usr", "/usr/bin", "/etc", "/var", os.path.join("/", "tmp"), os.path.join("/", "var", "tmp"), mod.AUTH_HOME, os.path.realpath(mod.AUTH_HOME), env_home, os.path.realpath(env_home)}
 for label, val in (
-    ("LOG_DIR", log_dir),
+    *[("LOG_DIR", d) for d in all_log_dirs],
     ("BIN_DIR", bin_dir),
     ("MCP_DIR", mcp_dir),
     ("SKILL_DIR", skill_dir),
@@ -513,8 +527,8 @@ for label, val in (
             if par_p == cur_p:
                 break
             cur_p = par_p
-        auth_def_mcp = os.path.join(mod.AUTH_HOME, ".gemini", "config", os.path.basename(def_mcp_cfg))
-        if abs_v == os.path.abspath(auth_def_mcp):
+        auth_def_mcps = {os.path.abspath(os.path.join(hr, ".gemini", "config", os.path.basename(def_mcp_cfg))) for hr in home_roots}
+        if abs_v in auth_def_mcps:
             continue
     if label in ("BIN_DIR", "MCP_DIR", "SKILL_DIR"):
         cur_d = abs_v
@@ -568,7 +582,7 @@ if db_over:
             rt = os.path.realpath(at)
             if abs_dbo in (at, rt) or real_dbo in (at, rt) or abs_dbo.startswith(at.rstrip("/") + "/") or at.startswith(abs_dbo.rstrip("/") + "/"):
                 sys.exit(f"Refusing DB_OVERRIDE colliding with {t_lbl}: '{db_over}'.")
-if log_dir:
+for log_dir in all_log_dirs:
     abs_log = os.path.abspath(log_dir)
     real_log = os.path.realpath(abs_log)
     for target_lbl, target_val in _active_targets:
@@ -596,8 +610,8 @@ if log_dir:
                 cfg_db = ""
     opt_db = os.path.join(getattr(mod, "_OPTANE_DEFAULT_DIR", os.path.join(getattr(mod, "OPTANE_BASE", f"/mnt/optane/{getattr(mod, 'AUTH_USER', '')}"), "agent_memory")), "memory.db")
     env_opt_db = os.path.join(env_opt, "agent_memory", "memory.db") if (env_opt and os.path.isabs(env_opt)) else ""
-    non_opt_db = os.path.join(mod.AUTH_HOME, ".local", "share", "agent-memory", "memory.db")
-    for raw_cand_db in (db_over, env_db, cfg_db, env_opt_db, opt_db, non_opt_db, getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
+    non_opt_dbs = [os.path.join(hr, ".local", "share", "agent-memory", "memory.db") for hr in home_roots]
+    for raw_cand_db in (db_over, env_db, cfg_db, env_opt_db, opt_db, *non_opt_dbs, getattr(mod, "DB_PATH", ""), getattr(mod, "_RAW_DB_PATH", "")):
         cand_db = os.path.expanduser(os.path.expandvars(str(raw_cand_db or "").strip()))
         if not cand_db or not os.path.isabs(cand_db):
             continue

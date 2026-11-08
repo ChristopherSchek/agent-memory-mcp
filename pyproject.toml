@@ -22,6 +22,10 @@ include = ["*.py", "bin/agent-memory"]
 line-length = 140
 target-version = "py310"
 
+[tool.ruff.lint]
+select = ["E7", "E9", "F", "W", "B"]
+ignore = ["B905"]
+
 [tool.mypy]
 files = ["bin/agent-memory", "tests/test_agent_memory.py", "benchmark/benchmark_comparison.py"]
 python_version = "3.10"
