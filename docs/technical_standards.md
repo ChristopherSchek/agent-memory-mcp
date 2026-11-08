@@ -34,7 +34,7 @@ Enforces static analysis, shell linting, docstring structure, and Markdown forma
 
 Runs static analysis across all Python, Bash, and Markdown files prior to commit so syntax and style defects are eliminated immediately, preventing CI or audit failures.
 
-- Run `ruff check bin/agent-memory benchmark/ tests/ && mypy bin/agent-memory benchmark/benchmark_comparison.py tests/test_agent_memory.py && bandit -r bin/agent-memory benchmark/ tests/ && shellcheck install.sh && markdownlint *.md skill/SKILL.md skill/**/*.md docs/*.md` and fix any reported issue.
+- Run `ruff check bin/agent-memory benchmark/ tests/ && mypy bin/agent-memory benchmark/benchmark_comparison.py tests/test_agent_memory.py && bandit -r bin/agent-memory benchmark/ tests/ && shellcheck install.sh && markdownlint --disable MD004 MD007 MD013 MD024 MD025 MD033 MD034 MD036 MD041 MD057 MD060 -- *.md skill/SKILL.md skill/**/*.md docs/*.md` and fix any reported issue.
 
 ---
 

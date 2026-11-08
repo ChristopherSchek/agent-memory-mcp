@@ -1259,12 +1259,12 @@ def init_db(force: bool = False, conn: sqlite3.Connection | None = None, silent_
     should_close = conn is None
     if conn is None:
         db_file = DB_PATH
+        _check_not_guarded_path(_RAW_DB_PATH, "Database path")
+        _check_not_guarded_path(db_file, "Database path")
         real_db_file = os.path.realpath(db_file)
         if os.path.isdir(real_db_file) or real_db_file in (_OPTANE_BASE_REAL, _AUTH_BASE_REAL):
             raise RuntimeError(f"Database path '{real_db_file}' cannot be a directory. Specify a database file.")
         if force and os.path.exists(db_file) and os.path.getsize(db_file) > 0:
-            _check_not_guarded_path(_RAW_DB_PATH, "Database path")
-            _check_not_guarded_path(db_file, "Database path")
             enforce_storage_gate(real_db_file, read_only=False, label="Database path")
             if os.path.lexists(_RAW_DB_PATH):
                 _require_owned(_RAW_DB_PATH, "Database file", forbid_group_other_write=True, check_sidecars=True)
@@ -1396,8 +1396,9 @@ def init_db(force: bool = False, conn: sqlite3.Connection | None = None, silent_
         if should_close:
             conn.close()
 
-_FTS_COL_SPACE_RE = re.compile(r'(?i)\b(content|tags|entity_name):\s+(?="|\S)')
-_FTS_TOKEN_RE = re.compile(r'[-+]?[a-zA-Z_]+:"(?:""|[^"])*"|[-+]?"(?:""|[^"])*"|-\(|\+\(|[()]|\bAND\b|\bOR\b|\bNOT\b|[^\s()]+')
+_FTS_COL_NOT_RE = re.compile(r'(?i)\b(content|tags|entity_name):\s*NOT(?=\s|\()')
+_FTS_COL_SPACE_RE = re.compile(r'(?i)\b(content|tags|entity_name):\s+(?!(?:AND|OR|NOT)\b)(?="|\S)')
+_FTS_TOKEN_RE = re.compile(r'[-+]?[a-zA-Z_]+:[-+]?"(?:""|[^"])*"|[-+]?(?i:content|tags|entity_name):(?=[-+]\()|[-+]?"(?:""|[^"])*"|-\(|\+\(|[()]|(?<![\w-])(?:AND|OR|NOT)(?![\w-])|[^\s()]+')
 _TRIM_EDGE_PUNCT_RE = re.compile(r"^(?:[^\w]|_)+|(?:[^\w]|_)+$")
 _WORD_RE = re.compile(r"[^\W_]+")
 
@@ -1526,46 +1527,57 @@ def sanitize_fts_query(raw_query: str) -> str:
     cached = _SANITIZE_CACHE.get(raw_query)
     if cached is not None:
         return cached
-    cleaned = _normalize_nfc(raw_query)
-    cleaned = cleaned.replace("\x00", " ")
-    cleaned = _FTS_COL_SPACE_RE.sub(r"\1:", cleaned)
+    cleaned = _normalize_nfc(raw_query).replace("\x00", " ")
+    cleaned = _FTS_COL_SPACE_RE.sub(r"\1:", _FTS_COL_NOT_RE.sub(r"-\1:", cleaned))
     tokens = _FTS_TOKEN_RE.findall(cleaned)
     if not tokens:
         _cache_put(_SANITIZE_CACHE, raw_query, '""', 512)
         return '""'
 
     classified: list[tuple[str, str]] = []
-    for lexeme in tokens:
+    col_stack: list[str | None] = [None]
+    pending_col: str | None = None
+    for tok_idx, lexeme in enumerate(tokens):
         if lexeme == "-(":
             classified.append(_TOK_NOT)
             classified.append(_TOK_LPAREN)
+            col_stack.append(pending_col or col_stack[-1])
+            pending_col = None
         elif lexeme in ("(", "+("):
             classified.append(_TOK_LPAREN)
+            col_stack.append(pending_col or col_stack[-1])
+            pending_col = None
         elif lexeme == ")":
             classified.append(_TOK_RPAREN)
+            if len(col_stack) > 1:
+                col_stack.pop()
+            pending_col = None
         elif lexeme == "NOT":
             classified.append(_TOK_NOT)
+            pending_col = None
         elif lexeme == "AND":
             classified.append(_TOK_AND)
+            pending_col = None
         elif lexeme == "OR":
             classified.append(_TOK_OR)
+            pending_col = None
         elif lexeme in ("-", "+"):
+            pending_col = None
             continue
-        elif lexeme.startswith(('-"', '+"')) and lexeme.endswith('"') and len(lexeme) > 2:
-            inner = lexeme[2:-1].replace('""', '"').replace('"', '""')
+        elif (lexeme.startswith('"') or (lexeme.startswith(('-"', '+"')) and len(lexeme) > 2)) and lexeme.endswith('"'):
+            pending_col = None
+            raw_inner = lexeme[2:-1] if lexeme[0] in "-+" else lexeme[1:-1]
+            if col_stack[-1] == "entity_name":
+                raw_inner = _normalize_nfkc(raw_inner)
+            inner = raw_inner.replace('""', '"').replace('"', '""')
             if inner.strip() and any(c.isalnum() for c in inner):
                 if lexeme.startswith("-"):
                     classified.append(_TOK_NOT)
-                classified.append(("TERM", f'"{inner}"'))
-            elif classified and classified[-1] == _TOK_NOT:
-                classified.pop()
-        elif lexeme.startswith('"') and lexeme.endswith('"'):
-            inner = lexeme[1:-1].replace('""', '"').replace('"', '""')
-            if inner.strip() and any(c.isalnum() for c in inner):
-                classified.append(("TERM", f'"{inner}"'))
+                classified.append(("TERM", f'{col_stack[-1]} : "{inner}"' if col_stack[-1] else f'"{inner}"'))
             elif classified and classified[-1] == _TOK_NOT:
                 classified.pop()
         else:
+            pending_col = None
             is_neg = False
             curr_token = lexeme
             if curr_token.startswith("-") and not curr_token.startswith("--") and len(curr_token) > 1:
@@ -1582,16 +1594,32 @@ def sanitize_fts_query(raw_query: str) -> str:
                 for col in _VALID_FTS_COLS:
                     if curr_token.lower() == col + ":":
                         bare_col = True
+                        col_match = col
                         break
                     if curr_token.lower().startswith(col + ":") and len(curr_token) > len(col) + 1:
                         col_match = col
                         break
             if bare_col:
-                if classified and classified[-1] == _TOK_NOT:
+                if tok_idx + 1 < len(tokens) and tokens[tok_idx + 1] in ("(", "+(", "-("):
+                    if is_neg:
+                        classified.append(_TOK_NOT)
+                    pending_col = col_match
+                elif classified and classified[-1] == _TOK_NOT:
                     classified.pop()
                 continue
-            if col_match:
+            if not col_match and col_stack[-1]:
+                col_match = col_stack[-1]
+                val_part = curr_token
+            elif col_match:
                 val_part = curr_token[len(col_match) + 1:]
+                if val_part.startswith("-") and not val_part.startswith("--") and len(val_part) > 1:
+                    is_neg = True
+                    val_part = val_part[1:]
+                elif val_part.startswith("+") and not val_part.startswith("++") and len(val_part) > 1:
+                    val_part = val_part[1:]
+            else:
+                val_part = ""
+            if col_match:
                 if col_match == "entity_name":
                     val_part = _normalize_nfkc(val_part)
                 if val_part.startswith('"') and val_part.endswith('"'):
@@ -1722,7 +1750,7 @@ _SECRET_PATTERNS = [
     (re.compile(r"\bglpat-[A-Za-z0-9\-_]{20,}\b"), "GitLab personal access token"),
     (re.compile(r"\bsk[-_](?:proj[-_]|ant[-_]|live[-_]|test[-_])?[A-Za-z0-9\-_]{20,}\b"), "API secret key"),
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "AWS access key ID"),
-    (re.compile(r"(?i)(?:^|[^A-Za-z0-9])aws_secret_access_key['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}['\"]?"), "AWS secret access key"),
+    (re.compile(r"(?i)(?:^|[^A-Za-z0-9])aws[_-]secret[_-]access[_-]key['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}['\"]?"), "AWS secret access key"),
     (re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"), "Google API key"),
     (re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b"), "Slack token"),
     (re.compile(r"\b(?:pypi-AgEIcHlwaS5vcmc[A-Za-z0-9\-_]{50,}|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36})\b"), "package registry token"),
@@ -1731,11 +1759,11 @@ _SECRET_PATTERNS = [
     (re.compile(r"https://(?:hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+|(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+)"), "webhook URL secret"),
     (re.compile(r"\bbearer\s+(?=[A-Za-z0-9\-._~+/=]*[0-9\-._~+/=])[A-Za-z0-9\-._~+/]{16,}=*(?=\s|$|['\",;)])", re.IGNORECASE), "bearer authentication token"),
     (re.compile(r"\b(?:SecretStr|SecretBytes|SecretValue|SensitiveStr|RedactedStr)\s*\(\s*['\"][^'\"]{4,}['\"]\s*\)"), "wrapped secret literal"),
-    (re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:password|passwd|pwd|pgpassword|db_pass|db_password|master_key|id_token|x_api_key|auth_secret|jwt_secret|hmac_key|private_key_id|client_secret|api_secret|api_key|apikey|secret_key|api_token|bot_token|access_token|refresh_token|auth_token|private_token|session_token|private_key|encryption_key|signing_key|secret|token)['\"]?\s*[:=]\s*(?!(?:['\"]?(?:none|null|true|false|redacted|example|placeholder|changeme|\$[A-Za-z_][A-Za-z0-9_]*|<[^>]+>|\$\{[A-Za-z_][A-Za-z0-9_]*\})['\"]?)(?:\s|[,;}\])]|$))(?:'[^'\n]{8,}'|\"[^\"\n]{8,}\"|[^\s'\",;}]{8,})"), "credential assignment"),
+    (re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:password|passwd|pwd|pgpassword|db[_-]pass|db[_-]password|master[_-]key|id[_-]token|x[_-]api[_-]key|auth[_-]secret|jwt[_-]secret|hmac[_-]key|private[_-]key[_-]id|client[_-]secret|api[_-]secret|api[_-]key|apikey|secret[_-]key|api[_-]token|bot[_-]token|access[_-]token|refresh[_-]token|auth[_-]token|private[_-]token|session[_-]token|private[_-]key|encryption[_-]key|signing[_-]key|secret|token)['\"]?\s*[:=]\s*(?!(?:['\"]?(?:none|null|true|false|redacted|example|placeholder|changeme|\$[A-Za-z_][A-Za-z0-9_]*|<[^>]+>|\$\{[A-Za-z_][A-Za-z0-9_]*\})['\"]?)(?:\s|[,;}\])]|$))(?:'(?:\\.|[^'\n]){8,}'|\"(?:\\.|[^\"\n]){8,}\"|[^\s'\",;}]{8,})"), "credential assignment"),
 ]
 
 _NON_CLINICAL_PROSE_RE = re.compile(
-    r"(?i)(?:^\s*\*[^*\n]{4,}\*|\b(?:my\s+darling|my\s+love|dearest\s+darling)\b)",
+    r"(?i)(?:^\s*\*[^\s*][^*\n]{2,}[^\s*]\*|\b(?:my\s+darling|my\s+love|dearest\s+darling)\b)",
     re.MULTILINE,
 )
 
@@ -1744,31 +1772,39 @@ _JSON_C0_ESCAPE_RE = re.compile(
     re.IGNORECASE,
 )
 
-def _collect_screen_strings(obj: Any, depth: int = 0, parent_key: str | None = None) -> list[str]:
+def _emit_screen_kv(out: list[str], key_s: str, val_s: str) -> None:
+    """Appends raw, quoted, and quote-stripped key=value screening candidates to `out` so embedded quotes or newlines in attribute values cannot truncate credential regex matching, preventing secret-hygiene bypasses."""
+    out.append(f"{key_s}={val_s}")
+    out.append(f'{key_s}="{val_s}"')
+    v_norm = re.sub(r'[\r\n"\'\\]+', "", val_s)
+    if v_norm != val_s:
+        out.append(f"{key_s}={v_norm}")
+        out.append(f'{key_s}="{v_norm}"')
+
+def _collect_screen_strings(obj: Any, depth: int = 0, parent_key: str | tuple[str, ...] | None = None) -> list[str]:
     """Recursively extracts string keys, string values, and key=value pairs from nested dictionaries or lists up to depth 32 so pre-serialization secret and prose screening covers all nested fields, preventing nested JSON attributes or deep recursion from bypassing validation."""
     if depth > 32:
         raise ValueError("Attributes or metadata nesting exceeds maximum depth of 32.")
+    anc_keys: tuple[str, ...] = (parent_key,) if isinstance(parent_key, str) else (parent_key or ())
     out: list[str] = []
     if isinstance(obj, str):
         out.append(obj)
-        if parent_key:
-            out.append(f"{parent_key}={obj}")
-            out.append(f'{parent_key}="{obj}"')
+        for pk in anc_keys:
+            _emit_screen_kv(out, pk, obj)
     elif isinstance(obj, dict):
         for k, v in obj.items():
             if isinstance(k, str):
                 out.append(k)
-            next_key = k if isinstance(k, str) else parent_key
+            cur_keys = tuple(dict.fromkeys((*anc_keys, k))) if isinstance(k, str) else anc_keys
             if isinstance(v, str):
                 out.append(v)
-                if next_key:
-                    out.append(f"{next_key}={v}")
-                    out.append(f'{next_key}="{v}"')
+                for ks in cur_keys:
+                    _emit_screen_kv(out, ks, v)
             elif isinstance(v, (dict, list, tuple)):
-                out.extend(_collect_screen_strings(v, depth + 1, next_key))
+                out.extend(_collect_screen_strings(v, depth + 1, cur_keys))
     elif isinstance(obj, (list, tuple)):
         for item in obj:
-            out.extend(_collect_screen_strings(item, depth + 1, parent_key))
+            out.extend(_collect_screen_strings(item, depth + 1, anc_keys))
     return out
 
 def _screen_for_secrets(*values: str | None) -> str | None:
@@ -1880,13 +1916,13 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
                     return {"error": "Entity attributes must be a JSON object/dictionary."}
                 attr_dict_for_screen = parsed_attr
                 clean_attributes = json.dumps(parsed_attr, ensure_ascii=False, allow_nan=False)
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError, RecursionError) as e:
                 return {"error": f"Entity attributes must be valid JSON (NaN/Infinity not allowed): {e}"}
         elif isinstance(attributes, dict):
             attr_dict_for_screen = attributes
             try:
                 clean_attributes = json.dumps(attributes, ensure_ascii=False, allow_nan=False)
-            except (TypeError, ValueError) as e:
+            except (TypeError, ValueError, RecursionError) as e:
                 return {"error": f"Entity attributes could not be serialized to standard JSON (NaN/Infinity not allowed): {e}"}
         else:
             return {"error": "Entity attributes must be a dictionary or valid JSON string."}
@@ -1917,7 +1953,7 @@ def record_observation(content: str, entity_name: str | None = None, entity_type
                         raw_tag_items = parsed
                     else:
                         raw_tag_items = split_tags_respecting_brackets(tags)
-                except ValueError:
+                except (ValueError, RecursionError):
                     raw_tag_items = split_tags_respecting_brackets(tags)
             else:
                 raw_tag_items = split_tags_respecting_brackets(tags)
@@ -2105,7 +2141,7 @@ def relate_entities(source_name: str, target_name: str, relation_type: str,
         if isinstance(metadata, str):
             try:
                 parsed = json.loads(metadata)
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError, RecursionError) as e:
                 return {"error": f"Metadata must be valid JSON: {e}"}
             if not isinstance(parsed, dict):
                 return {"error": "Metadata must be a JSON object (dictionary)."}
@@ -2117,7 +2153,7 @@ def relate_entities(source_name: str, target_name: str, relation_type: str,
     if metadata is not None:
         try:
             meta_json = json.dumps(metadata, ensure_ascii=False, allow_nan=False)
-        except (TypeError, ValueError) as e:
+        except (TypeError, ValueError, RecursionError) as e:
             return {"error": f"Metadata could not be serialized to standard JSON (NaN/Infinity not allowed): {e}"}
         if len(meta_json) > MAX_ATTR_CHARS:
             return {"error": f"Relation metadata JSON exceeds {MAX_ATTR_CHARS} characters."}
@@ -2240,7 +2276,7 @@ _STOPWORDS = frozenset((
     "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
 ))
 
-_NON_PLAIN_RE = re.compile(r'["()*]|(?:^|\s)(?:-(?!-)|\+(?!\+))(?=\S)|(?i:\b(?:content|tags|entity_name|category):)|\b(?:AND|OR|NOT)\b')
+_NON_PLAIN_RE = re.compile(r'["()*]|(?:^|\s)(?:-(?!-)|\+(?!\+))(?=\S)|(?i:\b(?:content|tags|entity_name|category):)|(?<![\w-])(?:AND|OR|NOT)(?![\w-])')
 _SPECIAL_SYNTAX_CHARS = ('"', '(', ')', ':', '-', '+', '*')
 
 _PLAIN_QUERY_CACHE: dict[str, tuple[str, str | None] | None] = {}
@@ -2289,21 +2325,22 @@ def build_plain_fts_queries(text: str) -> tuple[str, str | None] | None:
     _cache_put(_PLAIN_QUERY_CACHE, text, res, 512)
     return res
 
-_INLINE_CATEGORY_RE = re.compile(r'(?:(?<=[\s(])|^)(?:(NOT)\s+|([-+]?))(?i:category:)\s*(?:"((?:""|[^"])*)"|([^\s()"]+))')
-_OR_LEFT_RE = re.compile(r'\bOR\s*$')
-_OR_RIGHT_RE = re.compile(r'^\s*\bOR\b')
-_AND_LEFT_RE = re.compile(r'(?:^|\s+)\bAND\s*$')
-_AND_RIGHT_RE = re.compile(r'^\s*\bAND\b(?:\s+|$)')
+_INLINE_CATEGORY_RE = re.compile(r'(?:(?<=[\s(])|^)(?:(NOT)\s+)?([-+]?)(?i:category:)\s*(?:"((?:""|[^"])*)"|([^\s()"]+))')
+_OR_LEFT_RE = re.compile(r'(?<![\w-])OR\s*$')
+_OR_RIGHT_RE = re.compile(r'^\s*OR(?![\w-])')
+_AND_LEFT_RE = re.compile(r'(?:^|\s+)AND\s*$')
+_AND_RIGHT_RE = re.compile(r'^\s*AND(?:\s+|$)')
 
 def _extract_inline_category(query: str) -> tuple[str, str | None, str | None]:
     """Extracts a top-level inline `category:` filter from a search query string so category filtering routes to SQL WHERE clauses, preventing FTS5 MATCH errors on the UNINDEXED `category` column."""
     if "category:" not in query.lower():
         return query, None, None
     quoted = [m.span() for m in re.finditer(r'"(?:""|[^"])*"', query)]
-    for bad_m in re.finditer(r'(?i)(?:(?<=[\s(])|^)(?:NOT\s+|[-+]?)category:\s*(?:\(|$|\s)', query):
-        if not any(a <= bad_m.start() < b for a, b in quoted):
-            if not any(a <= bad_m.start() < b for a, b in [m.span() for m in _INLINE_CATEGORY_RE.finditer(query)]):
-                return query, None, "Inline category: filter requires a non-empty value and cannot wrap parentheses."
+    for bad_m in re.finditer(r'(?i)(?:(?<=[\s(])|^)(?:NOT\s+)?[-+]?category:\s*(?:\(|$|\s)', query):
+        if not any(a <= bad_m.start() < b for a, b in quoted) and not any(
+            a <= bad_m.start() < b for a, b in [m.span() for m in _INLINE_CATEGORY_RE.finditer(query)]
+        ):
+            return query, None, "Inline category: filter requires a non-empty value and cannot wrap parentheses."
     matches = [m for m in _INLINE_CATEGORY_RE.finditer(query)
                if not any(a < m.start() < b for a, b in quoted)]
     if not matches:
@@ -2323,7 +2360,10 @@ def _extract_inline_category(query: str) -> tuple[str, str | None, str | None]:
             paren_depth += 1
         elif ch == ")" and paren_depth > 0:
             paren_depth -= 1
-    has_top_or = bool(re.search(r'(?:^|\s)OR(?:\s|$)', re.sub(r'\([^()]*\)|"(?:""|[^"])*"', ' ', prefix + " " + suffix)))
+    rem_or = re.sub(r'"(?:""|[^"])*"', ' ', prefix + " " + suffix)
+    while "(" in rem_or and ")" in rem_or and (nxt_or := re.sub(r'\([^()]*\)', ' ', rem_or)) != rem_or:
+        rem_or = nxt_or
+    has_top_or = bool(re.search(r'(?:^|\s)OR(?:\s|$)', rem_or))
     if paren_depth > 0 or has_top_or or _OR_LEFT_RE.search(prefix) or _OR_RIGHT_RE.search(suffix):
         return query, None, "Inline category: filter cannot be nested inside parentheses or combined with OR. Pass the category parameter instead."
     prefix = _AND_LEFT_RE.sub(" ", prefix)
@@ -3486,7 +3526,7 @@ def serve_mcp() -> None:
 
                 try:
                     msg = json.loads(line)
-                except (json.JSONDecodeError, ValueError, TypeError) as e:
+                except (json.JSONDecodeError, ValueError, TypeError, RecursionError) as e:
                     _send_rpc(format_rpc_error(None, -32700, f"Parse error: {e}"))
                     continue
 
@@ -3680,7 +3720,8 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
                     nxt in all_opts
                     or nxt_base in all_opts
                     or (nxt[:2] in _NUMERIC_SHORT_OPTS and nxt[:2] in takes_val and nxt[2:].replace(".", "", 1).isdigit())
-                    or (cmd == "record" and nxt.startswith("-a") and len(nxt) > 2)
+                    or (cmd == "record" and nxt.startswith("-a{"))
+                    or (cmd == "relate" and nxt.startswith("-m{"))
                     or (nxt.startswith("-c") and cmd in ("search", "recall", "record") and nxt[2:] in _CATEGORIES_ENUM)
                 )
                 if not nxt_is_opt and nxt != "--":
@@ -3703,7 +3744,7 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
             options.append(arg_item)
             idx += 1
             continue
-        if cmd == "record" and arg_item.startswith("-a") and len(arg_item) > 2:
+        if (cmd == "record" and arg_item.startswith("-a{")) or (cmd == "relate" and arg_item.startswith("-m{")):
             options.append(arg_item)
             idx += 1
             continue
@@ -3729,7 +3770,11 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
         idx += 1
 
     positionals.extend(post_ddash)
-    has_leading_dash = has_ddash or any(p.startswith("-") for p in positionals)
+    has_leading_dash = (
+        has_ddash
+        or any(p.startswith("-") for p in positionals)
+        or bool(options and options[-1] in takes_val and positionals)
+    )
     res = [argv[0], cmd]
     res.extend(options)
     if has_leading_dash:
@@ -4188,7 +4233,7 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
                 attributes = raw[idx]
             elif arg.startswith(("--attributes=", "-a=")):
                 attributes = arg.partition("=")[2]
-            elif arg.startswith("-a") and len(arg) > 2:
+            elif arg.startswith("-a{"):
                 attributes = arg[2:]
             elif arg == "--":
                 if content is not None or idx + 2 != n:
@@ -4255,6 +4300,8 @@ def _fast_cli_dispatch(argv: list[str]) -> bool:
                 metadata = raw[idx]
             elif arg.startswith(("--metadata=", "-m=")):
                 metadata = arg.partition("=")[2]
+            elif arg.startswith("-m{"):
+                metadata = arg[2:]
             elif arg == "--":
                 positionals.extend(raw[idx + 1:])
                 break
@@ -4519,6 +4566,15 @@ def _main_inner() -> None:
     def run_backup(a: Any) -> None:
         """Dispatches the `backup` CLI subcommand so a mode `0600` online SQLite backup is written to a non-existent destination path, preventing overwrites of live databases or guarded credential paths."""
         dest = os.path.abspath(os.path.expanduser(a.dest))
+        dest_dir = os.path.dirname(dest)
+        try:
+            _check_not_guarded_path(dest, "Backup destination")
+            _check_not_guarded_path(DB_PATH, "Database path")
+            if _RAW_DB_PATH != DB_PATH:
+                _check_not_guarded_path(_RAW_DB_PATH, "Database path")
+        except RuntimeError as e:
+            print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
+            sys.exit(1)
         for suffix in ("", "-wal", "-shm", "-journal"):
             if os.path.lexists(dest + suffix):
                 print(json.dumps({"error": f"'{dest + suffix}' already exists. Refusing to overwrite or adopt existing sidecars."}, indent=2), file=sys.stderr)
@@ -4527,12 +4583,10 @@ def _main_inner() -> None:
         if real_dest == DB_PATH or real_dest in (DB_PATH + "-wal", DB_PATH + "-shm", DB_PATH + "-journal"):
             print(json.dumps({"error": "Destination is the live database or its sidecars."}, indent=2), file=sys.stderr)
             sys.exit(1)
-        dest_dir = os.path.dirname(dest)
         if not os.path.exists(dest_dir):
             print(json.dumps({"error": f"Destination directory '{dest_dir}' does not exist."}, indent=2), file=sys.stderr)
             sys.exit(1)
         try:
-            _check_not_guarded_path(dest, "Backup destination")
             _require_owned(dest_dir, "Destination directory", forbid_group_other_write=True, check_sidecars=False)
         except RuntimeError as e:
             print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
@@ -4589,6 +4643,14 @@ def _main_inner() -> None:
         import glob
         os.umask(0o077)
         src = os.path.abspath(os.path.expanduser(a.src))
+        try:
+            _check_not_guarded_path(src, "Backup source")
+            _check_not_guarded_path(DB_PATH, "Database path")
+            if _RAW_DB_PATH != DB_PATH:
+                _check_not_guarded_path(_RAW_DB_PATH, "Database path")
+        except RuntimeError as e:
+            print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
+            sys.exit(1)
         if not os.path.isfile(src):
             print(json.dumps({"error": f"Backup file '{src}' does not exist or is not a regular file."}, indent=2), file=sys.stderr)
             sys.exit(1)
@@ -4596,8 +4658,6 @@ def _main_inner() -> None:
             print(json.dumps({"error": "Source is the live database file."}, indent=2), file=sys.stderr)
             sys.exit(1)
         try:
-            _check_not_guarded_path(src, "Backup source")
-            _check_not_guarded_path(DB_PATH, "Database path")
             enforce_storage_gate(os.path.realpath(DB_PATH), read_only=False, label="Database path")
             _require_owned(src, "Backup file", forbid_group_other_write=True)
             _require_owned(os.path.dirname(os.path.realpath(src)), "Backup source directory", forbid_group_other_write=True, check_sidecars=False)
@@ -4608,9 +4668,7 @@ def _main_inner() -> None:
             os.makedirs(db_dir, mode=0o700, exist_ok=True)
             _require_owned(db_dir, "Database directory", forbid_group_other_write=True, check_sidecars=False)
             if _RAW_DB_PATH != DB_PATH and os.path.lexists(_RAW_DB_PATH):
-                st_raw = os.lstat(_RAW_DB_PATH)
-                if stat.S_ISLNK(st_raw.st_mode) and st_raw.st_uid != os.geteuid():
-                    raise RuntimeError(f"Database symlink '{_RAW_DB_PATH}' is owned by uid {st_raw.st_uid}, not current user ({os.geteuid()}).")
+                _require_owned(_RAW_DB_PATH, "Database file", forbid_group_other_write=True, check_sidecars=True, allow_missing_target=True)
             if os.path.lexists(DB_PATH):
                 if os.path.isdir(DB_PATH):
                     raise RuntimeError(f"Database path '{DB_PATH}' is a directory.")
@@ -4820,9 +4878,13 @@ def _main_inner() -> None:
             print("Error: --count must be an integer greater than 0.", file=sys.stderr)
             sys.exit(1)
         bench_base_dir = os.path.realpath(os.path.dirname(DB_PATH))
+        bench_sub = os.path.join(bench_base_dir, ".bench")
         try:
             check_sqlite_features()
-            enforce_storage_gate(bench_base_dir, read_only=False, label="Benchmark storage path")
+            _check_not_guarded_path(DB_PATH, "Database path")
+            if _RAW_DB_PATH != DB_PATH:
+                _check_not_guarded_path(_RAW_DB_PATH, "Database path")
+            enforce_storage_gate(bench_sub, read_only=False, label="Benchmark storage path")
             if os.path.exists(bench_base_dir):
                 _require_owned(bench_base_dir, "Benchmark storage directory", forbid_group_other_write=True)
         except (RuntimeError, OSError) as e:
@@ -4832,7 +4894,6 @@ def _main_inner() -> None:
         conn: sqlite3.Connection | None = None
         ro_conn: sqlite3.Connection | None = None
         cleaned_up = False
-        bench_sub = os.path.join(bench_base_dir, ".bench")
         bench_db = os.path.join(bench_sub, f"bench_{os.getpid()}_{_uuid4_str()[:8]}.db")
 
         def _bench_cleanup(signum: int | None = None, frame: FrameType | None = None) -> None:
@@ -4883,22 +4944,10 @@ def _main_inner() -> None:
 
             conn = sqlite3.connect(bench_db, timeout=5.0, cached_statements=256)
             conn.isolation_level = None
-            conn.execute("PRAGMA page_size = 4096;")
-            conn.execute("PRAGMA journal_mode = WAL;")
             _raw_sync = os.environ.get("AGENT_MEMORY_SYNC", "").strip().upper()
             sync_mode = _raw_sync if _raw_sync in ("FULL", "NORMAL", "OFF", "EXTRA") else ("NORMAL" if allow_non_optane() else "FULL")
-            conn.execute(f"PRAGMA synchronous = {sync_mode};")
-            conn.execute("PRAGMA foreign_keys = ON;")
-            conn.execute("PRAGMA recursive_triggers = ON;")
-            conn.execute("PRAGMA secure_delete = ON;")
-            conn.execute("PRAGMA busy_timeout = 5000;")
-            conn.execute("PRAGMA journal_size_limit = 33554432;")
-            conn.execute("PRAGMA wal_autocheckpoint = 2000;")
-            conn.execute("PRAGMA mmap_size = 268435456;")
-            conn.execute("PRAGMA cache_size = -8192;")
-            conn.execute("PRAGMA cache_spill = OFF;")
-            conn.execute("PRAGMA temp_store = MEMORY;")
-            conn.execute("PRAGMA threads = 4;")
+            for _p in ("page_size = 4096", "journal_mode = WAL", f"synchronous = {sync_mode}", "foreign_keys = ON", "recursive_triggers = ON", "secure_delete = ON", "busy_timeout = 5000", "journal_size_limit = 33554432", "wal_autocheckpoint = 2000", "mmap_size = 268435456", "cache_size = -8192", "cache_spill = OFF", "temp_store = MEMORY", "threads = 4"):
+                conn.execute(f"PRAGMA {_p};")
             init_db(conn=conn)
 
             t0 = time.perf_counter()
@@ -4924,13 +4973,8 @@ def _main_inner() -> None:
             encoded_bench_db = _pathname2url(os.path.realpath(bench_db))
             ro_conn = sqlite3.connect(f"file:{encoded_bench_db}?mode=ro", uri=True, timeout=5.0, cached_statements=256)
             ro_conn.isolation_level = None
-            ro_conn.execute("PRAGMA query_only = ON;")
-            ro_conn.execute("PRAGMA busy_timeout = 5000;")
-            ro_conn.execute("PRAGMA mmap_size = 268435456;")
-            ro_conn.execute("PRAGMA cache_size = -8192;")
-            ro_conn.execute("PRAGMA foreign_keys = ON;")
-            ro_conn.execute("PRAGMA temp_store = MEMORY;")
-            ro_conn.execute("PRAGMA threads = 4;")
+            for _rp in ("query_only = ON", "busy_timeout = 5000", "mmap_size = 268435456", "cache_size = -8192", "foreign_keys = ON", "temp_store = MEMORY", "threads = 4"):
+                ro_conn.execute(f"PRAGMA {_rp};")
             try:
                 t_search = time.perf_counter()
                 for i in range(args.count):

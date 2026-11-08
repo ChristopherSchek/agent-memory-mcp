@@ -489,6 +489,30 @@ def _validate_and_init_log_dir(log_dir: str, am_mod: Any, home_dir: str) -> tupl
     user_base = os.path.basename(os.path.abspath(home_dir).rstrip("/")) or "user"
     env_db = os.path.expanduser(os.path.expandvars(os.environ.get("AGENT_MEMORY_DB", "").strip()))
     env_opt = os.path.expanduser(os.path.expandvars(os.environ.get("OPTANE_BASE", "").strip()))
+    cfg_dbs: list[str] = []
+    cfg_files: list[str] = [
+        os.path.expanduser(os.path.expandvars(os.environ.get(ev, "").strip()))
+        for ev in ("AGENT_MEMORY_MCP_CONFIG", "MCP_CONFIG")
+        if os.environ.get(ev, "").strip()
+    ]
+    for hr in dict.fromkeys((home_dir, os.path.expanduser("~"))):
+        if hr:
+            cfg_files.append(os.path.join(hr, ".gemini", "config", "mcp_config" + ".json"))
+    for mcp_c_p in dict.fromkeys(cfg_files):
+        if mcp_c_p and os.path.isfile(mcp_c_p) and not os.path.islink(mcp_c_p):
+            with contextlib.suppress(Exception):
+                with open(mcp_c_p, encoding="utf-8") as cf:
+                    c_obj = json.load(cf)
+                if isinstance(c_obj, dict):
+                    srv = c_obj.get("mcpServers", {})
+                    if isinstance(srv, dict):
+                        am_s = srv.get("agent-memory", {})
+                        if isinstance(am_s, dict):
+                            env_s = am_s.get("env", {})
+                            if isinstance(env_s, dict):
+                                c_db = os.path.expanduser(os.path.expandvars(str(env_s.get("AGENT_MEMORY_DB", "")).strip()))
+                                if c_db and os.path.isabs(c_db):
+                                    cfg_dbs.append(c_db)
     cand_dbs = [
         env_db if os.path.isabs(env_db) else "",
         os.path.join(env_opt, "agent_memory", "memory.db") if (env_opt and os.path.isabs(env_opt)) else "",
@@ -496,6 +520,7 @@ def _validate_and_init_log_dir(log_dir: str, am_mod: Any, home_dir: str) -> tupl
         getattr(am_mod, "_RAW_DB_PATH", "") if am_mod is not None else "",
         f"/mnt/optane/{user_base}/agent_memory/memory.db",
         os.path.join(xdg_data, "agent-memory", "memory.db"),
+        *cfg_dbs,
     ]
     for raw_cand_db in cand_dbs:
         cand_db = os.path.expanduser(os.path.expandvars(str(raw_cand_db).strip()))
@@ -518,11 +543,10 @@ def _validate_and_init_log_dir(log_dir: str, am_mod: Any, home_dir: str) -> tupl
             st_cur = os.lstat(cur)
             if stat.S_ISLNK(st_cur.st_mode):
                 raise ValueError(f"Refusing symlinked --log-dir component: '{cur}'.")
-            if cur == norm_log:
-                if not stat.S_ISDIR(st_cur.st_mode):
-                    raise ValueError(f"--log-dir exists and is not a directory: '{norm_log}'.")
-                if st_cur.st_uid != euid:
-                    raise ValueError(f"--log-dir is not owned by current user: '{norm_log}'.")
+            if not stat.S_ISDIR(st_cur.st_mode):
+                raise ValueError(f"--log-dir component exists and is not a directory: '{cur}'.")
+            if cur == norm_log and st_cur.st_uid != euid:
+                raise ValueError(f"--log-dir is not owned by current user: '{norm_log}'.")
         parent = os.path.dirname(cur)
         if parent == cur:
             break
@@ -765,7 +789,7 @@ def main() -> None:
                     raise ValueError("--log-dir requires a non-empty directory path")
                 if not results_json_path:
                     debug_log_path, results_json_path = _validate_and_init_log_dir(os.path.expanduser(args.log_dir.strip()), am_mod, home_dir)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             _log_debug(f"[!] Argument error: {exc}")
             _write_tri_stream_results(
                 results_json_path,
@@ -820,7 +844,7 @@ def main() -> None:
                         getattr(am_mod, "_VALIDATED_STORAGE_DEVS", set()).clear()
                         am_mod.validate_storage_hardware(optane_user_dir)
                     has_optane = True
-                except Exception:
+                except (OSError, RuntimeError, ValueError):
                     has_optane = False
             flash_base_dir = tempfile.gettempdir()
             if os.path.realpath(flash_base_dir).startswith("/mnt/optane") or os.path.abspath(flash_base_dir).startswith("/mnt/optane"):
